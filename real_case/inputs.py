@@ -16,7 +16,7 @@ import pandas as pd
 from typing import Dict, Tuple, List
 
 from lib.data import GeoData, RouteData
-from lbbd_config import DATA_PATHS, BG_GEOID_LIST
+from config import DATA_PATHS, BG_GEOID_LIST
 
 
 def load_geodata() -> GeoData:
@@ -24,7 +24,7 @@ def load_geodata() -> GeoData:
     return GeoData(shp, BG_GEOID_LIST, level='block_group')
 
 
-def compute_vehicle_speed_kmh(geodata: GeoData, routes_json: str = 'hct_routes.json') -> float:
+def compute_vehicle_speed_kmh(geodata: GeoData, routes_json: str = 'data/hct_routes.json') -> float:
     """Estimate vehicle speed in km/h from HCT routes.
 
     For each route, decode the polyline, project to EPSG:2163 using RouteData's
@@ -65,7 +65,7 @@ def compute_vehicle_speed_kmh(geodata: GeoData, routes_json: str = 'hct_routes.j
 
 def set_geodata_speeds(
     geodata: GeoData,
-    routes_json: str = 'hct_routes.json',
+    routes_json: str = 'data/hct_routes.json',
     walk_kmh: float = 0.0,
     vehicle_kmh: float = 18.710765208297367,
     compute_from_routes: bool = False,
@@ -103,7 +103,7 @@ def _load_population_df() -> pd.DataFrame:
                     break
         out = pd.DataFrame({'GEOID': df[geocol], 'pop': pd.to_numeric(df[popcol], errors='coerce')})
     else:
-        alt = os.path.join('2023_target_blockgroup_population', '2023_target_blockgroup_population.csv')
+        alt = os.path.join('data', '2023_target_blockgroup_population', '2023_target_blockgroup_population.csv')
         df = pd.read_csv(alt, dtype={'GEO_ID': str})
         out = pd.DataFrame({'GEOID': df['GEO_ID'], 'pop': pd.to_numeric(df['B02001_001E'], errors='coerce')})
     out['short_GEOID'] = out['GEOID'].str[-7:]
@@ -122,8 +122,8 @@ def load_probability_from_population(geodata: GeoData) -> Dict[str, float]:
 
 
 def load_probability_from_commuting(geodata: GeoData,
-                                    tract_csv: str = '2023_target_tract_commuting/2023_target_tract_commuting.csv',
-                                    bg_csv: str = '2023_target_blockgroup_population/2023_target_blockgroup_population.csv') -> Dict[str, float]:
+                                    tract_csv: str = 'data/2023_target_tract_commuting/2023_target_tract_commuting.csv',
+                                    bg_csv: str = 'data/2023_target_blockgroup_population/2023_target_blockgroup_population.csv') -> Dict[str, float]:
     """Replicate the notebook's nominal mass based on ACS commuting counts.
 
     Steps (matching data_process.ipynb logic):
@@ -239,7 +239,7 @@ def load_real_odd(csv_path: str = 'data/odd_features.csv') -> Dict[str, np.ndarr
     return {k: np.array([v], dtype=float) for k, v in odd_dict.items()}
 
 
-def load_baseline_assignment(geodata: GeoData, routes_json: str = 'hct_routes.json', visualize: bool = False) -> Tuple[np.ndarray, List[str]]:
+def load_baseline_assignment(geodata: GeoData, routes_json: str = 'data/hct_routes.json', visualize: bool = False) -> Tuple[np.ndarray, List[str]]:
     rd = RouteData(routes_json, geodata)
     assignment, centers = rd.build_assignment_matrix(visualize=visualize)
     # Convert centers (which are short_GEOID values) to strings for consistency

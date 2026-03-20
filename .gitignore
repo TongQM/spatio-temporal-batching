@@ -1,10 +1,28 @@
+# Data directories
+data/
+cache/
+
+# Legacy paths (now inside data/)
 2020_target_block_population/
 2023_shape_files/
 2023_target_blockgroup_population/
 2023_target_tract_commuting/
+
+# Removed directories
 prev_version/
 visualizations/
 
+# Binary / large output files
 *.xlsx
 *.csv
 *.zip
+*.pdf
+*.png
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store

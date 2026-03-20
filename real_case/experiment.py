@@ -6,7 +6,7 @@ Usage (from repo root):
 
 Outputs:
   - Prints summary metrics for baseline vs optimized
-  - Saves a JSON summary under lbbd_results/
+  - Saves a JSON summary under results/lbbd/
 """
 
 from __future__ import annotations
@@ -116,7 +116,7 @@ def _evaluate_fixed_route_full(geodata, prob: Dict[str, float], epsilon_km: floa
     Provider metrics are left as None (route operations treated as sunk in this framework).
     Returns a dict with expected and worst-P rider metrics.
     """
-    rd = RouteData('hct_routes.json', geodata)
+    rd = RouteData('data/hct_routes.json', geodata)
     ev = Evaluate(rd, geodata, epsilon=epsilon_km)
 
     # Nearest stop per node for walk times
@@ -335,7 +335,7 @@ def _evaluate_tsp_partition(
     wv = getattr(geodata, 'wv_kmh', getattr(geodata, 'wv', 18.710765208297367 / 1.60934) * 1.60934)
     travel_discount = getattr(geodata, 'tsp_travel_discount', TSP_TRAVEL_DISCOUNT)
     # build evaluator only if needed
-    rd = RouteData('hct_routes.json', geodata)
+    rd = RouteData('data/hct_routes.json', geodata)
     ev = Evaluate(rd, geodata, epsilon=epsilon_km if epsilon_km is not None else 1e-3)
 
     # Ensure square assignment and centers
@@ -489,7 +489,7 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
     # Use constants by default to match notebook; toggle compute_from_routes=True to recompute.
     wv_kmh, wr_kmh = set_geodata_speeds(
         geodata,
-        'hct_routes.json',
+        'data/hct_routes.json',
         walk_kmh=5.04,
         vehicle_kmh=18.710765208297367,
         compute_from_routes=False,
@@ -712,8 +712,8 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
         table_lines.append(f"{tag},Rider,wait,{aggW['rider_wait_min']},{aggE['rider_wait_min']},{aggW['provider_travel_kmph']},{aggE['provider_travel_kmph']}")
         table_lines.append(f"{tag},Rider,transit,{aggW['rider_transit_min']},{aggE['rider_transit_min']},,")
 
-    os.makedirs('lbbd_results', exist_ok=True)
-    table_path = os.path.join('lbbd_results', f'real_case_table_{ts}.csv')
+    os.makedirs('results/lbbd', exist_ok=True)
+    table_path = os.path.join('results/lbbd', f'real_case_table_{ts}.csv')
     with open(table_path, 'w') as f:
         f.write('\n'.join(table_lines))
     # --- Also emit a LaTeX table in the target format ---

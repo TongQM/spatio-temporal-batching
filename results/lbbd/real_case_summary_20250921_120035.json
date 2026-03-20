@@ -1,0 +1,19 @@
+{
+  "method": "LBBD",
+  "num_districts": 3,
+  "baseline": {
+    "obj": 7.189165594232897,
+    "depot": "5041002",
+    "K_sum": 3.0674648508820894,
+    "F_sum": 10.063371403156436,
+    "num_districts": 3
+  },
+  "optimized": {
+    "obj": 6.323488101476383,
+    "depot": "5520003",
+    "K_sum": 0.8375037817918967,
+    "F_sum": 8.4140503834162,
+    "num_districts": 3
+  },
+  "improvement": 0.8656774927565136
+}

@@ -1,0 +1,194 @@
+{
+  "method": "RS",
+  "num_districts": 3,
+  "baseline": {
+    "obj": 7.189164927966611,
+    "depot": "5041002",
+    "K_sum": 3.0674648508820894,
+    "F_sum": 10.063371403156438,
+    "num_districts": 3
+  },
+  "optimized": {
+    "obj": 6.637520780845671,
+    "depot": "5070001",
+    "K_sum": null,
+    "F_sum": null,
+    "num_districts": 3
+  },
+  "improvement": 0.5516441471209399,
+  "evaluations": {
+    "FR_original": {
+      "rider": {
+        "expected": {
+          "walk_s": 832.773862734763,
+          "wait_s": 1159.0255429968627,
+          "transit_s": 2937.5460346617197
+        },
+        "worstP": {
+          "walk_s": 833.4881483859584,
+          "wait_s": 1159.0255429968627,
+          "transit_s": 2937.5460346617197
+        },
+        "worst_rider": {
+          "walk_s": 3298.805776604055
+        }
+      },
+      "provider": {
+        "expected": null,
+        "worst": null
+      }
+    },
+    "TSP_original_unconstrained": {
+      "per_district": {
+        "5041002": {
+          "dispatch_interval_h": 0.001,
+          "rider_wait_min": 0.03,
+          "rider_transit_min": 0.0,
+          "provider_linehaul_min": 0.0,
+          "provider_odd_cost": 3329.143754909662,
+          "provider_travel_min": 0.0,
+          "mass": 0.4451971022673818
+        },
+        "5041001": {
+          "dispatch_interval_h": 0.001,
+          "rider_wait_min": 0.03,
+          "rider_transit_min": 0.0,
+          "provider_linehaul_min": 9673.710935803576,
+          "provider_odd_cost": 3510.66480385261,
+          "provider_travel_min": 0.0,
+          "mass": 0.21738482767271927
+        },
+        "5041003": {
+          "dispatch_interval_h": 0.001,
+          "rider_wait_min": 0.03,
+          "rider_transit_min": 0.0,
+          "provider_linehaul_min": 27135.867274781496,
+          "provider_odd_cost": 3223.562844394165,
+          "provider_travel_min": 0.0,
+          "mass": 0.33741807005989893
+        }
+      },
+      "aggregate": {
+        "rider_wait_min": 0.03,
+        "rider_transit_min": 0.0,
+        "provider_linehaul_min": 36809.578210585074,
+        "provider_odd_cost": 10063.371403156438,
+        "provider_travel_min": 0.0
+      }
+    },
+    "TSP_original_constrained": {
+      "per_district": {
+        "5041002": {
+          "dispatch_interval_h": 0.001,
+          "rider_wait_min": 0.03,
+          "rider_transit_min": 0.0,
+          "provider_linehaul_min": 0.0,
+          "provider_odd_cost": 3329.143754909662,
+          "provider_travel_min": 0.0,
+          "mass": 0.4451971022673818
+        },
+        "5041001": {
+          "dispatch_interval_h": 0.001,
+          "rider_wait_min": 0.03,
+          "rider_transit_min": 0.0,
+          "provider_linehaul_min": 9673.710935803576,
+          "provider_odd_cost": 3510.66480385261,
+          "provider_travel_min": 0.0,
+          "mass": 0.21738482767271927
+        },
+        "5041003": {
+          "dispatch_interval_h": 0.001,
+          "rider_wait_min": 0.03,
+          "rider_transit_min": 0.0,
+          "provider_linehaul_min": 27135.867274781496,
+          "provider_odd_cost": 3223.562844394165,
+          "provider_travel_min": 0.0,
+          "mass": 0.33741807005989893
+        }
+      },
+      "aggregate": {
+        "rider_wait_min": 0.03,
+        "rider_transit_min": 0.0,
+        "provider_linehaul_min": 36809.578210585074,
+        "provider_odd_cost": 10063.371403156438,
+        "provider_travel_min": 0.0
+      }
+    },
+    "TSP_opt_unconstrained": {
+      "per_district": {
+        "5070001": {
+          "dispatch_interval_h": 2.318560712424851,
+          "rider_wait_min": 69.55682137274553,
+          "rider_transit_min": 0.0,
+          "provider_linehaul_min": 0.0,
+          "provider_odd_cost": 1.435866543010599,
+          "provider_travel_min": 0.0,
+          "mass": 0.4680982845673787
+        },
+        "5070002": {
+          "dispatch_interval_h": 2.427252060605748,
+          "rider_wait_min": 72.81756181817245,
+          "rider_transit_min": 0.0,
+          "provider_linehaul_min": 4.239968638603408,
+          "provider_odd_cost": 1.328070906484137,
+          "provider_travel_min": 0.0,
+          "mass": 0.34651268542039065
+        },
+        "5644006": {
+          "dispatch_interval_h": 2.675062865462322,
+          "rider_wait_min": 80.25188596386965,
+          "rider_transit_min": 0.0,
+          "provider_linehaul_min": 7.2515559535393,
+          "provider_odd_cost": 1.5804505271674063,
+          "provider_travel_min": 0.0,
+          "mass": 0.1853890300122307
+        }
+      },
+      "aggregate": {
+        "rider_wait_min": 72.66945695141595,
+        "rider_transit_min": 0.0,
+        "provider_linehaul_min": 11.491524592142706,
+        "provider_odd_cost": 4.3443879766621425,
+        "provider_travel_min": 0.0
+      }
+    },
+    "TSP_opt_constrained": {
+      "per_district": {
+        "5070001": {
+          "dispatch_interval_h": 2.318560712424851,
+          "rider_wait_min": 69.55682137274553,
+          "rider_transit_min": 0.0,
+          "provider_linehaul_min": 0.0,
+          "provider_odd_cost": 1.435866543010599,
+          "provider_travel_min": 0.0,
+          "mass": 0.4680982845673787
+        },
+        "5070002": {
+          "dispatch_interval_h": 2.427252060605748,
+          "rider_wait_min": 72.81756181817245,
+          "rider_transit_min": 0.0,
+          "provider_linehaul_min": 4.239968638603408,
+          "provider_odd_cost": 1.328070906484137,
+          "provider_travel_min": 0.0,
+          "mass": 0.34651268542039065
+        },
+        "5644006": {
+          "dispatch_interval_h": 2.675062865462322,
+          "rider_wait_min": 80.25188596386965,
+          "rider_transit_min": 0.0,
+          "provider_linehaul_min": 7.2515559535393,
+          "provider_odd_cost": 1.5804505271674063,
+          "provider_travel_min": 0.0,
+          "mass": 0.1853890300122307
+        }
+      },
+      "aggregate": {
+        "rider_wait_min": 72.66945695141595,
+        "rider_transit_min": 0.0,
+        "provider_linehaul_min": 11.491524592142706,
+        "provider_odd_cost": 4.3443879766621425,
+        "provider_travel_min": 0.0
+      }
+    }
+  }
+}

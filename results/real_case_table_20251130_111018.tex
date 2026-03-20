@@ -1,0 +1,31 @@
+\begin{table*}[t]
+\centering
+\caption{Comparison of Travel Time (minutes) and Provider Distance Rate (km/h)}
+\begin{tabular}{l l r r r r r}
+\toprule
+\textbf{Design} & \textbf{Metric} & 
+\multicolumn{3}{c}{\textbf{User Perspective (min)}} & 
+\multicolumn{2}{c}{\textbf{Provider (km/h)}} \\
+\cmidrule(lr){3-5}\cmidrule(lr){6-7}
+& & \textbf{Worst-user} & \textbf{Worst-P} & \textbf{Expected} & \textbf{Worst} & \textbf{Expected} \\
+\midrule
+$\mathcal{P}_0$ FR & walk    & 54.98 & 32.32 & 13.88 &        &        \\
+                   & wait    & 187.72 & 19.22 & 19.22 & 56.13  & 56.13  \\
+                   & transit & 155.27 & 49.13 & 49.13 &        &        \\
+                   & total   & 397.96 & 100.68 & 82.24 &       &        \\
+                   & ODD (per h) &  &  &  & \multicolumn{2}{c}{0.00} \\
+\midrule
+$\mathcal{P}_0$ TSP (unconstrained) & wait    &  & 11.88 & 11.88 & 33.50 & 25.86 \\
+                                    & transit &  & 21.27 & 17.28 &        &       \\
+                                    & total   & 83.82 & 33.15 & 29.16 &        &       \\
+\midrule
+$\mathcal{P}^*$ TSP (unconstrained) & wait    &  & 9.67 & 9.20 & 32.54 & 24.02 \\
+                                    & transit &  & 19.93 & 14.24 &        &       \\
+                                    & total   & 62.86 & 29.60 & 23.44 &        &       \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.5ex}
+\small
+Notes: FR Worst-P uses worstP\_min; provider values are aggregate travel km/h; ODD from odd\_cost. Source: results/real_case_summary_20251130_111018.json.
+\end{table*}

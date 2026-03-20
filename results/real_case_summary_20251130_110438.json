@@ -1,0 +1,497 @@
+{
+  "method": "RS",
+  "num_districts": 3,
+  "baseline": {
+    "obj": 8.975613043743929,
+    "depot": "5041002",
+    "K_sum": 3.0674648508820894,
+    "F_sum": 0.0,
+    "num_districts": 3
+  },
+  "optimized": {
+    "obj": 6.0421120850123415,
+    "depot": "5070002",
+    "K_sum": null,
+    "F_sum": null,
+    "num_districts": 3
+  },
+  "improvement": 2.933500958731587,
+  "evaluations": {
+    "FR_original": {
+      "rider": {
+        "expected": {
+          "walk_s": 832.773862734763,
+          "wait_s": 1123.4837797071605,
+          "transit_s": 2980.7206127475774
+        },
+        "worstP": {
+          "walk_s": 1939.388796153547,
+          "wait_s": 1123.4837797071605,
+          "transit_s": 2980.7206127475774
+        },
+        "worst_rider": {
+          "walk_s": 3298.805776604055
+        },
+        "worst_user": {
+          "walk_s": 3298.805776604055,
+          "wait_s": 11263,
+          "transit_s": 9316
+        },
+        "expected_min": {
+          "walk_min": 13.879564378912717,
+          "wait_min": 18.724729661786007,
+          "transit_min": 49.67867687912629
+        },
+        "worstP_min": {
+          "walk_min": 32.32314660255911,
+          "wait_min": 18.724729661786007,
+          "transit_min": 49.67867687912629
+        },
+        "worst_rider_min": {
+          "walk_min": 54.98009627673425
+        },
+        "worst_user_min": {
+          "walk_min": 54.98009627673425,
+          "wait_min": 187.71666666666667,
+          "transit_min": 155.26666666666668
+        }
+      },
+      "provider": {
+        "expected": {
+          "linehaul_kmph": 0.0,
+          "travel_kmph": 56.132295624892095,
+          "odd_cost": 0.0
+        },
+        "worst": {
+          "linehaul_kmph": 0.0,
+          "travel_kmph": 56.132295624892095,
+          "odd_cost": 0.0
+        }
+      }
+    },
+    "TSP_original_unconstrained": {
+      "per_district_worst": {
+        "5041001": {
+          "dispatch_interval_h": 0.42415860077419526,
+          "rider_wait_h": 0.21207930038709763,
+          "rider_transit_h": 0.6360140740289504,
+          "rider_worst_user_h": 1.653102322887499,
+          "rider_wait_min": 12.724758023225858,
+          "rider_transit_min": 38.16084444173703,
+          "rider_worst_user_min": 99.18613937324994,
+          "provider_linehaul_kmph": 3.8011374825936337,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 14.26341966675314,
+          "mass": 0.6308950359764228
+        },
+        "5041002": {
+          "dispatch_interval_h": 0.17086623278963184,
+          "rider_wait_h": 0.08543311639481592,
+          "rider_transit_h": 0.7608963697122164,
+          "rider_worst_user_h": 1.6926589722140646,
+          "rider_wait_min": 5.125986983688955,
+          "rider_transit_min": 45.65378218273298,
+          "rider_worst_user_min": 101.55953833284387,
+          "provider_linehaul_kmph": 0.0,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 33.32888678843748,
+          "mass": 0.8785197899437829
+        },
+        "5041003": {
+          "dispatch_interval_h": 0.6744206553840771,
+          "rider_wait_h": 0.33721032769203857,
+          "rider_transit_h": 0.8003526869363705,
+          "rider_worst_user_h": 2.1542692792669427,
+          "rider_wait_min": 20.232619661522314,
+          "rider_transit_min": 48.02116121618223,
+          "rider_worst_user_min": 129.25615675601657,
+          "provider_linehaul_kmph": 6.705969797472033,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 14.246598237422432,
+          "mass": 0.645990941344052
+        }
+      },
+      "aggregate_worst": {
+        "rider_wait_h": 0.1979623905689365,
+        "rider_transit_h": 0.7361682198056857,
+        "rider_worst_user_h": 2.1542692792669427,
+        "rider_wait_min": 11.877743434136189,
+        "rider_transit_min": 44.17009318834114,
+        "rider_worst_user_min": 129.25615675601657,
+        "provider_linehaul_kmph": 10.507107280065666,
+        "provider_odd_cost": 0.0,
+        "provider_travel_kmph": 61.838904692613056
+      },
+      "per_district_expected": {
+        "5041001": {
+          "dispatch_interval_h": 0.42415860077419526,
+          "rider_wait_h": 0.21207930038709763,
+          "rider_transit_h": 0.23612379403177083,
+          "rider_worst_user_h": 0.8533217628931398,
+          "rider_wait_min": 12.724758023225858,
+          "rider_transit_min": 14.16742764190625,
+          "rider_worst_user_min": 51.199305773588385,
+          "provider_linehaul_kmph": 3.8011374825936337,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 7.207329681119898,
+          "mass": 0.2173848276727193
+        },
+        "5041002": {
+          "dispatch_interval_h": 0.17086623278963184,
+          "rider_wait_h": 0.08543311639481592,
+          "rider_transit_h": 0.18855787864825754,
+          "rider_worst_user_h": 0.5479819900861469,
+          "rider_wait_min": 5.125986983688955,
+          "rider_transit_min": 11.313472718895452,
+          "rider_worst_user_min": 32.878919405168816,
+          "provider_linehaul_kmph": 0.0,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 8.259237973382081,
+          "mass": 0.4451971022673817
+        },
+        "5041003": {
+          "dispatch_interval_h": 0.6744206553840771,
+          "rider_wait_h": 0.33721032769203857,
+          "rider_transit_h": 0.4527135180066836,
+          "rider_worst_user_h": 1.4589909414075688,
+          "rider_wait_min": 20.232619661522314,
+          "rider_transit_min": 27.162811080401013,
+          "rider_worst_user_min": 87.53945648445412,
+          "provider_linehaul_kmph": 6.705969797472033,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 10.388712322972387,
+          "mass": 0.337418070059899
+        }
+      },
+      "aggregate_expected": {
+        "rider_wait_h": 0.19791825599835783,
+        "rider_transit_h": 0.28802887299475655,
+        "rider_worst_user_h": 1.4589909414075688,
+        "rider_wait_min": 11.87509535990147,
+        "rider_transit_min": 17.281732379685394,
+        "rider_worst_user_min": 87.53945648445412,
+        "provider_linehaul_kmph": 10.507107280065666,
+        "provider_odd_cost": 0.0,
+        "provider_travel_kmph": 25.855279977474368
+      }
+    },
+    "TSP_original_constrained": {
+      "per_district_worst": {
+        "5041001": {
+          "dispatch_interval_h": 0.42415860077419526,
+          "rider_wait_h": 0.21207930038709763,
+          "rider_transit_h": 0.48777960476253357,
+          "rider_worst_user_h": 1.3566333843546654,
+          "rider_wait_min": 12.724758023225858,
+          "rider_transit_min": 29.266776285752016,
+          "rider_worst_user_min": 81.39800306127992,
+          "provider_linehaul_kmph": 3.8011374825936337,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 11.647812820485711,
+          "mass": 0.6308950359764228
+        },
+        "5041002": {
+          "dispatch_interval_h": 0.17086623278963184,
+          "rider_wait_h": 0.08543311639481592,
+          "rider_transit_h": 0.6308183555148174,
+          "rider_worst_user_h": 1.4325029438192665,
+          "rider_wait_min": 5.125986983688955,
+          "rider_transit_min": 37.84910133088904,
+          "rider_worst_user_min": 85.95017662915599,
+          "provider_linehaul_kmph": 0.0,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 27.63119183098936,
+          "mass": 0.8785197899437829
+        },
+        "5041003": {
+          "dispatch_interval_h": 0.6744206553840771,
+          "rider_wait_h": 0.33721032769203857,
+          "rider_transit_h": 0.658005194917768,
+          "rider_worst_user_h": 1.8695742952297376,
+          "rider_wait_min": 20.232619661522314,
+          "rider_transit_min": 39.48031169506608,
+          "rider_worst_user_min": 112.17445771378425,
+          "provider_linehaul_kmph": 6.705969797472033,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 12.666913226361642,
+          "mass": 0.645990941344052
+        }
+      },
+      "aggregate_worst": {
+        "rider_wait_h": 0.1979623905689365,
+        "rider_transit_h": 0.5970984931447487,
+        "rider_worst_user_h": 1.8695742952297376,
+        "rider_wait_min": 11.877743434136189,
+        "rider_transit_min": 35.82590958868492,
+        "rider_worst_user_min": 112.17445771378425,
+        "provider_linehaul_kmph": 10.507107280065666,
+        "provider_odd_cost": 0.0,
+        "provider_travel_kmph": 51.94591787783671
+      },
+      "per_district_expected": {
+        "5041001": {
+          "dispatch_interval_h": 0.42415860077419526,
+          "rider_wait_h": 0.21207930038709763,
+          "rider_transit_h": 0.23612379403177083,
+          "rider_worst_user_h": 0.8533217628931398,
+          "rider_wait_min": 12.724758023225858,
+          "rider_transit_min": 14.16742764190625,
+          "rider_worst_user_min": 51.199305773588385,
+          "provider_linehaul_kmph": 3.8011374825936337,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 7.207329681119898,
+          "mass": 0.2173848276727193
+        },
+        "5041002": {
+          "dispatch_interval_h": 0.17086623278963184,
+          "rider_wait_h": 0.08543311639481592,
+          "rider_transit_h": 0.18855787864825754,
+          "rider_worst_user_h": 0.5479819900861469,
+          "rider_wait_min": 5.125986983688955,
+          "rider_transit_min": 11.313472718895452,
+          "rider_worst_user_min": 32.878919405168816,
+          "provider_linehaul_kmph": 0.0,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 8.259237973382081,
+          "mass": 0.4451971022673817
+        },
+        "5041003": {
+          "dispatch_interval_h": 0.6744206553840771,
+          "rider_wait_h": 0.33721032769203857,
+          "rider_transit_h": 0.4527135180066836,
+          "rider_worst_user_h": 1.4589909414075688,
+          "rider_wait_min": 20.232619661522314,
+          "rider_transit_min": 27.162811080401013,
+          "rider_worst_user_min": 87.53945648445412,
+          "provider_linehaul_kmph": 6.705969797472033,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 10.388712322972387,
+          "mass": 0.337418070059899
+        }
+      },
+      "aggregate_expected": {
+        "rider_wait_h": 0.19791825599835783,
+        "rider_transit_h": 0.28802887299475655,
+        "rider_worst_user_h": 1.4589909414075688,
+        "rider_wait_min": 11.87509535990147,
+        "rider_transit_min": 17.281732379685394,
+        "rider_worst_user_min": 87.53945648445412,
+        "provider_linehaul_kmph": 10.507107280065666,
+        "provider_odd_cost": 0.0,
+        "provider_travel_kmph": 25.855279977474368
+      }
+    },
+    "TSP_opt_unconstrained": {
+      "per_district_worst": {
+        "5070001": {
+          "dispatch_interval_h": 0.43587930963136573,
+          "rider_wait_h": 0.21793965481568287,
+          "rider_transit_h": 0.6490196405535166,
+          "rider_worst_user_h": 1.6880828000390156,
+          "rider_wait_min": 13.076379288940972,
+          "rider_transit_min": 38.94117843321099,
+          "rider_worst_user_min": 101.28496800234093,
+          "provider_linehaul_kmph": 3.9351384613237825,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 14.292162658322226,
+          "mass": 0.618286612840304
+        },
+        "5070002": {
+          "dispatch_interval_h": 0.1715495830525514,
+          "rider_wait_h": 0.0857747915262757,
+          "rider_transit_h": 0.7663823402958625,
+          "rider_worst_user_h": 1.7043142636442763,
+          "rider_wait_min": 5.146487491576543,
+          "rider_transit_min": 45.98294041775175,
+          "rider_worst_user_min": 102.25885581865657,
+          "provider_linehaul_kmph": 0.0,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 33.435464601901444,
+          "mass": 0.8852298902817666
+        },
+        "5644005": {
+          "dispatch_interval_h": 0.4212499497064851,
+          "rider_wait_h": 0.21062497485324255,
+          "rider_transit_h": 0.7058193610972,
+          "rider_worst_user_h": 1.7911459581970823,
+          "rider_wait_min": 12.637498491194552,
+          "rider_transit_min": 42.349161665832,
+          "rider_worst_user_min": 107.46875749182495,
+          "provider_linehaul_kmph": 3.708193274863233,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 15.506777216153944,
+          "mass": 0.6399557036621162
+        }
+      },
+      "aggregate_worst": {
+        "rider_wait_h": 0.16117318114455295,
+        "rider_transit_h": 0.714447255850118,
+        "rider_worst_user_h": 1.7911459581970823,
+        "rider_wait_min": 9.670390868673177,
+        "rider_transit_min": 42.86683535100708,
+        "rider_worst_user_min": 107.46875749182495,
+        "provider_linehaul_kmph": 7.643331736187015,
+        "provider_odd_cost": 0.0,
+        "provider_travel_kmph": 63.23440447637761
+      },
+      "per_district_expected": {
+        "5070001": {
+          "dispatch_interval_h": 0.43587930963136573,
+          "rider_wait_h": 0.21793965481568287,
+          "rider_transit_h": 0.23907564179574853,
+          "rider_worst_user_h": 0.8681948025234794,
+          "rider_wait_min": 13.076379288940972,
+          "rider_transit_min": 14.344538507744911,
+          "rider_worst_user_min": 52.09168815140876,
+          "provider_linehaul_kmph": 3.9351384613237825,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 7.253181234042949,
+          "mass": 0.2014143694922696
+        },
+        "5070002": {
+          "dispatch_interval_h": 0.1715495830525514,
+          "rider_wait_h": 0.0857747915262757,
+          "rider_transit_h": 0.1960927269332625,
+          "rider_worst_user_h": 0.5637350369190763,
+          "rider_wait_min": 5.146487491576543,
+          "rider_transit_min": 11.765563615995749,
+          "rider_worst_user_min": 33.82410221514458,
+          "provider_linehaul_kmph": 0.0,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 8.555065905532611,
+          "mass": 0.4701132122808668
+        },
+        "5644005": {
+          "dispatch_interval_h": 0.4212499497064851,
+          "rider_wait_h": 0.21062497485324255,
+          "rider_transit_h": 0.2952066801522937,
+          "rider_worst_user_h": 0.9699205963072697,
+          "rider_wait_min": 12.637498491194552,
+          "rider_transit_min": 17.71240080913762,
+          "rider_worst_user_min": 58.19523577843618,
+          "provider_linehaul_kmph": 3.708193274863233,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 8.21146243208062,
+          "mass": 0.32847241822686357
+        }
+      },
+      "aggregate_expected": {
+        "rider_wait_h": 0.15340453576821975,
+        "rider_transit_h": 0.23730630352310944,
+        "rider_worst_user_h": 0.9699205963072697,
+        "rider_wait_min": 9.204272146093185,
+        "rider_transit_min": 14.238378211386566,
+        "rider_worst_user_min": 58.19523577843618,
+        "provider_linehaul_kmph": 7.643331736187015,
+        "provider_odd_cost": 0.0,
+        "provider_travel_kmph": 24.01970957165618
+      }
+    },
+    "TSP_opt_constrained": {
+      "per_district_worst": {
+        "5070001": {
+          "dispatch_interval_h": 0.43587930963136573,
+          "rider_wait_h": 0.21793965481568287,
+          "rider_transit_h": 0.5226587551025972,
+          "rider_worst_user_h": 1.4353610291371768,
+          "rider_wait_min": 13.076379288940972,
+          "rider_transit_min": 31.35952530615583,
+          "rider_worst_user_min": 86.12166174823061,
+          "provider_linehaul_kmph": 3.9351384613237825,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 12.122471363560592,
+          "mass": 0.618286612840304
+        },
+        "5070002": {
+          "dispatch_interval_h": 0.1715495830525514,
+          "rider_wait_h": 0.0857747915262757,
+          "rider_transit_h": 0.6353664793852035,
+          "rider_worst_user_h": 1.4422825418229586,
+          "rider_wait_min": 5.146487491576543,
+          "rider_transit_min": 38.12198876311221,
+          "rider_worst_user_min": 86.53695250937751,
+          "provider_linehaul_kmph": 0.0,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 27.719549777879198,
+          "mass": 0.8852298902817666
+        },
+        "5644005": {
+          "dispatch_interval_h": 0.4212499497064851,
+          "rider_wait_h": 0.21062497485324255,
+          "rider_transit_h": 0.5667020535098033,
+          "rider_worst_user_h": 1.512911343022289,
+          "rider_wait_min": 12.637498491194552,
+          "rider_transit_min": 34.002123210588195,
+          "rider_worst_user_min": 90.77468058133734,
+          "provider_linehaul_kmph": 3.708193274863233,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 13.03509380777186,
+          "mass": 0.6399557036621162
+        }
+      },
+      "aggregate_worst": {
+        "rider_wait_h": 0.16117318114455295,
+        "rider_transit_h": 0.5823553567284034,
+        "rider_worst_user_h": 1.512911343022289,
+        "rider_wait_min": 9.670390868673177,
+        "rider_transit_min": 34.94132140370421,
+        "rider_worst_user_min": 90.77468058133734,
+        "provider_linehaul_kmph": 7.643331736187015,
+        "provider_odd_cost": 0.0,
+        "provider_travel_kmph": 52.877114949211645
+      },
+      "per_district_expected": {
+        "5070001": {
+          "dispatch_interval_h": 0.43587930963136573,
+          "rider_wait_h": 0.21793965481568287,
+          "rider_transit_h": 0.23907564179574853,
+          "rider_worst_user_h": 0.8681948025234794,
+          "rider_wait_min": 13.076379288940972,
+          "rider_transit_min": 14.344538507744911,
+          "rider_worst_user_min": 52.09168815140876,
+          "provider_linehaul_kmph": 3.9351384613237825,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 7.253181234042949,
+          "mass": 0.2014143694922696
+        },
+        "5070002": {
+          "dispatch_interval_h": 0.1715495830525514,
+          "rider_wait_h": 0.0857747915262757,
+          "rider_transit_h": 0.1960927269332625,
+          "rider_worst_user_h": 0.5637350369190763,
+          "rider_wait_min": 5.146487491576543,
+          "rider_transit_min": 11.765563615995749,
+          "rider_worst_user_min": 33.82410221514458,
+          "provider_linehaul_kmph": 0.0,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 8.555065905532611,
+          "mass": 0.4701132122808668
+        },
+        "5644005": {
+          "dispatch_interval_h": 0.4212499497064851,
+          "rider_wait_h": 0.21062497485324255,
+          "rider_transit_h": 0.2952066801522937,
+          "rider_worst_user_h": 0.9699205963072697,
+          "rider_wait_min": 12.637498491194552,
+          "rider_transit_min": 17.71240080913762,
+          "rider_worst_user_min": 58.19523577843618,
+          "provider_linehaul_kmph": 3.708193274863233,
+          "provider_odd_cost": 0.0,
+          "provider_travel_kmph": 8.21146243208062,
+          "mass": 0.32847241822686357
+        }
+      },
+      "aggregate_expected": {
+        "rider_wait_h": 0.15340453576821975,
+        "rider_transit_h": 0.23730630352310944,
+        "rider_worst_user_h": 0.9699205963072697,
+        "rider_wait_min": 9.204272146093185,
+        "rider_transit_min": 14.238378211386566,
+        "rider_worst_user_min": 58.19523577843618,
+        "provider_linehaul_kmph": 7.643331736187015,
+        "provider_odd_cost": 0.0,
+        "provider_travel_kmph": 24.01970957165618
+      }
+    }
+  }
+}
