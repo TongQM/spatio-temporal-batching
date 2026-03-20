@@ -1,6 +1,6 @@
 # Spatio-Temporal Batching: Transit Service District Partitioning
 
-This project implements optimization algorithms for partitioning a geographic area into contiguous transit service districts, with simultaneous depot location optimization under demand uncertainty. The primary application is the Pittsburgh High Capacity Transit (HCT) network.
+This project implements optimization algorithms for partitioning a geographic area into contiguous transit service districts, with simultaneous depot location optimization under demand uncertainty. The primary application is the Pittsburgh Heritage Community Transit (HCT) service.
 
 ## Problem
 
