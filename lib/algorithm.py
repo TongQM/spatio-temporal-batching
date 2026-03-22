@@ -198,8 +198,8 @@ class Partition:
                 expanded[j, center_idx_map[block_centers[d]]] = block_assignment[j, d]
         return expanded
 
-    def random_search(self, max_iters=1000, prob_dict=None, Lambda=1.0, wr=1.0, wv=10.0, beta=0.7120, 
-                      Omega_dict=None, J_function=None):
+    def random_search(self, max_iters=1000, prob_dict=None, Lambda=1.0, wr=1.0, wv=10.0, beta=0.7120,
+                      Omega_dict=None, J_function=None, T_override=None):
         """
         Enhanced randomized search with depot optimization and ODD cost integration.
         
@@ -247,7 +247,8 @@ class Partition:
             
             # Evaluate partition with optimized depot
             obj_val, district_info = self.evaluate_partition_objective(
-                expanded_assignment, optimized_depot, prob_dict, Lambda, wr, wv, beta, Omega_dict, J_function
+                expanded_assignment, optimized_depot, prob_dict, Lambda, wr, wv, beta, Omega_dict, J_function,
+                T_override=T_override
             )
             
             # Update best solution
@@ -260,16 +261,17 @@ class Partition:
         
         # Apply enhanced local search to best solution
         final_depot, final_centers, final_assignment, final_obj_val, final_district_info = self.local_search(
-            best_block_centers, best_obj_val, prob_dict, Lambda, wr, wv, beta, 
-            best_depot, Omega_dict, J_function
+            best_block_centers, best_obj_val, prob_dict, Lambda, wr, wv, beta,
+            best_depot, Omega_dict, J_function, T_override=T_override
         )
-        
+
         # Optionally relocate roots to be closest to depot for optimal linehaul costs
         optimized_assignment, optimized_roots = self.relocate_roots_to_depot_closest(final_assignment, final_depot)
-        
+
         # Re-evaluate with optimized root locations
         optimized_obj_val, optimized_district_info = self.evaluate_partition_objective(
-            optimized_assignment, final_depot, prob_dict, Lambda, wr, wv, beta, Omega_dict, J_function
+            optimized_assignment, final_depot, prob_dict, Lambda, wr, wv, beta, Omega_dict, J_function,
+            T_override=T_override
         )
         
         print(f"Best depot: {final_depot}")
@@ -281,8 +283,8 @@ class Partition:
         
         return final_depot, optimized_roots, optimized_assignment, optimized_obj_val, optimized_district_info
 
-    def local_search(self, block_centers, best_obj_val, prob_dict=None, Lambda=1.0, wr=1.0, wv=10.0, beta=0.7120, 
-                     depot_id=None, Omega_dict=None, J_function=None):
+    def local_search(self, block_centers, best_obj_val, prob_dict=None, Lambda=1.0, wr=1.0, wv=10.0, beta=0.7120,
+                     depot_id=None, Omega_dict=None, J_function=None, T_override=None):
         """
         Enhanced local search with depot optimization and ODD cost integration.
         
@@ -314,7 +316,8 @@ class Partition:
         
         # Evaluate current solution
         obj_val, district_info = self.evaluate_partition_objective(
-            expanded_assignment, depot_id, prob_dict, Lambda, wr, wv, beta, Omega_dict, J_function
+            expanded_assignment, depot_id, prob_dict, Lambda, wr, wv, beta, Omega_dict, J_function,
+            T_override=T_override
         )
         print(f"Original objective value: {obj_val}")
         
@@ -344,21 +347,22 @@ class Partition:
                     
                     # Evaluate new solution
                     new_obj_val, new_district_info = self.evaluate_partition_objective(
-                        expanded_new_assignment, new_depot, prob_dict, Lambda, wr, wv, beta, Omega_dict, J_function
+                        expanded_new_assignment, new_depot, prob_dict, Lambda, wr, wv, beta, Omega_dict, J_function,
+                        T_override=T_override
                     )
-                    
+
                     # If improvement found, recurse
                     if new_obj_val < best_obj_val:
                         print(f"new obj val: {new_obj_val}")
                         return self.local_search(
-                            new_centers, new_obj_val, prob_dict, Lambda, wr, wv, beta, 
-                            new_depot, Omega_dict, J_function
+                            new_centers, new_obj_val, prob_dict, Lambda, wr, wv, beta,
+                            new_depot, Omega_dict, J_function, T_override=T_override
                         )
         
         return best_depot, block_centers, best_assignment, best_obj_val, best_district_info
 
 
-    def _CQCP_benders(self, assigned_blocks, root, prob_dict, epsilon, K_i, F_i, grid_points=20, beta=None, Lambda=None, single_threaded=False):
+    def _CQCP_benders(self, assigned_blocks, root, prob_dict, epsilon, K_i, F_i, grid_points=20, beta=None, Lambda=None, single_threaded=False, T_override=None):
         """
         Updated CQCP subproblem that accepts partition-dependent costs K_i and F_i as parameters.
         
@@ -458,9 +462,6 @@ class Partition:
             wr = wr_mph * 1.60934
             wv = wv_mph * 1.60934
         
-        # Newton's method for optimal ci (dispatch subinterval)
-        # g_bar is strictly convex, so we can find the exact optimum analytically
-        
         def g_bar_objective(ci):
             """Objective function g_bar(ci)"""
             provider = (K_i + F_i) * ci**-2 + alpha_provider * ci**-1
@@ -468,36 +469,31 @@ class Partition:
             rider_travel = (wr/wv) * alpha_i * ci
             rider_wait = wr * ci**2
             return provider + rider_linehaul + rider_travel + rider_wait
-        
-        def g_bar_derivative(ci):
-            """First derivative dg_bar/dci"""
-            return (-2*(K_i + F_i) * ci**-3 - alpha_provider * ci**-2 + 2*wr*ci + (wr/wv) * alpha_i)
-        
-        def g_bar_second_derivative(ci):
-            """Second derivative d²g_bar/dci²"""
-            return (6*(K_i + F_i) * ci**-4 + 2*alpha_provider * ci**-3 + 2*wr)
-        
-        # Newton's method starting from a reasonable initial guess
-        ci_star = np.sqrt(max(1.0, min(10.0, wv/wr)))  # Start near the high-Lambda limit
-        
-        # Newton iterations
-        for newton_iter in range(20):  # Usually converges in 3-5 iterations
-            grad = g_bar_derivative(ci_star)
-            hess = g_bar_second_derivative(ci_star)
-            
-            if abs(grad) < 1e-8:  # Convergence tolerance
-                break
-                
-            ci_new = ci_star - grad / hess
-            
-            # Ensure ci stays in reasonable bounds
-            ci_new = max(0.01, min(ci_new, 20.0))  
-            
-            if abs(ci_new - ci_star) < 1e-10:
-                break
-                
-            ci_star = ci_new
-        
+
+        if T_override is not None:
+            # Fixed dispatch interval: skip Newton, evaluate at the given T
+            ci_star = np.sqrt(max(1e-6, T_override))
+        else:
+            # Newton's method for optimal ci (dispatch subinterval)
+            # g_bar is strictly convex, so we can find the exact optimum analytically
+            def g_bar_derivative(ci):
+                return (-2*(K_i + F_i) * ci**-3 - alpha_provider * ci**-2 + 2*wr*ci + (wr/wv) * alpha_i)
+
+            def g_bar_second_derivative(ci):
+                return (6*(K_i + F_i) * ci**-4 + 2*alpha_provider * ci**-3 + 2*wr)
+
+            ci_star = np.sqrt(max(1.0, min(10.0, wv/wr)))
+            for newton_iter in range(20):
+                grad = g_bar_derivative(ci_star)
+                hess = g_bar_second_derivative(ci_star)
+                if abs(grad) < 1e-8:
+                    break
+                ci_new = ci_star - grad / hess
+                ci_new = max(0.01, min(ci_new, 20.0))
+                if abs(ci_new - ci_star) < 1e-10:
+                    break
+                ci_star = ci_new
+
         C_star = ci_star**2
         best_obj = g_bar_objective(ci_star)
         
@@ -1174,7 +1170,7 @@ class Partition:
         
         return district_omega_dict
 
-    def evaluate_partition_objective(self, assignment, depot_id, prob_dict, Lambda, wr, wv, beta=0.7120, Omega_dict=None, J_function=None):
+    def evaluate_partition_objective(self, assignment, depot_id, prob_dict, Lambda, wr, wv, beta=0.7120, Omega_dict=None, J_function=None, T_override=None):
         """
         Evaluate the real-problem objective for a given assignment with depot location.
         Enhanced version that properly handles depot location and ODD costs.
@@ -1226,7 +1222,7 @@ class Partition:
             # CQCP inner maximization with updated costs
             cost, x_star, _, T_star, alpha_i, subgrad_K_i, subgrad_F_i = self._CQCP_benders(
                 assigned_blocks, root, prob_dict, epsilon, K_i=K_i, F_i=F_i,
-                beta=beta, Lambda=Lambda
+                beta=beta, Lambda=Lambda, T_override=T_override
             )
             
             district_info.append((cost, root, K_i, F_i, T_star, x_star))
