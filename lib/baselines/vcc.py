@@ -207,20 +207,18 @@ class VCC(BaselineMethod):
             dispatch_intervals=dispatch_intervals,
         )
 
-    def evaluate(
+    def compute_route_costs(
         self,
         design: ServiceDesign,
         geodata,
         prob_dict: Dict[str, float],
-        Omega_dict,
-        J_function: Callable,
         Lambda: float,
         wr: float,
-        wv: float,
-        beta: float = BETA,
-        road_network=None,
-    ) -> EvaluationResult:
-        """Evaluate with VCC-optimised in-district tour lengths."""
+    ) -> tuple:
+        """Compute VCC-optimised tour lengths and walk times.
+
+        Returns (tour_km_overrides, avg_walk_time_h).
+        """
         block_ids = geodata.short_geoid_list
         N = len(block_ids)
         assignment = design.assignment
@@ -253,7 +251,25 @@ class VCC(BaselineMethod):
 
         acc_prob = max(acc_prob, 1e-12)
         avg_walk_time_h = (acc_walk_km / acc_prob) / self.walk_speed_kmh
+        return tour_km_overrides, avg_walk_time_h
 
+    def evaluate(
+        self,
+        design: ServiceDesign,
+        geodata,
+        prob_dict: Dict[str, float],
+        Omega_dict,
+        J_function: Callable,
+        Lambda: float,
+        wr: float,
+        wv: float,
+        beta: float = BETA,
+        road_network=None,
+    ) -> EvaluationResult:
+        """Evaluate with VCC-optimised in-district tour lengths."""
+        tour_km_overrides, avg_walk_time_h = self.compute_route_costs(
+            design, geodata, prob_dict, Lambda, wr,
+        )
         result = evaluate_design(
             design, geodata, prob_dict, Omega_dict, J_function,
             Lambda, wr, wv, beta, road_network,

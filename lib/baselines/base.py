@@ -215,6 +215,230 @@ def _centroid_block(geodata, block_ids: List[str]) -> str:
 # Core shared evaluation
 # ---------------------------------------------------------------------------
 
+def _nn_tsp_length(depot: np.ndarray, points: np.ndarray) -> float:
+    """Nearest-neighbour TSP tour: depot → points → depot.  Returns km."""
+    n = len(points)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return 2.0 * float(np.linalg.norm(points[0] - depot))
+
+    used = np.zeros(n, dtype=bool)
+    current = depot.copy()
+    total = 0.0
+    for _ in range(n):
+        dists = np.linalg.norm(points - current, axis=1)
+        dists[used] = np.inf
+        nearest = int(np.argmin(dists))
+        total += float(dists[nearest])
+        current = points[nearest]
+        used[nearest] = True
+    total += float(np.linalg.norm(current - depot))
+    return total
+
+
+def simulate_design(
+    design: ServiceDesign,
+    geodata,
+    prob_dict: Dict[str, float],
+    Omega_dict,
+    J_function: Callable,
+    Lambda: float,
+    wr: float,
+    wv: float,
+    beta: float = BETA,
+    discount: float = TSP_TRAVEL_DISCOUNT,
+    walk_time_override: float = 0.0,
+    tour_km_overrides: Optional[Dict[str, float]] = None,
+    n_scenarios: int = 500,
+    resolution: int = 100,
+) -> EvaluationResult:
+    """
+    Continuous-space Monte Carlo evaluation.
+
+    For each scenario:
+      1. Sample n_i ~ Poisson(Lambda * T_i * p_i) demand per district.
+      2. Sample demand-point locations from the continuous density f(x)
+         within each district (grid-cell sampling + uniform jitter).
+      3. Compute NN-TSP tour through the realised points.
+      4. Derive per-district costs from the actual tour length.
+
+    All spatial computations use km (positions converted from metres).
+    """
+    block_ids = geodata.short_geoid_list
+    N = len(block_ids)
+    assignment = design.assignment
+
+    # --- Positions in km ---
+    block_pos_m = np.array([_get_pos(geodata, b) for b in block_ids])
+    block_pos = block_pos_m / 1000.0
+    depot_idx = block_ids.index(design.depot_id)
+    depot_pos = block_pos[depot_idx]
+
+    # --- Identify districts from assignment matrix ---
+    roots = []  # root block indices
+    for i in range(N):
+        if round(assignment[i, i]) == 1:
+            roots.append(i)
+    n_districts = len(roots)
+
+    block_district = np.full(N, -1, dtype=int)
+    for d, root_idx in enumerate(roots):
+        for j in range(N):
+            if round(assignment[j, root_idx]) == 1:
+                block_district[j] = d
+
+    # --- Fine grid in km for continuous density ---
+    areas_km2 = np.array([max(float(geodata.get_area(b)), 1e-12)
+                           for b in block_ids])
+    probs = np.array([prob_dict.get(b, 0.0) for b in block_ids])
+
+    span = block_pos.max(axis=0) - block_pos.min(axis=0)
+    pad = float(span.max()) * 0.05 + 0.05
+    lo = block_pos.min(axis=0) - pad
+    hi = block_pos.max(axis=0) + pad
+
+    xs = np.linspace(lo[0], hi[0], resolution)
+    ys = np.linspace(lo[1], hi[1], resolution)
+    dA = float((xs[1] - xs[0]) * (ys[1] - ys[0]))  # km²
+    cell_dx = float(xs[1] - xs[0]) if len(xs) > 1 else 0.0
+    cell_dy = float(ys[1] - ys[0]) if len(ys) > 1 else 0.0
+
+    xx, yy = np.meshgrid(xs, ys)
+    grid_pos = np.column_stack([xx.ravel(), yy.ravel()])  # (M, 2) km
+
+    # Nearest-block interpolation for density
+    dists_gb = np.linalg.norm(
+        grid_pos[:, None, :] - block_pos[None, :, :], axis=2,
+    )  # (M, N)
+    nearest_block = np.argmin(dists_gb, axis=1)  # (M,)
+
+    f_vals = probs[nearest_block] / areas_km2[nearest_block]  # per km²
+    f_dA = np.maximum(f_vals, 0.0) * dA               # probability mass
+
+    # Grid cell → district (via nearest block's assignment)
+    grid_district = block_district[nearest_block]
+
+    # --- Per-district measures and sampling distributions ---
+    p_dist = np.zeros(n_districts)
+    K_dist = np.zeros(n_districts)
+    F_dist = np.zeros(n_districts)
+    T_dist = np.zeros(n_districts)
+
+    # Per-district: cell indices, positions, sampling probabilities
+    district_cells = []       # list of (cell_indices, cell_positions, cell_probs)
+
+    for d in range(n_districts):
+        root_id = block_ids[roots[d]]
+        T_dist[d] = design.dispatch_intervals.get(root_id, 1.0)
+
+        cell_mask = grid_district == d
+        cell_idx = np.where(cell_mask)[0]
+        mass = f_dA[cell_idx]
+        total_mass = float(mass.sum())
+        p_dist[d] = total_mass
+
+        if len(cell_idx) > 0 and total_mass > 1e-15:
+            cell_prob = mass / total_mass
+            K_dist[d] = float(np.linalg.norm(
+                grid_pos[cell_idx] - depot_pos, axis=1,
+            ).min())
+        else:
+            cell_prob = np.ones(max(len(cell_idx), 1)) / max(len(cell_idx), 1)
+        district_cells.append((cell_idx, grid_pos[cell_idx], cell_prob))
+
+        # F_i: ODD cost (inherently discrete — max over blocks)
+        assigned_blocks = [block_ids[j] for j in range(N)
+                           if block_district[j] == d]
+        if Omega_dict and J_function and assigned_blocks:
+            ref = next(iter(Omega_dict.values()))
+            omega_max = np.zeros_like(ref)
+            for b in assigned_blocks:
+                omega_max = np.maximum(
+                    omega_max, Omega_dict.get(b, np.zeros_like(ref)))
+            F_dist[d] = J_function(omega_max)
+
+    # --- Monte Carlo: sample demand points, compute NN-TSP tours ---
+    rng = np.random.default_rng(42)
+    mu = Lambda * T_dist * p_dist  # expected demand per district (D,)
+
+    n_demand = rng.poisson(
+        lam=np.broadcast_to(mu, (n_scenarios, n_districts)).copy(),
+    )  # (S, D)
+
+    tour_km_scenarios = np.zeros((n_scenarios, n_districts))
+
+    for d in range(n_districts):
+        root_id = block_ids[roots[d]]
+        # Skip Monte Carlo if tour is overridden (e.g. fixed-route designs)
+        if tour_km_overrides and root_id in tour_km_overrides:
+            tour_km_scenarios[:, d] = tour_km_overrides[root_id]
+            continue
+
+        cell_idx, cell_pos, cell_prob = district_cells[d]
+        if len(cell_idx) == 0:
+            continue
+
+        for s in range(n_scenarios):
+            n_d = int(n_demand[s, d])
+            if n_d == 0:
+                continue
+            # Sample demand-point locations from the district density
+            sampled = rng.choice(len(cell_idx), size=n_d, p=cell_prob)
+            points = cell_pos[sampled].copy()
+            # Uniform jitter within cell for continuous sampling
+            points[:, 0] += rng.uniform(-0.5 * cell_dx, 0.5 * cell_dx, size=n_d)
+            points[:, 1] += rng.uniform(-0.5 * cell_dy, 0.5 * cell_dy, size=n_d)
+            # NN-TSP tour through realised demand points
+            tour_km_scenarios[s, d] = _nn_tsp_length(depot_pos, points)
+
+    avg_tour_km = tour_km_scenarios.mean(axis=0)  # (D,)
+
+    # --- Aggregate costs (demand-weighted) ---
+    total_prob = max(float(p_dist.sum()), 1e-12)
+
+    acc_linehaul    = float((K_dist / T_dist * p_dist).sum())
+    acc_in_district = float((avg_tour_km / (discount * T_dist) * p_dist).sum())
+    acc_odd         = float((F_dist / T_dist * p_dist).sum())
+    acc_fleet       = float((avg_tour_km / (VEHICLE_SPEED_KMH * T_dist)).sum())
+    acc_wait        = float((T_dist / 2.0 * p_dist).sum())
+    acc_invehicle   = float((avg_tour_km / (2.0 * VEHICLE_SPEED_KMH) * p_dist).sum())
+    acc_T_w         = float((T_dist * p_dist).sum())
+
+    avg_wait      = acc_wait / total_prob
+    avg_invehicle = acc_invehicle / total_prob
+    avg_walk      = walk_time_override
+    total_user_time = avg_wait + avg_invehicle + avg_walk
+
+    linehaul_cost     = acc_linehaul
+    in_district_cost  = acc_in_district
+    total_travel_cost = linehaul_cost + in_district_cost
+    odd_cost          = acc_odd
+    fleet_size        = acc_fleet
+    avg_dispatch_interval = acc_T_w / total_prob
+
+    provider_cost = linehaul_cost + in_district_cost + odd_cost
+    user_cost     = wr * total_user_time * total_prob
+    total_cost    = provider_cost + user_cost
+
+    return EvaluationResult(
+        name=design.name,
+        avg_wait_time=avg_wait,
+        avg_invehicle_time=avg_invehicle,
+        avg_walk_time=avg_walk,
+        total_user_time=total_user_time,
+        linehaul_cost=linehaul_cost,
+        in_district_cost=in_district_cost,
+        total_travel_cost=total_travel_cost,
+        fleet_size=fleet_size,
+        avg_dispatch_interval=avg_dispatch_interval,
+        odd_cost=odd_cost,
+        provider_cost=provider_cost,
+        user_cost=user_cost,
+        total_cost=total_cost,
+    )
+
+
 def evaluate_design(
     design: ServiceDesign,
     geodata,

@@ -182,16 +182,40 @@ def build_road_network(args):
 
 def run_baseline(method, name, geodata, prob_dict, Omega_dict, J_function,
                  num_districts, Lambda, wr, wv, road_network):
+    from lib.baselines.base import simulate_design, EvaluationResult
     try:
         print(f"  [{name}] designing …", end=" ", flush=True)
         design = method.design(
             geodata, prob_dict, Omega_dict, J_function, num_districts,
             Lambda=Lambda, wr=wr, wv=wv,
         )
-        print("evaluating …", end=" ", flush=True)
-        result = method.evaluate(
-            design, geodata, prob_dict, Omega_dict, J_function,
-            Lambda, wr, wv, road_network=road_network,
+        print("simulating …", end=" ", flush=True)
+
+        # Methods with custom simulation (e.g. TP-Lit ADP+VRP)
+        if hasattr(method, 'custom_simulate'):
+            result = method.custom_simulate(
+                design, geodata, prob_dict, Omega_dict, J_function,
+                Lambda, wr, wv,
+            )
+        else:
+            # Methods with custom route costs (FR, VCC) provide overrides
+            walk_time_h = 0.0
+            tour_km_overrides = None
+            if hasattr(method, 'compute_route_costs'):
+                tour_km_overrides, walk_time_h = method.compute_route_costs(
+                    design, geodata, prob_dict, Lambda, wr,
+                )
+
+            result = simulate_design(
+                design, geodata, prob_dict, Omega_dict, J_function,
+                Lambda, wr, wv,
+                walk_time_override=walk_time_h,
+                tour_km_overrides=tour_km_overrides,
+            )
+        # Override name to match the baseline label
+        result = EvaluationResult(
+            name=name,
+            **{k: v for k, v in result.__dict__.items() if k != 'name'},
         )
         print(f"done  (total_cost={result.total_cost:.4f})")
         return result
@@ -249,20 +273,20 @@ def main():
     road_network = build_road_network(args) if args.mode == 'real' else None
 
     from lib.baselines import (
-        FullyOD, FixedRoute, TemporalOnly, SpatialOnly,
-        JointNom, JointDRO, VCC, FRDetour,
+        FullyOD, TemporalOnly,
+        JointNom, JointDRO, VCC, FRDetour, CarlssonPartition,
     )
 
-    # Table order: existing baselines + multi-route FR variants
+    # Table order: FR, spatial, temporal, joint, VCC, OD
     baselines = [
-        ("Multi-FR",        FRDetour(delta=0.0, max_iters=args.rs_iters, name="Multi-FR")),
-        ("OD",              FullyOD()),
-        ("SP-Lit",          SpatialOnly(T_fixed=args.T_fixed, max_iters=args.rs_iters)),
-        ("TP-Lit",          TemporalOnly()),
-        ("Joint-Nom",       JointNom(max_iters=args.rs_iters)),
-        ("Joint-DRO",       JointDRO(epsilon=args.epsilon, max_iters=args.rs_iters)),
-        ("VCC",             VCC()),
-        ("Multi-FR-Detour", FRDetour(delta=0.3, max_iters=args.rs_iters)),
+        ("Multi-FR (Jacquillat)",        FRDetour(delta=0.0, max_iters=args.rs_iters, name="Multi-FR (Jacquillat)")),
+        ("Multi-FR-Detour (Jacquillat)", FRDetour(delta=0.3, max_iters=args.rs_iters)),
+        ("SP-Lit (Carlsson)",            CarlssonPartition(T_fixed=args.T_fixed)),
+        ("TP-Lit (Liu)",                 TemporalOnly()),
+        ("Joint-Nom",                    JointNom(max_iters=args.rs_iters)),
+        ("Joint-DRO",                    JointDRO(epsilon=args.epsilon, max_iters=args.rs_iters)),
+        ("VCC",                          VCC()),
+        ("OD",                           FullyOD()),
     ]
 
     print(f"\nRunning {len(baselines)} baselines")

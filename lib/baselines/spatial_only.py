@@ -1,5 +1,5 @@
 """
-Spatial-only baseline (Carlsson et al. 2024): K districts, fixed T.
+Spatial-only baseline: K districts via random search, fixed T.
 Represents pure spatial partitioning without temporal dispatch optimisation.
 """
 from __future__ import annotations
@@ -16,8 +16,7 @@ from lib.baselines.base import (
 class SpatialOnly(BaselineMethod):
     """K districts via random search (ε=0), fixed global dispatch interval T.
 
-    Corresponds to Carlsson et al. (2024): optimal spatial partitioning,
-    but no per-district dispatch optimisation.
+    Pure spatial partition optimisation with no per-district dispatch tuning.
     """
 
     def __init__(self, T_fixed: float = 0.5, max_iters: int = 200):
