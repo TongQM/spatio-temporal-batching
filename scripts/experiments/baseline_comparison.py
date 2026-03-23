@@ -250,18 +250,19 @@ def main():
 
     from lib.baselines import (
         FullyOD, FixedRoute, TemporalOnly, SpatialOnly,
-        JointNom, JointDRO, VCC,
+        JointNom, JointDRO, VCC, FRDetour,
     )
 
-    # Table order matches the paper figure: FR, OD, SP-Lit, TP-Lit, Joint-Nom, Joint-DRO
+    # Table order: existing baselines + multi-route FR variants
     baselines = [
-        ("FR",         FixedRoute(T_fixed=args.T_fixed)),
-        ("OD",         FullyOD()),
-        ("SP-Lit",     SpatialOnly(T_fixed=args.T_fixed, max_iters=args.rs_iters)),
-        ("TP-Lit",     TemporalOnly()),
-        ("Joint-Nom",  JointNom(max_iters=args.rs_iters)),
-        ("Joint-DRO",  JointDRO(epsilon=args.epsilon, max_iters=args.rs_iters)),
-        ("VCC",        VCC()),
+        ("Multi-FR",        FRDetour(delta=0.0, max_iters=args.rs_iters, name="Multi-FR")),
+        ("OD",              FullyOD()),
+        ("SP-Lit",          SpatialOnly(T_fixed=args.T_fixed, max_iters=args.rs_iters)),
+        ("TP-Lit",          TemporalOnly()),
+        ("Joint-Nom",       JointNom(max_iters=args.rs_iters)),
+        ("Joint-DRO",       JointDRO(epsilon=args.epsilon, max_iters=args.rs_iters)),
+        ("VCC",             VCC()),
+        ("Multi-FR-Detour", FRDetour(delta=0.3, max_iters=args.rs_iters)),
     ]
 
     print(f"\nRunning {len(baselines)} baselines")

@@ -1,12 +1,19 @@
 """
-Fixed-Route (FR) baseline: fixed routes with fixed headway T_fixed.
-Represents pure temporal batching (no spatial optimisation).
+Multi Fixed-Route (Multi-FR) baseline: multiple fixed routes with fixed headway.
 
-For synthetic grids: K vertical strips as routes, blocks assigned to nearest strip.
-For real cities: accepts an external assignment matrix (e.g. from inputs.py).
+K routes via vertical strips (synthetic) or pre-computed assignment (real cities).
+Each route/district served by a vehicle dispatched every T_fixed hours.
+Represents spatio-temporal batching with low (fixed-route) flexibility.
+
+.. deprecated::
+    This class uses BHH evaluation (vehicle visits individual customers, walk=0),
+    which is inconsistent with a fixed-route service model. Use
+    ``FRDetour(delta=0)`` from ``lib.baselines.fr_detour`` instead, which
+    correctly models explicit TSP through zone centroids with non-zero walk time.
 """
 from __future__ import annotations
 
+import warnings
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
@@ -40,6 +47,12 @@ class FixedRoute(BaselineMethod):
         depot_id: Optional[str] = None,
         num_strips: Optional[int] = None,
     ):
+        warnings.warn(
+            "FixedRoute uses BHH evaluation (walk=0), which is inconsistent with "
+            "a fixed-route service model. Use FRDetour(delta=0) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.T_fixed = T_fixed
         self._preset_assignment = assignment
         self._preset_depot = depot_id
@@ -80,7 +93,7 @@ class FixedRoute(BaselineMethod):
         dispatch_intervals = {r: self.T_fixed for r in roots}
 
         return ServiceDesign(
-            name="FR",
+            name="Multi-FR",
             assignment=assignment,
             depot_id=depot_id,
             district_roots=roots,

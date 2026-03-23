@@ -30,6 +30,8 @@ class ServiceDesign:
     district_roots: List[str]
     # root → T* (hours)
     dispatch_intervals: Dict[str, float] = field(default_factory=dict)
+    # root → fixed-route ordering (list of local block indices in visit order)
+    district_routes: Dict[str, List[int]] = field(default_factory=dict)
 
 
 @dataclass
