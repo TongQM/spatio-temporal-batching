@@ -6,7 +6,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -24,14 +24,19 @@ VEHICLE_SPEED_KMH = 30.0   # assumed shuttle speed for fleet/transit-time estima
 class ServiceDesign:
     """Fully describes a service design produced by a baseline method."""
     name: str
-    # N×N binary matrix: assignment[j, i] = 1 iff block j is in district i
-    assignment: np.ndarray
-    depot_id: str
-    district_roots: List[str]
+    # N×N binary matrix: assignment[j, i] = 1 iff block j is in district i.
+    # Non-partition modes may leave this unset and rely on service_metadata.
+    assignment: Optional[np.ndarray] = None
+    depot_id: str = ""
+    district_roots: List[str] = field(default_factory=list)
     # root → T* (hours)
     dispatch_intervals: Dict[str, float] = field(default_factory=dict)
     # root → fixed-route ordering (list of global block indices in visit order)
     district_routes: Dict[str, List[int]] = field(default_factory=dict)
+    # High-level mode tag so non-partition designs do not have to fake districts.
+    service_mode: str = "partition"
+    # Mode-specific metadata for evaluators / visualizers.
+    service_metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -265,6 +270,9 @@ def simulate_design(
 
     All spatial computations use km (positions converted from metres).
     """
+    if design.assignment is None:
+        raise ValueError("simulate_design requires a partition-based ServiceDesign with assignment.")
+
     block_ids = geodata.short_geoid_list
     N = len(block_ids)
     assignment = design.assignment
@@ -474,6 +482,9 @@ def evaluate_design(
         Pre-computed average walk time (hours) for FR mode; 0 elsewhere.
     """
     from lib.tsp_solver import tsp_tour_length
+
+    if design.assignment is None:
+        raise ValueError("evaluate_design requires a partition-based ServiceDesign with assignment.")
 
     block_ids = geodata.short_geoid_list
     N = len(block_ids)

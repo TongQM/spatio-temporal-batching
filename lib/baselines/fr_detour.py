@@ -1,14 +1,14 @@
 """
 Multi Fixed-Route with Detour — MiND-structured adaptation (Martin-Iradi et al. 2025)
 
-MiND-structured adaptation of the double decomposition from:
+Adaptation of the double decomposition from:
   "A Double Decomposition Algorithm for Network Planning and Operations in
   Deviated Fixed-route Microtransit"
   (Martin-Iradi, Schmid, Cummings, Jacquillat 2025, arXiv:2402.01265)
 
 to a steady-state district-based service design setting.
 
-Algorithm structure:
+Algorithm structure (from the paper):
   Double decomposition:
     - Outer: SAA multi-cut Benders with scenario-wise optimality cuts
     - Inner: column generation with label-setting DP pricing
@@ -26,13 +26,34 @@ Algorithm structure:
     - Benders cut coefficients: π[b] + μ[b] (linking + coverage duals)
 
 Adaptations from the paper (honest deviations):
-  - Block-level demand aggregation: each block fully served or not;
-    binary service requirement, count-based passenger load
-  - Steady-state timing surrogate: time_budget = (1+α)*direct_dist/speed,
-    not the paper's scheduled checkpoint arrival times
-  - Line library via angular partition + NN-TSP (not pre-existing network)
-  - Reachability = within δ of any checkpoint (not subpath-specific feasibility)
-  - First-stage load bounds use expected demand; scenario capacity in 2nd stage
+
+  Structural:
+    - Block-level demand aggregation (not individual passengers)
+    - Steady-state timing surrogate: time_budget = (1+α)*direct_dist/speed,
+      not the paper's scheduled checkpoint arrival times
+    - Line library via angular partition + NN-TSP (not pre-existing network)
+    - Expected-demand master load bounds; scenario capacity in 2nd stage
+
+  Cost model (repo-specific, differs from the paper):
+    - Master objective uses FR-consistent cost structure:
+        * No linehaul term (depot travel is part of the route tour)
+        * No ODD term (vehicles run on a fixed schedule)
+        * Wait cost is demand-weighted: wr * T/2 * Σ prob[b] * z[b,ℓ,t]
+    - This aligns the master with this repo's evaluation semantics,
+      not the paper's original planning + service-quality objective.
+
+  Reachability:
+    - Geometric δ-distance to route segments, plus time-budget feasibility
+      for a single-block detour.  Still weaker than the paper's full subpath
+      feasibility model (which considers multi-block detour paths).
+
+  Evaluation:
+    - Final scoring uses a BHH-style stochastic tour simulator
+      (_fr_detour_tour_stochastic), not the subpath-routing LP.
+    - This means the design is optimized against one routing model
+      (subpath LP via Benders) but scored by another (BHH Monte Carlo).
+    - The gap is accepted as an optimization-vs-evaluation separation
+      consistent with this repo's design philosophy.
 
 When delta=0: "Multi-FR" (no deviations).
 When delta>0: "Multi-FR-Detour" (deviation within δ-corridor).
@@ -211,6 +232,10 @@ def _fr_detour_tour_stochastic(
                 BETA * np.sqrt(n_j * math.pi) * cr,
                 2.0 * walk_saved[active],
             )
+            # Marginal total-cost impact of detouring to block j.
+            # Walk is a per-rider average in evaluate(), so the marginal
+            # walk saving from detouring to j is walk_saved_j * n_j / n_total
+            # (contribution to the demand-weighted average).
             benefit = wr * walk_saved[active] * n_j / (n_total * walk_speed)
             cost = (mini_km / (discount * T)
                     + wr * mini_km / (2.0 * VEHICLE_SPEED_KMH))
@@ -244,13 +269,17 @@ def _point_to_segment_dist(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float
     return float(np.linalg.norm(p - proj))
 
 
-def _compute_reachable(checkpoints, block_ids, block_pos_km, delta):
-    """Blocks within delta of any route segment or checkpoint.
+def _compute_reachable(checkpoints, block_ids, block_pos_km, delta,
+                       speed_kmh=VEHICLE_SPEED_KMH, alpha_time=0.5):
+    """Blocks within delta of a route segment AND time-feasible to detour to.
 
-    Uses segment-based reachability: a block is reachable if its distance
-    to any checkpoint-to-checkpoint segment (or to any checkpoint itself)
-    is at most delta.  This matches the corridor definition used by the
-    second-stage subpath arcs in _build_initial_arcs.
+    A block is reachable if:
+      1. it is within delta of some checkpoint-to-checkpoint segment, AND
+      2. a single-block detour from one segment endpoint through the block
+         to the other endpoint fits within that segment's time budget.
+
+    This tightens the purely geometric check to match what _build_initial_arcs
+    can actually produce as a feasible subpath arc.
     """
     reachable = set(checkpoints)
     if delta <= 0:
@@ -259,19 +288,28 @@ def _compute_reachable(checkpoints, block_ids, block_pos_km, delta):
         if b in reachable:
             continue
         b_pos = block_pos_km[b]
-        # Check distance to each checkpoint (endpoint reachability)
-        for cp in checkpoints:
-            if float(np.linalg.norm(b_pos - block_pos_km[cp])) <= delta + 1e-9:
+        # Check each consecutive segment
+        for k in range(len(checkpoints) - 1):
+            ci_pos = block_pos_km[checkpoints[k]]
+            cj_pos = block_pos_km[checkpoints[k + 1]]
+            # Geometric check: within delta of segment
+            d = _point_to_segment_dist(b_pos, ci_pos, cj_pos)
+            if d > delta + 1e-9:
+                continue
+            # Time-feasibility check: detour ci → b → cj within time budget
+            time_budget = _checkpoint_time_budget(
+                ci_pos, cj_pos, speed_kmh, alpha_time)
+            detour_km = (float(np.linalg.norm(b_pos - ci_pos))
+                         + float(np.linalg.norm(cj_pos - b_pos)))
+            detour_time = detour_km / speed_kmh if speed_kmh > 0 else 0.0
+            if detour_time <= time_budget + 1e-9:
                 reachable.add(b)
                 break
         if b in reachable:
             continue
-        # Check distance to each consecutive segment (corridor reachability)
-        for k in range(len(checkpoints) - 1):
-            d = _point_to_segment_dist(
-                b_pos, block_pos_km[checkpoints[k]],
-                block_pos_km[checkpoints[k + 1]])
-            if d <= delta + 1e-9:
+        # Also check endpoint-only reachability (blocks near a single CP)
+        for cp in checkpoints:
+            if float(np.linalg.norm(b_pos - block_pos_km[cp])) <= delta + 1e-9:
                 reachable.add(b)
                 break
     return reachable
@@ -288,7 +326,8 @@ def _tour_distance(depot_km, checkpoints, block_pos_km):
 
 
 def _generate_line_library(geodata, depot_id, block_ids, n_angular, delta,
-                           num_districts=None):
+                           num_districts=None, speed_kmh=VEHICLE_SPEED_KMH,
+                           alpha_time=0.5):
     """Generate candidate reference lines from depot through block subsets.
 
     Includes sector lines, merged-sector lines, partition lines (sized for
@@ -316,7 +355,8 @@ def _generate_line_library(geodata, depot_id, block_ids, n_angular, delta,
         nn = _greedy_nn_route(pts, depot_pos)
         nn = _two_opt_improve(nn, pts, depot_pos)
         cps = [block_list[i] for i in nn]
-        reach = _compute_reachable(cps, block_ids, block_pos_km, delta)
+        reach = _compute_reachable(cps, block_ids, block_pos_km, delta,
+                                       speed_kmh, alpha_time)
         km = _tour_distance(depot_pos, cps, block_pos_km)
         return ReferenceLine(idx=idx_counter, checkpoints=cps,
                              reachable_blocks=reach, est_tour_km=km)
@@ -369,7 +409,8 @@ def _generate_line_library(geodata, depot_id, block_ids, n_angular, delta,
 
     # 5. Singleton fallback lines (every block reachable by at least one line)
     for b in block_ids:
-        reachable = _compute_reachable([b], block_ids, block_pos_km, delta)
+        reachable = _compute_reachable([b], block_ids, block_pos_km, delta,
+                                           speed_kmh, alpha_time)
         est_km = 2.0 * float(np.linalg.norm(block_pos_km[b] - depot_pos))
         lines.append(ReferenceLine(idx=idx, checkpoints=[b],
                                    reachable_blocks=reachable, est_tour_km=est_km))
@@ -493,7 +534,7 @@ def _build_initial_arcs(line, block_ids, block_pos_km, delta, K_skip,
 
 def _solve_restricted_routing_lp(arcs, checkpoints, m, capacity, z_star,
                                   demand_s, all_blocks, cp_set, cost_mult,
-                                  walk_penalties):
+                                  walk_penalties, return_solution=False):
     """Solve the restricted subpath routing LP for one scenario on one line.
 
     Load is measured in **passengers** (scenario-dependent), not blocks.
@@ -542,10 +583,26 @@ def _solve_restricted_routing_lp(arcs, checkpoints, m, capacity, z_star,
     # Build arc-id-to-arc lookup
     arc_by_id: Dict[int, SubpathArc] = {a.arc_id: a for a in arcs}
 
-    # Pre-compute incidence: which arcs serve each block
+    # Pre-compute incidence: which arcs serve each block.
+    # For non-skipped checkpoint endpoints, service = flow visits the CP.
+    # We express this via outgoing arcs from that checkpoint index.
+    cp_index = {checkpoints[c]: c for c in range(m)}
     arcs_serving: Dict[str, List[SubpathArc]] = {}
+    # Also track which blocks are checkpoint-served (need special linking)
+    cp_served_blocks: Set[str] = set()
     for b in all_blocks:
-        arcs_serving[b] = [a for a in arcs if b in a.served_blocks]
+        # Standard: arcs that have b in served_blocks
+        serving = [a for a in arcs if b in a.served_blocks]
+        if serving:
+            arcs_serving[b] = serving
+        elif b in cp_index:
+            # Non-skipped checkpoint: served by flow visitation.
+            # Use outgoing arcs from this CP as "serving" arcs.
+            c = cp_index[b]
+            arcs_serving[b] = [a for a in arcs if a.cp_from == c]
+            cp_served_blocks.add(b)
+        else:
+            arcs_serving[b] = []
 
     # --- Variables ---
     # y[arc_id, load_from] for each arc and valid starting load
@@ -599,25 +656,33 @@ def _solve_restricted_routing_lp(arcs, checkpoints, m, capacity, z_star,
         gp.quicksum(term[l] for l in range(capacity + 1)) == 1.0,
         name="sink")
 
-    # --- (iii) Linking: Σ y_a ≤ z*[b] for all blocks in all_blocks ---
-    link_constrs: Dict[str, object] = {}
-    for b in all_blocks:
+    # Pre-index y-variables by arc_id for fast lookup
+    y_by_arc: Dict[int, List[object]] = {}
+    for (aid, l), var in y.items():
+        y_by_arc.setdefault(aid, []).append(var)
+
+    # Helper to build service expression for a block
+    def _service_expr(b):
+        """Sum of y-variables that indicate block b is served."""
         serving = arcs_serving.get(b, [])
         if not serving:
-            continue
-        zval = z_star.get(b, 0.0)
+            return gp.LinExpr()
         expr = gp.LinExpr()
         for a in serving:
-            ld = arc_load[a.arc_id]
-            for l in range(max(0, capacity - ld) + 1):
-                if (a.arc_id, l) in y:
-                    expr += y[(a.arc_id, l)]
+            for var in y_by_arc.get(a.arc_id, []):
+                expr += var
+        return expr
+
+    # --- (iii) Linking: Σ service(b) ≤ z*[b] for all blocks ---
+    link_constrs: Dict[str, object] = {}
+    for b in all_blocks:
+        zval = z_star.get(b, 0.0)
+        expr = _service_expr(b)
         if expr.size() > 0:
             link_constrs[b] = model.addConstr(expr <= zval, name=f"link_{b}")
 
-    # --- (iv) Coverage with slack: Σ y_a + u[b] ≥ z*[b] ---
-    # Only for blocks with demand in this scenario. RHS = z*[b] (not 1)
-    # so that Benders cut derivation is valid.
+    # --- (iv) Coverage with slack: service(b) + u[b] ≥ z*[b] ---
+    # Only for blocks with demand in this scenario.
     cov_constrs: Dict[str, object] = {}
     for b in all_blocks:
         if demand_s.get(b, 0) <= 0:
@@ -625,13 +690,7 @@ def _solve_restricted_routing_lp(arcs, checkpoints, m, capacity, z_star,
         zval = z_star.get(b, 0.0)
         if zval < 1e-9:
             continue
-        serving = arcs_serving.get(b, [])
-        expr = gp.LinExpr()
-        for a in serving:
-            ld = arc_load[a.arc_id]
-            for l in range(max(0, capacity - ld) + 1):
-                if (a.arc_id, l) in y:
-                    expr += y[(a.arc_id, l)]
+        expr = _service_expr(b)
         cov_constrs[b] = model.addConstr(
             expr + u[b] >= zval, name=f"cov_{b}")
 
@@ -659,6 +718,18 @@ def _solve_restricted_routing_lp(arcs, checkpoints, m, capacity, z_star,
         'link': {b: c.Pi for b, c in link_constrs.items()},
         'coverage': {b: c.Pi for b, c in cov_constrs.items()},
     }
+
+    if return_solution:
+        # Extract primal solution: route_km and unserved slack per block
+        route_km = 0.0
+        for a in arcs:
+            ld = arc_load[a.arc_id]
+            for l in range(max(0, capacity - ld) + 1):
+                if (a.arc_id, l) in y:
+                    route_km += a.cost_km * y[(a.arc_id, l)].X
+        u_vals = {b: u[b].X for b in all_blocks}
+        return model.ObjVal, duals, route_km, u_vals
+
     return model.ObjVal, duals
 
 
@@ -867,14 +938,13 @@ def _solve_routing_lp_with_cg(initial_arcs, line, block_ids, block_pos_km,
                                m, capacity, z_star, demand_s, all_blocks,
                                cp_set, cost_mult, walk_penalties,
                                delta, speed_kmh,
-                               alpha_time, K_skip, max_cg_iters=30):
+                               alpha_time, K_skip, max_cg_iters=30,
+                               return_solution=False):
     """Solve routing LP with column generation for one (line, scenario).
 
     Iterates: solve restricted LP → price new subpath arcs → add to pool.
-    Returns (lp_obj, benders_coefficients) where:
-      - lp_obj is the LP optimal value (routing + walk-saved penalties)
-      - benders_coefficients is {block: π[b] + μ[b]} from LP duals
-    The caller adds walk_det_cost per block to get full Benders coefficients.
+    Returns (lp_obj, benders_coefficients) by default.
+    If return_solution=True, returns (lp_obj, benders_coefficients, route_km, u_vals).
     """
     checkpoints = line.checkpoints
     arc_pool = list(initial_arcs)
@@ -885,7 +955,7 @@ def _solve_routing_lp_with_cg(initial_arcs, line, block_ids, block_pos_km,
             all_blocks, cp_set, cost_mult, walk_penalties)
 
         if obj is None:
-            return None, None
+            return (None, None, None, None) if return_solution else (None, None)
 
         # Price new arcs
         new_arcs = _price_subpaths(
@@ -903,13 +973,20 @@ def _solve_routing_lp_with_cg(initial_arcs, line, block_ids, block_pos_km,
             next_id += 1
             arc_pool.append(a)
 
-    # Final solve to get definitive duals for Benders cut
-    obj, duals = _solve_restricted_routing_lp(
+    # Final solve to get definitive duals (and optionally solution values)
+    result = _solve_restricted_routing_lp(
         arc_pool, checkpoints, m, capacity, z_star, demand_s,
-        all_blocks, cp_set, cost_mult, walk_penalties)
+        all_blocks, cp_set, cost_mult, walk_penalties,
+        return_solution=return_solution)
 
-    if obj is None:
-        return None, None
+    if return_solution:
+        obj, duals, route_km, u_vals = result
+        if obj is None:
+            return None, None, None, None
+    else:
+        obj, duals = result
+        if obj is None:
+            return None, None
 
     # Benders cut coefficient for block b = π[b] + μ[b] (from LP duals)
     # Caller adds walk_det_cost[b] to get full coefficient.
@@ -921,6 +998,8 @@ def _solve_routing_lp_with_cg(initial_arcs, line, block_ids, block_pos_km,
         if abs(coeff) > 1e-12:
             benders_coeffs[b] = coeff
 
+    if return_solution:
+        return obj, benders_coeffs, route_km, u_vals
     return obj, benders_coeffs
 
 
@@ -960,11 +1039,12 @@ class FRDetour(BaselineMethod):
              Benders subproblem (subpath routing LP on load-expanded
              checkpoint network)
 
-    Adaptations from the paper (honest deviations):
+    Key adaptations (see module docstring for full details):
+      - FR-consistent master objective (no linehaul/ODD; demand-weighted wait)
       - Block-level demand aggregation (not individual passengers)
       - Steady-state timing surrogate (not scheduled checkpoint times)
       - Line library via angular partition (not pre-existing network)
-      - Expected-demand master load bounds (scenario capacity in 2nd stage)
+      - Evaluation via BHH stochastic tour (not subpath LP)
 
     Parameters
     ----------
@@ -1030,16 +1110,6 @@ class FRDetour(BaselineMethod):
         K_i = min(geodata.get_dist(depot_id, b) for b in assigned_blocks)
         return depot_pos_km, pts_km, areas_km2, prob_weights, K_i
 
-    @staticmethod
-    def _odd_cost(Omega_dict, J_function, assigned_blocks):
-        if Omega_dict and J_function:
-            ref = next(iter(Omega_dict.values()))
-            omega = np.zeros_like(ref)
-            for b in assigned_blocks:
-                omega = np.maximum(omega, Omega_dict.get(b, np.zeros_like(ref)))
-            return J_function(omega)
-        return 0.0
-
     # ------------------------------------------------------------------
     # Design: Double decomposition (Benders + subpath routing LP)
     # ------------------------------------------------------------------
@@ -1087,22 +1157,10 @@ class FRDetour(BaselineMethod):
         # ---- Step 1: Generate line library ----
         lines, block_pos_km, depot_pos = _generate_line_library(
             geodata, depot_id, block_ids, self.n_angular, self.delta,
-            num_districts=K)
+            num_districts=K, speed_kmh=speed, alpha_time=self.alpha_time)
         L = len(lines)
         T_vals = self.T_values
         n_T = len(T_vals)
-
-        # Pre-compute linehaul and ODD for each line
-        line_K = {}  # linehaul distance (km)
-        line_F = {}  # ODD cost
-        for line in lines:
-            if line.checkpoints:
-                first_cp = block_pos_km[line.checkpoints[0]]
-                line_K[line.idx] = float(np.linalg.norm(first_cp - depot_pos))
-            else:
-                line_K[line.idx] = 0.0
-            reachable_list = [b for b in line.reachable_blocks if b in block_ids]
-            line_F[line.idx] = self._odd_cost(Omega_dict, J_function, reachable_list)
 
         # Pre-build initial seed arcs for each line (for CG)
         line_arcs = {}
@@ -1280,32 +1338,43 @@ class FRDetour(BaselineMethod):
                         theta_v[(line.idx, ti)] >= sp_km * cm * x_v[(line.idx, ti)],
                         name=f"theta_ws_{line.idx}_{ti}")
 
-            # Operating cost per trip
-            def _op_cost_inner(line_idx, ti):
-                T_t = T_vals[ti]
-                return ((line_K[line_idx] + line_F[line_idx]) / T_t
-                        + wr * T_t / 2.0)
+            # Objective (FR-consistent: no linehaul, no ODD)
+            #
+            # Wait cost is demand-weighted via z variables:
+            #   wr * T_t/2 * Σ_b prob[b] * z[b,ℓ,t]
+            # This makes the master properly internalize that a line serving
+            # more demand incurs more total wait cost.
+            #
+            # Pre-index z_v keys by (line_idx, ti) for efficient objective build
+            z_by_trip: Dict[Tuple[int, int], List[Tuple[str, object]]] = {}
+            for (b, li, ti), var in z_v.items():
+                z_by_trip.setdefault((li, ti), []).append((b, var))
 
-            # Objective
-            obj_expr = gp.quicksum(
-                _op_cost_inner(k[0], k[1]) * x_v[k]
-                + theta_v[k]
-                + penalty_low * slack_low_v[k]
-                for k in x_v)
+            obj_expr = gp.LinExpr()
+            for k in x_v:
+                li, ti = k
+                T_t = T_vals[ti]
+                # Recourse proxy + slack penalty
+                obj_expr += theta_v[k] + penalty_low * slack_low_v[k]
+                # Demand-weighted wait: wr * T/2 * Σ prob[b] * z[b,ℓ,t]
+                for b, zvar in z_by_trip.get((li, ti), []):
+                    coeff = wr * T_t / 2.0 * prob_dict.get(b, 0.0)
+                    if coeff > 1e-15:
+                        obj_expr += coeff * zvar
             if not hard_coverage:
                 obj_expr += penalty_uncov * gp.quicksum(
                     uncov_v[b] for b in block_ids)
             master.setObjective(obj_expr, GRB.MINIMIZE)
 
-            return master, x_v, z_v, theta_v, uncov_v, _op_cost_inner
+            return master, x_v, z_v, theta_v, uncov_v
 
         # Try hard coverage first; fall back to soft if infeasible
-        master, x, z, theta, uncov, _op_cost = _build_master(hard_coverage=True)
+        master, x, z, theta, uncov = _build_master(hard_coverage=True)
         master.optimize()
         if master.status != GRB.OPTIMAL:
             print(f"  [MiND] Hard coverage infeasible with K={K}, "
                   f"falling back to soft coverage")
-            master, x, z, theta, uncov, _op_cost = _build_master(hard_coverage=False)
+            master, x, z, theta, uncov = _build_master(hard_coverage=False)
             master.optimize()
             if master.status == GRB.OPTIMAL and uncov:
                 uncov_blocks = [b for b in block_ids
@@ -1357,7 +1426,8 @@ class FRDetour(BaselineMethod):
             active_trips = [(li, ti) for (li, ti), v in x_star.items()
                             if v > 0.5]
 
-            # Solve subproblems
+            # Solve subproblems: subpath LP with CG for both Benders cuts and UB.
+            # Same cost model in optimization and evaluation.
             ub_iter = 0.0
             iter_solution = {}
 
@@ -1372,23 +1442,21 @@ class FRDetour(BaselineMethod):
                 z_dict = {b: z_star_all.get((b, li, ti), 0.0)
                           for b in line_obj.reachable_blocks}
 
-                # Blocks for linking/coverage: skipped CPs + corridor
-                # (non-skipped CPs served by flow visitation)
+                # All assigned blocks participate in linking/coverage,
+                # including non-skipped checkpoint endpoints.
                 cp_set_local = set(line_obj.checkpoints)
-                # Blocks that appear in any arc's served_blocks
-                arc_served_blocks: Set[str] = set()
-                for a in initial_arcs:
-                    arc_served_blocks.update(a.served_blocks)
-                # All blocks = union of what arcs can serve
-                # (corridor + skipped CPs; excludes non-skipped CP endpoints)
-                all_blocks = arc_served_blocks & line_obj.reachable_blocks
+                all_blocks = set(b for b in line_obj.reachable_blocks
+                                 if z_dict.get(b, 0.0) > 1e-9)
 
                 cost_mult = 1.0 / (discount * T_t) + wr / (2.0 * speed)
 
-                op = _op_cost(li, ti)
+                # First-stage cost: demand-weighted wait from z solution
+                op_wait = sum(wr * T_t / 2.0 * prob_dict.get(b, 0.0)
+                              * z_dict.get(b, 0.0)
+                              for b in line_obj.reachable_blocks)
 
                 if mc <= 1 or len(initial_arcs) == 0:
-                    ub_iter += op
+                    ub_iter += op_wait
                     iter_solution[(li, ti)] = (z_dict, T_t, 0.0)
                     continue
 
@@ -1401,17 +1469,15 @@ class FRDetour(BaselineMethod):
                     demand_s = {block_ids[j]: int(demand_matrix[s, j])
                                 for j in range(N)}
 
-                    # Per-scenario walking penalties and costs.
-                    # walk_pen[b] = wr * walk_saved_km[b] * d_b / ws
-                    #   (penalty for NOT detouring → passengers walk)
-                    # walk_det_cost[b] = wr * walk_det_km[b] * d_b / ws
-                    #   (base walking cost when served by arc)
+                    # Per-scenario walking penalties and costs
                     s_walk_pen: Dict[str, float] = {}
                     s_walk_det_cost: Dict[str, float] = {}
                     for b in all_blocks:
                         d_b = demand_s.get(b, 0)
-                        s_walk_pen[b] = wr * walk_saved_km.get(b, 0.0) * d_b / walk_speed
-                        s_walk_det_cost[b] = wr * walk_det_km.get(b, 0.0) * d_b / walk_speed
+                        s_walk_pen[b] = (wr * walk_saved_km.get(b, 0.0)
+                                         * d_b / walk_speed)
+                        s_walk_det_cost[b] = (wr * walk_det_km.get(b, 0.0)
+                                              * d_b / walk_speed)
 
                     # Solve with column generation
                     lp_obj_s, lp_coeffs_s = _solve_routing_lp_with_cg(
@@ -1422,7 +1488,6 @@ class FRDetour(BaselineMethod):
                         max_cg_iters=self.max_cg_iters)
 
                     if lp_obj_s is None:
-                        # Fallback: large cost, no cut
                         max_dist = line_obj.est_tour_km + 10.0
                         fallback_pen = 10.0 * max_dist * cost_mult
                         scenario_costs.append(fallback_pen * N)
@@ -1436,14 +1501,11 @@ class FRDetour(BaselineMethod):
                     total_obj_s = lp_obj_s + base_walk
                     scenario_costs.append(total_obj_s)
 
-                    # Benders cut with combined coefficients:
-                    #   coeff_b = (π[b] + μ[b]) + walk_det_cost[b]
-                    # The LP duals capture routing sensitivity; walk_det_cost
-                    # captures base walking cost sensitivity to z.
-                    #   θ ≥ total_obj_s + Σ coeff_b * (z[b] - z*[b])
+                    # Benders cut coefficients
                     full_coeffs: Dict[str, float] = {}
                     for b in all_blocks:
-                        lp_coeff = lp_coeffs_s.get(b, 0.0) if lp_coeffs_s else 0.0
+                        lp_coeff = (lp_coeffs_s.get(b, 0.0)
+                                    if lp_coeffs_s else 0.0)
                         wdc = s_walk_det_cost.get(b, 0.0)
                         coeff = lp_coeff + wdc
                         if abs(coeff) > 1e-12:
@@ -1462,7 +1524,7 @@ class FRDetour(BaselineMethod):
                         })
 
                 avg_cost = float(np.mean(scenario_costs))
-                ub_iter += op + avg_cost
+                ub_iter += op_wait + avg_cost
                 iter_solution[(li, ti)] = (z_dict, T_t, avg_cost)
 
             # Update best
@@ -1559,7 +1621,7 @@ class FRDetour(BaselineMethod):
                     ri = block_ids.index(best_root)
                     assignment[j, ri] = 1.0
 
-        return ServiceDesign(
+        design = ServiceDesign(
             name=self._name,
             assignment=assignment,
             depot_id=depot_id,
@@ -1568,71 +1630,7 @@ class FRDetour(BaselineMethod):
             district_routes=district_routes,
         )
 
-    # ------------------------------------------------------------------
-    # Route cost extraction (for use with simulate_design)
-    # ------------------------------------------------------------------
-
-    def compute_route_costs(
-        self, design: ServiceDesign, geodata,
-        prob_dict: Dict[str, float], Lambda: float, wr: float,
-    ) -> tuple:
-        """Second-stage evaluation: stochastic tour with optimal deviation.
-
-        Returns (tour_km_overrides, avg_walk_time_h).
-        """
-        block_ids = geodata.short_geoid_list
-        N = len(block_ids)
-        assignment = design.assignment
-        depot_id = design.depot_id
-
-        tour_km_overrides: Dict[str, float] = {}
-        acc_walk_km = 0.0
-        acc_prob = 0.0
-        rng = np.random.default_rng(42)
-
-        for i, root in enumerate(block_ids):
-            if round(assignment[i, i]) != 1:
-                continue
-            assigned_idx = [j for j in range(N)
-                            if round(assignment[j, i]) == 1]
-            if not assigned_idx:
-                continue
-            assigned_blocks = [block_ids[j] for j in assigned_idx]
-
-            depot_pos_km, pts_km, areas_km2, prob_weights, _ = \
-                self._district_data(geodata, block_ids, assigned_blocks,
-                                    depot_id, prob_dict)
-
-            T_i = design.dispatch_intervals.get(root, 0.5)
-            route_global = design.district_routes.get(root)
-            if route_global is not None:
-                # Convert global block indices to local district indices
-                route_order = []
-                for gi in route_global:
-                    bid = block_ids[gi]
-                    if bid in assigned_blocks:
-                        route_order.append(assigned_blocks.index(bid))
-                if not route_order:
-                    route_order = _greedy_nn_route(pts_km, depot_pos_km)
-            else:
-                route_order = _greedy_nn_route(pts_km, depot_pos_km)
-
-            # Evaluate with the design's delta — no ex-post fallback.
-            # The optimization already balances detour vs walking cost,
-            # so evaluation should use the same delta consistently.
-            tour_km, walk_km = _fr_detour_tour_stochastic(
-                pts_km, depot_pos_km, areas_km2, self.delta, prob_weights,
-                Lambda, T_i, route_order,
-                wr=wr, num_scenarios=self.num_scenarios, rng=rng)
-            tour_km_overrides[root] = tour_km
-
-            district_prob = float(prob_weights.sum())
-            acc_walk_km += walk_km * district_prob
-            acc_prob += district_prob
-
-        acc_prob = max(acc_prob, 1e-12)
-        avg_walk_time_h = (acc_walk_km / acc_prob) / self.walk_speed_kmh
-        return tour_km_overrides, avg_walk_time_h
+        return design
 
     # ------------------------------------------------------------------
     # Custom simulate (called by run_baseline in experiment scripts)
@@ -1650,7 +1648,7 @@ class FRDetour(BaselineMethod):
             Lambda, wr, wv)
 
     # ------------------------------------------------------------------
-    # Evaluate
+    # Evaluate — subpath routing (same model as optimization)
     # ------------------------------------------------------------------
 
     def evaluate(
@@ -1660,29 +1658,63 @@ class FRDetour(BaselineMethod):
         wr: float, wv: float,
         beta: float = BETA, road_network=None,
     ) -> EvaluationResult:
-        """FR-specific evaluation.
+        """FR-specific evaluation using subpath routing on checkpoint network.
 
-        Cost structure for fixed-route (with optional detour):
-          - No separate linehaul: depot→route→depot travel is already in
-            the tour_km computed by compute_route_costs.
-          - No ODD cost: vehicles run on a fixed schedule, not on-demand
-            dispatch.
-          - Provider cost = route_km / (discount * T) per district.
-          - User cost = T/2 (wait) + route_km/(2*speed) (in-vehicle)
-                       + walk_to_stop (walk).
+        For each district and demand scenario, solves the subpath routing LP
+        (same model as the Benders subproblem) to decide which corridor blocks
+        are detoured to vs walked.  This aligns optimization and evaluation
+        on the same cost model.
+
+        Cost structure:
+          - No separate linehaul (depot travel is in the checkpoint tour)
+          - No ODD cost (fixed schedule, not on-demand dispatch)
+          - Provider cost = (checkpoint_tour_km + detour_km) / (discount * T)
+          - User cost = T/2 (wait) + tour_km/(2*speed) (in-vehicle) + walk
         """
-        tour_km_overrides, avg_walk_time_h = self.compute_route_costs(
-            design, geodata, prob_dict, Lambda, wr)
-
         block_ids = geodata.short_geoid_list
         N = len(block_ids)
         assignment = design.assignment
+        depot_id = design.depot_id
         discount = TSP_TRAVEL_DISCOUNT
         speed = VEHICLE_SPEED_KMH
+        walk_speed = self.walk_speed_kmh
+
+        # Build block positions in km
+        block_pos_km = {}
+        for b in block_ids:
+            block_pos_km[b] = np.array(_get_pos(geodata, b),
+                                       dtype=float) / 1000.0
+        depot_pos_km = np.array(_get_pos(geodata, depot_id),
+                                dtype=float) / 1000.0
+
+        # Pre-compute walking geometry per block
+        walk_saved_km: Dict[str, float] = {}
+        walk_det_km: Dict[str, float] = {}
+        walk_no_det_km: Dict[str, float] = {}
+        for b in block_ids:
+            area_b = float(geodata.get_area(b))
+            r_b = math.sqrt(area_b / math.pi)
+            r_safe = max(r_b, 1e-12)
+            wnd = 2.0 * r_b / 3.0
+            if self.delta < r_safe:
+                wd = wnd - self.delta + self.delta**3 / (3.0 * r_safe**2)
+            else:
+                wd = 0.0
+            wd = max(wd, 0.0)
+            walk_no_det_km[b] = wnd
+            walk_det_km[b] = wd
+            walk_saved_km[b] = wnd - wd
+
+        # SAA: generate demand scenarios
+        rng = np.random.default_rng(42)
+        n_eval = self.num_scenarios
+        U_base = rng.uniform(0.0, 1.0, size=(n_eval, N))
 
         acc_in_district = 0.0
         acc_wait = 0.0
         acc_invehicle = 0.0
+        acc_walk_riders = 0.0  # walk_km * n_riders accumulated
+        acc_riders = 0.0       # total riders accumulated
         acc_fleet = 0.0
         acc_T_weighted = 0.0
         acc_prob = 0.0
@@ -1694,17 +1726,129 @@ class FRDetour(BaselineMethod):
             if not assigned:
                 continue
 
+            assigned_blocks = [block_ids[j] for j in assigned]
             T_i = design.dispatch_intervals.get(root, 1.0)
-            district_prob = sum(prob_dict.get(block_ids[j], 0.0)
-                                for j in assigned)
+            district_prob = sum(prob_dict.get(b, 0.0) for b in assigned_blocks)
 
-            tour_km = tour_km_overrides.get(root, 0.0)
-            provider_in_district = tour_km / discount
+            # Build checkpoint list from district_routes
+            route_global = design.district_routes.get(root, [])
+            checkpoints = []
+            for gi in route_global:
+                bid = block_ids[gi]
+                if bid in assigned_blocks:
+                    checkpoints.append(bid)
+            if not checkpoints:
+                # All assigned blocks as checkpoints (NN order)
+                pts = np.array([block_pos_km[b] for b in assigned_blocks])
+                order = _greedy_nn_route(pts, depot_pos_km)
+                order = _two_opt_improve(order, pts, depot_pos_km)
+                checkpoints = [assigned_blocks[o] for o in order]
 
-            acc_in_district += (provider_in_district / T_i) * district_prob
+            m = len(checkpoints)
+            cp_set = set(checkpoints)
+            all_blocks_set = set(assigned_blocks)
+
+            # Build subpath arcs for this district's checkpoint route
+            # (Wrap as a ReferenceLine-like object for _build_initial_arcs)
+            line_obj = ReferenceLine(
+                idx=0, checkpoints=checkpoints,
+                reachable_blocks=all_blocks_set,
+                est_tour_km=_tour_distance(depot_pos_km, checkpoints,
+                                           block_pos_km))
+
+            arcs = _build_initial_arcs(
+                line_obj, block_ids, block_pos_km, self.delta,
+                self.K_skip, speed, self.alpha_time)
+
+            # Checkpoint tour distance (depot → checkpoints → depot)
+            cp_tour_km = line_obj.est_tour_km
+
+            # Generate demand scenarios for this district's interval
+            demand_matrix = _crn_demand(
+                U_base, Lambda, T_i, prob_dict, block_ids)
+
+            # Per-scenario: solve subpath LP to get detour routing + walk
+            acc_route_km = 0.0      # checkpoint + detour km
+            district_walk_riders = 0.0
+            district_riders = 0.0
+
+            for s in range(n_eval):
+                demand_s = {block_ids[j]: int(demand_matrix[s, j])
+                            for j in range(N)}
+                n_total = sum(demand_s.get(b, 0) for b in assigned_blocks)
+                if n_total == 0:
+                    acc_route_km += cp_tour_km
+                    continue
+
+                # z_star = 1 for all assigned blocks (evaluation)
+                z_star = {b: 1.0 for b in all_blocks_set}
+
+                # Same cost_mult as optimization so the detour trade-off
+                # is identical: cost_mult * detour_km vs walk_pen.
+                eval_cost_mult = 1.0 / (discount * T_i) + wr / (2.0 * speed)
+
+                # Walk penalties: same scaling as optimization subproblem
+                wp = {}
+                for b in all_blocks_set:
+                    d_b = demand_s.get(b, 0)
+                    wp[b] = wr * walk_saved_km.get(b, 0.0) * d_b / walk_speed
+
+                if m > 1 and arcs:
+                    # Solve with CG — same cost model as master subproblem
+                    result = _solve_routing_lp_with_cg(
+                        arcs, line_obj, block_ids, block_pos_km,
+                        m, self.capacity, z_star, demand_s,
+                        all_blocks_set, cp_set, eval_cost_mult, wp,
+                        self.delta, speed, self.alpha_time, self.K_skip,
+                        max_cg_iters=15, return_solution=True)
+                    _, _, detour_km, u_vals = result
+
+                    if detour_km is not None:
+                        acc_route_km += cp_tour_km + detour_km
+                        # Walk: walk_det for served blocks, walk_no_det for unserved
+                        for b in assigned_blocks:
+                            d_b = demand_s.get(b, 0)
+                            if d_b == 0:
+                                continue
+                            u_b = u_vals.get(b, 1.0) if b not in cp_set else 0.0
+                            # Checkpoint blocks: always visited, walk = walk_det
+                            # Corridor served (u≈0): walk = walk_det
+                            # Corridor unserved (u≈1): walk = walk_no_det
+                            w = (walk_det_km.get(b, 0.0) * (1.0 - u_b)
+                                 + walk_no_det_km.get(b, 0.0) * u_b)
+                            district_walk_riders += w * d_b
+                        district_riders += n_total
+                    else:
+                        # Fallback: checkpoint-only route
+                        acc_route_km += cp_tour_km
+                        for b in assigned_blocks:
+                            d_b = demand_s.get(b, 0)
+                            if b in cp_set:
+                                district_walk_riders += walk_det_km.get(b, 0.0) * d_b
+                            else:
+                                district_walk_riders += walk_no_det_km.get(b, 0.0) * d_b
+                        district_riders += n_total
+                else:
+                    # Singleton or no arcs: just checkpoint tour
+                    acc_route_km += cp_tour_km
+                    for b in assigned_blocks:
+                        d_b = demand_s.get(b, 0)
+                        if b in cp_set:
+                            district_walk_riders += walk_det_km.get(b, 0.0) * d_b
+                        else:
+                            district_walk_riders += walk_no_det_km.get(b, 0.0) * d_b
+                    district_riders += n_total
+
+            avg_tour_km = acc_route_km / n_eval
+
+            # Accumulate into overall metrics
+            provider_d = (avg_tour_km / discount / T_i) * district_prob
+            acc_in_district += provider_d
             acc_wait += (T_i / 2.0) * district_prob
-            acc_invehicle += (tour_km / (2.0 * speed)) * district_prob
-            acc_fleet += tour_km / (speed * T_i)
+            acc_invehicle += (avg_tour_km / (2.0 * speed)) * district_prob
+            acc_fleet += avg_tour_km / (speed * T_i)
+            acc_walk_riders += district_walk_riders
+            acc_riders += district_riders
             acc_T_weighted += T_i * district_prob
             acc_prob += district_prob
 
@@ -1712,7 +1856,8 @@ class FRDetour(BaselineMethod):
 
         avg_wait = acc_wait / acc_prob
         avg_invehicle = acc_invehicle / acc_prob
-        avg_walk = avg_walk_time_h
+        avg_walk_km = acc_walk_riders / max(acc_riders, 1.0)
+        avg_walk = avg_walk_km / walk_speed
         total_user_time = avg_wait + avg_invehicle + avg_walk
 
         in_district_cost = acc_in_district
@@ -1729,12 +1874,12 @@ class FRDetour(BaselineMethod):
             avg_invehicle_time=avg_invehicle,
             avg_walk_time=avg_walk,
             total_user_time=total_user_time,
-            linehaul_cost=0.0,         # depot travel included in route tour
+            linehaul_cost=0.0,
             in_district_cost=in_district_cost,
             total_travel_cost=in_district_cost,
             fleet_size=fleet_size,
             avg_dispatch_interval=avg_dispatch_interval,
-            odd_cost=0.0,              # no on-demand dispatch for FR
+            odd_cost=0.0,
             provider_cost=provider_cost,
             user_cost=user_cost,
             total_cost=total_cost,
