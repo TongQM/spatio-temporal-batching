@@ -50,7 +50,7 @@ import numpy as np
 
 from lib.baselines.base import (
     BETA, VEHICLE_SPEED_KMH, BaselineMethod, EvaluationResult, ServiceDesign,
-    _get_pos, evaluate_design,
+    _get_pos,
 )
 from lib.constants import TSP_TRAVEL_DISCOUNT
 
@@ -245,17 +245,35 @@ def _point_to_segment_dist(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float
 
 
 def _compute_reachable(checkpoints, block_ids, block_pos_km, delta):
-    """Blocks within δ of any checkpoint position."""
+    """Blocks within delta of any route segment or checkpoint.
+
+    Uses segment-based reachability: a block is reachable if its distance
+    to any checkpoint-to-checkpoint segment (or to any checkpoint itself)
+    is at most delta.  This matches the corridor definition used by the
+    second-stage subpath arcs in _build_initial_arcs.
+    """
     reachable = set(checkpoints)
     if delta <= 0:
         return reachable
-    for cp in checkpoints:
-        cp_pos = block_pos_km[cp]
-        for b in block_ids:
-            if b not in reachable:
-                d = float(np.linalg.norm(block_pos_km[b] - cp_pos))
-                if d <= delta + 1e-9:
-                    reachable.add(b)
+    for b in block_ids:
+        if b in reachable:
+            continue
+        b_pos = block_pos_km[b]
+        # Check distance to each checkpoint (endpoint reachability)
+        for cp in checkpoints:
+            if float(np.linalg.norm(b_pos - block_pos_km[cp])) <= delta + 1e-9:
+                reachable.add(b)
+                break
+        if b in reachable:
+            continue
+        # Check distance to each consecutive segment (corridor reachability)
+        for k in range(len(checkpoints) - 1):
+            d = _point_to_segment_dist(
+                b_pos, block_pos_km[checkpoints[k]],
+                block_pos_km[checkpoints[k + 1]])
+            if d <= delta + 1e-9:
+                reachable.add(b)
+                break
     return reachable
 
 
@@ -473,26 +491,33 @@ def _build_initial_arcs(line, block_ids, block_pos_km, delta, K_skip,
 # Restricted routing LP on load-expanded checkpoint network
 # ---------------------------------------------------------------------------
 
-def _solve_restricted_routing_lp(arcs, m, capacity, z_star, demand_s,
-                                  all_blocks, cp_set, cost_mult, penalty):
+def _solve_restricted_routing_lp(arcs, checkpoints, m, capacity, z_star,
+                                  demand_s, all_blocks, cp_set, cost_mult,
+                                  walk_penalties):
     """Solve the restricted subpath routing LP for one scenario on one line.
 
     Load is measured in **passengers** (scenario-dependent), not blocks.
-    Linking and coverage constraints apply to all reachable blocks that appear
-    in at least one arc's served_blocks (skipped CPs + corridor blocks).
-    Non-skipped checkpoint blocks are served by flow visitation and excluded.
+    Checkpoint demand enters load transitions: each arc's load delta includes
+    demand at its destination checkpoint, and the source includes demand at
+    the first checkpoint.
+
+    Walking cost model: u[b] penalty = walk_saved_cost[b] (the cost of NOT
+    detouring to serve block b — passengers walk to checkpoint instead).
+    This replaces the former big-M penalty and lets the optimizer see the
+    detour-vs-walking trade-off.
 
     Args:
         arcs: list of SubpathArc (current column pool)
+        checkpoints: ordered list of checkpoint block IDs
         m: number of checkpoints
         capacity: vehicle passenger capacity
         z_star: dict block_id → assignment value from master
         demand_s: dict block_id → passenger count for this scenario
         all_blocks: set of blocks that participate in linking/coverage
-            (skipped CPs + corridor blocks; excludes non-skipped CPs)
-        cp_set: set of ALL checkpoint block IDs (for identifying non-skipped)
+        cp_set: set of ALL checkpoint block IDs
         cost_mult: km → cost conversion factor
-        penalty: cost per unserved block
+        walk_penalties: dict block_id → penalty for u[b] (walking cost saved
+            by detouring = wr * walk_saved_km * demand_s / walk_speed)
 
     Returns:
         (obj, duals_dict) where duals_dict has keys 'flow', 'link', 'coverage'
@@ -504,10 +529,15 @@ def _solve_restricted_routing_lp(arcs, m, capacity, z_star, demand_s,
     model = gp.Model("routing_lp")
     model.setParam('OutputFlag', 0)
 
-    # Compute scenario-dependent load delta per arc
+    # Per-checkpoint demand (for load transitions at checkpoints)
+    cp_demand = [demand_s.get(checkpoints[c], 0) for c in range(m)]
+
+    # Compute scenario-dependent load delta per arc.
+    # Includes served_blocks demand + destination checkpoint demand.
     arc_load: Dict[int, int] = {}
     for a in arcs:
-        arc_load[a.arc_id] = sum(demand_s.get(b, 0) for b in a.served_blocks)
+        arc_load[a.arc_id] = (sum(demand_s.get(b, 0) for b in a.served_blocks)
+                              + cp_demand[a.cp_to])
 
     # Build arc-id-to-arc lookup
     arc_by_id: Dict[int, SubpathArc] = {a.arc_id: a for a in arcs}
@@ -560,7 +590,7 @@ def _solve_restricted_routing_lp(arcs, m, capacity, z_star, demand_s,
                     if 0 <= l_from <= capacity - ld:
                         inflow += y[(a.arc_id, l_from)]
 
-            rhs = 1.0 if (c == 0 and l == 0) else 0.0
+            rhs = 1.0 if (c == 0 and l == cp_demand[0]) else 0.0
             flow_constrs[(c, l)] = model.addConstr(
                 outflow - inflow == rhs, name=f"flow_{c}_{l}")
 
@@ -606,13 +636,17 @@ def _solve_restricted_routing_lp(arcs, m, capacity, z_star, demand_s,
             expr + u[b] >= zval, name=f"cov_{b}")
 
     # --- Objective ---
+    # Vehicle routing cost + walking penalty for unserved blocks.
+    # walk_penalties[b] = wr * walk_saved_km[b] * demand_s[b] / walk_speed
+    # This makes the optimizer balance detour cost vs walking cost.
     obj = gp.LinExpr()
     for a in arcs:
         ld = arc_load[a.arc_id]
         for l in range(max(0, capacity - ld) + 1):
             obj += cost_mult * a.cost_km * y[(a.arc_id, l)]
     for b in all_blocks:
-        obj += penalty * u[b]
+        wp = walk_penalties.get(b, 0.0)
+        obj += wp * u[b]
     model.setObjective(obj, GRB.MINIMIZE)
     model.optimize()
 
@@ -722,9 +756,11 @@ def _price_subpaths(line, block_ids, block_pos_km, m, capacity,
                 if total_time <= time_budget + 1e-9:
                     # Full served set
                     full_served = skipped_set | served
-                    # Scenario-dependent load delta
-                    load_delta = load + sum(
-                        demand_s.get(b, 0) for b in skipped_cps)
+                    # Scenario-dependent load delta:
+                    # corridor load + skipped CP load + destination CP load
+                    load_delta = (load
+                                  + sum(demand_s.get(b, 0) for b in skipped_cps)
+                                  + demand_s.get(checkpoints[j], 0))
 
                     # Evaluate reduced cost for each feasible starting load l
                     arc_travel_cost = cost_mult * total_km
@@ -770,9 +806,10 @@ def _price_subpaths(line, block_ids, block_pos_km, m, capacity,
                         continue
 
                     new_load = load + demand_s.get(b, 0)
-                    # Check capacity (including skipped CPs load)
-                    total_load_if_complete = new_load + sum(
-                        demand_s.get(cp, 0) for cp in skipped_cps)
+                    # Check capacity (including skipped CPs + dest CP load)
+                    total_load_if_complete = (new_load
+                        + sum(demand_s.get(cp, 0) for cp in skipped_cps)
+                        + demand_s.get(checkpoints[j], 0))
                     if total_load_if_complete > capacity:
                         continue
 
@@ -828,20 +865,24 @@ def _price_subpaths(line, block_ids, block_pos_km, m, capacity,
 
 def _solve_routing_lp_with_cg(initial_arcs, line, block_ids, block_pos_km,
                                m, capacity, z_star, demand_s, all_blocks,
-                               cp_set, cost_mult, penalty, delta, speed_kmh,
+                               cp_set, cost_mult, walk_penalties,
+                               delta, speed_kmh,
                                alpha_time, K_skip, max_cg_iters=30):
     """Solve routing LP with column generation for one (line, scenario).
 
     Iterates: solve restricted LP → price new subpath arcs → add to pool.
-    Returns (objective, benders_coefficients) where benders_coefficients is
-    {block: π[b] + μ[b]} for constructing Benders cuts.
+    Returns (lp_obj, benders_coefficients) where:
+      - lp_obj is the LP optimal value (routing + walk-saved penalties)
+      - benders_coefficients is {block: π[b] + μ[b]} from LP duals
+    The caller adds walk_det_cost per block to get full Benders coefficients.
     """
+    checkpoints = line.checkpoints
     arc_pool = list(initial_arcs)
 
     for cg_iter in range(max_cg_iters):
         obj, duals = _solve_restricted_routing_lp(
-            arc_pool, m, capacity, z_star, demand_s,
-            all_blocks, cp_set, cost_mult, penalty)
+            arc_pool, checkpoints, m, capacity, z_star, demand_s,
+            all_blocks, cp_set, cost_mult, walk_penalties)
 
         if obj is None:
             return None, None
@@ -864,13 +905,14 @@ def _solve_routing_lp_with_cg(initial_arcs, line, block_ids, block_pos_km,
 
     # Final solve to get definitive duals for Benders cut
     obj, duals = _solve_restricted_routing_lp(
-        arc_pool, m, capacity, z_star, demand_s,
-        all_blocks, cp_set, cost_mult, penalty)
+        arc_pool, checkpoints, m, capacity, z_star, demand_s,
+        all_blocks, cp_set, cost_mult, walk_penalties)
 
     if obj is None:
         return None, None
 
-    # Benders cut coefficient for block b = π[b] + μ[b]
+    # Benders cut coefficient for block b = π[b] + μ[b] (from LP duals)
+    # Caller adds walk_det_cost[b] to get full coefficient.
     link_d = duals.get('link', {})
     cov_d = duals.get('coverage', {})
     benders_coeffs = {}
@@ -1070,6 +1112,25 @@ class FRDetour(BaselineMethod):
                 self.K_skip, speed, self.alpha_time)
             for i, a in enumerate(line_arcs[line.idx]):
                 a.arc_id = i
+
+        # Pre-compute walking geometry for recourse objective.
+        # walk_saved_km[b]: km saved per passenger by detouring (constant, ≥ 0)
+        # walk_det_km[b]:   km walked per passenger when served by detour arc
+        walk_saved_km: Dict[str, float] = {}
+        walk_det_km: Dict[str, float] = {}
+        for b in block_ids:
+            area_b = float(geodata.get_area(b))
+            r_b = math.sqrt(area_b / math.pi)
+            r_safe = max(r_b, 1e-12)
+            walk_no_det_b = 2.0 * r_b / 3.0
+            if self.delta < r_safe:
+                walk_det_b = walk_no_det_b - self.delta + self.delta**3 / (3.0 * r_safe**2)
+            else:
+                walk_det_b = 0.0
+            walk_det_b = max(walk_det_b, 0.0)
+            walk_saved_km[b] = walk_no_det_b - walk_det_b
+            walk_det_km[b] = walk_det_b
+        walk_speed = self.walk_speed_kmh
 
         # No preprocessing guard: the master's load bound is soft (lower only),
         # and vehicle capacity is enforced per-scenario in the second-stage LP.
@@ -1323,8 +1384,6 @@ class FRDetour(BaselineMethod):
                 all_blocks = arc_served_blocks & line_obj.reachable_blocks
 
                 cost_mult = 1.0 / (discount * T_t) + wr / (2.0 * speed)
-                max_dist = line_obj.est_tour_km + 10.0
-                pen = 10.0 * max_dist * cost_mult
 
                 op = _op_cost(li, ti)
 
@@ -1342,38 +1401,65 @@ class FRDetour(BaselineMethod):
                     demand_s = {block_ids[j]: int(demand_matrix[s, j])
                                 for j in range(N)}
 
+                    # Per-scenario walking penalties and costs.
+                    # walk_pen[b] = wr * walk_saved_km[b] * d_b / ws
+                    #   (penalty for NOT detouring → passengers walk)
+                    # walk_det_cost[b] = wr * walk_det_km[b] * d_b / ws
+                    #   (base walking cost when served by arc)
+                    s_walk_pen: Dict[str, float] = {}
+                    s_walk_det_cost: Dict[str, float] = {}
+                    for b in all_blocks:
+                        d_b = demand_s.get(b, 0)
+                        s_walk_pen[b] = wr * walk_saved_km.get(b, 0.0) * d_b / walk_speed
+                        s_walk_det_cost[b] = wr * walk_det_km.get(b, 0.0) * d_b / walk_speed
+
                     # Solve with column generation
-                    obj_s, bcoeffs_s = _solve_routing_lp_with_cg(
+                    lp_obj_s, lp_coeffs_s = _solve_routing_lp_with_cg(
                         initial_arcs, line_obj, block_ids, block_pos_km,
                         mc, self.capacity, z_dict, demand_s, all_blocks,
-                        cp_set_local, cost_mult, pen,
+                        cp_set_local, cost_mult, s_walk_pen,
                         self.delta, speed, self.alpha_time, self.K_skip,
                         max_cg_iters=self.max_cg_iters)
 
-                    if obj_s is None:
-                        obj_s = pen * N
-                        bcoeffs_s = {}
+                    if lp_obj_s is None:
+                        # Fallback: large cost, no cut
+                        max_dist = line_obj.est_tour_km + 10.0
+                        fallback_pen = 10.0 * max_dist * cost_mult
+                        scenario_costs.append(fallback_pen * N)
+                        continue
 
-                    scenario_costs.append(obj_s)
+                    # Total scenario cost = LP routing/walk-penalty
+                    #   + base walking cost (walk_det for served blocks)
+                    base_walk = sum(
+                        s_walk_det_cost.get(b, 0.0) * z_dict.get(b, 0.0)
+                        for b in all_blocks)
+                    total_obj_s = lp_obj_s + base_walk
+                    scenario_costs.append(total_obj_s)
 
-                    # Build Benders cut:
-                    #   θ ≥ obj_s + Σ_b coeff_b * (z[b] - z*[b])
-                    # = (obj_s - Σ coeff_b * z*_b) + Σ coeff_b * z[b]
-                    # where coeff_b = π[b] + μ[b]
-                    if bcoeffs_s:
-                        const = obj_s - sum(
-                            bcoeffs_s.get(b, 0.0) * z_dict.get(b, 0.0)
+                    # Benders cut with combined coefficients:
+                    #   coeff_b = (π[b] + μ[b]) + walk_det_cost[b]
+                    # The LP duals capture routing sensitivity; walk_det_cost
+                    # captures base walking cost sensitivity to z.
+                    #   θ ≥ total_obj_s + Σ coeff_b * (z[b] - z*[b])
+                    full_coeffs: Dict[str, float] = {}
+                    for b in all_blocks:
+                        lp_coeff = lp_coeffs_s.get(b, 0.0) if lp_coeffs_s else 0.0
+                        wdc = s_walk_det_cost.get(b, 0.0)
+                        coeff = lp_coeff + wdc
+                        if abs(coeff) > 1e-12:
+                            full_coeffs[b] = coeff
+
+                    if full_coeffs:
+                        const = total_obj_s - sum(
+                            full_coeffs.get(b, 0.0) * z_dict.get(b, 0.0)
                             for b in all_blocks)
-                        coeffs = {b: v for b, v in bcoeffs_s.items()
-                                  if abs(v) > 1e-12}
-                        if coeffs:
-                            pending_cuts.append({
-                                'trip': (li, ti),
-                                'const': const,
-                                'coeffs': coeffs,
-                                'blocks': set(coeffs.keys()),
-                                'id': len(pending_cuts),
-                            })
+                        pending_cuts.append({
+                            'trip': (li, ti),
+                            'const': const,
+                            'coeffs': full_coeffs,
+                            'blocks': set(full_coeffs.keys()),
+                            'id': len(pending_cuts),
+                        })
 
                 avg_cost = float(np.mean(scenario_costs))
                 ub_iter += op + avg_cost
@@ -1411,13 +1497,11 @@ class FRDetour(BaselineMethod):
         dispatch_intervals: Dict[str, float] = {}
         district_routes: Dict[str, List[int]] = {}
 
+        used_roots: Set[str] = set()
+
         for li, ti in active_trips:
             T_t = T_vals[ti]
-            line_obj = None
-            for ln in lines:
-                if ln.idx == li:
-                    line_obj = ln
-                    break
+            line_obj = line_by_idx.get(li)
             if line_obj is None:
                 continue
 
@@ -1429,11 +1513,25 @@ class FRDetour(BaselineMethod):
             if not assigned_blocks:
                 continue
 
-            # District root: first checkpoint, or centroid if no checkpoints
-            root_id = line_obj.checkpoints[0] if line_obj.checkpoints else assigned_blocks[0]
+            # District root: pick a unique block not already used as root.
+            # Prefer checkpoints (in order), then any assigned block.
+            root_id = None
+            for cp in line_obj.checkpoints:
+                if cp in assigned_blocks and cp not in used_roots:
+                    root_id = cp
+                    break
+            if root_id is None:
+                for b in assigned_blocks:
+                    if b not in used_roots:
+                        root_id = b
+                        break
+            if root_id is None:
+                continue  # all blocks already roots (degenerate)
+
             if root_id not in assigned_blocks:
                 assigned_blocks.append(root_id)
             root_idx = block_ids.index(root_id)
+            used_roots.add(root_id)
 
             # Fill assignment matrix
             for b in assigned_blocks:
@@ -1519,33 +1617,14 @@ class FRDetour(BaselineMethod):
             else:
                 route_order = _greedy_nn_route(pts_km, depot_pos_km)
 
-            # Evaluate with deviation (self.delta)
-            rng_state = rng.bit_generator.state
-            tour_det, walk_det = _fr_detour_tour_stochastic(
+            # Evaluate with the design's delta — no ex-post fallback.
+            # The optimization already balances detour vs walking cost,
+            # so evaluation should use the same delta consistently.
+            tour_km, walk_km = _fr_detour_tour_stochastic(
                 pts_km, depot_pos_km, areas_km2, self.delta, prob_weights,
                 Lambda, T_i, route_order,
                 wr=wr, num_scenarios=self.num_scenarios, rng=rng)
-            # Evaluate without deviation (same scenarios)
-            rng.bit_generator.state = rng_state
-            tour_no, walk_no = _fr_detour_tour_stochastic(
-                pts_km, depot_pos_km, areas_km2, 0.0, prob_weights,
-                Lambda, T_i, route_order,
-                wr=wr, num_scenarios=self.num_scenarios, rng=rng)
-
-            # Per-district fallback: pick lower cost
-            cost_det = (tour_det / (TSP_TRAVEL_DISCOUNT * T_i)
-                        + wr * (tour_det / (2 * VEHICLE_SPEED_KMH)
-                                + walk_det / self.walk_speed_kmh))
-            cost_no = (tour_no / (TSP_TRAVEL_DISCOUNT * T_i)
-                       + wr * (tour_no / (2 * VEHICLE_SPEED_KMH)
-                               + walk_no / self.walk_speed_kmh))
-
-            if cost_det <= cost_no:
-                tour_km_overrides[root] = tour_det
-                walk_km = walk_det
-            else:
-                tour_km_overrides[root] = tour_no
-                walk_km = walk_no
+            tour_km_overrides[root] = tour_km
 
             district_prob = float(prob_weights.sum())
             acc_walk_km += walk_km * district_prob
@@ -1554,6 +1633,21 @@ class FRDetour(BaselineMethod):
         acc_prob = max(acc_prob, 1e-12)
         avg_walk_time_h = (acc_walk_km / acc_prob) / self.walk_speed_kmh
         return tour_km_overrides, avg_walk_time_h
+
+    # ------------------------------------------------------------------
+    # Custom simulate (called by run_baseline in experiment scripts)
+    # ------------------------------------------------------------------
+
+    def custom_simulate(
+        self, design: ServiceDesign, geodata,
+        prob_dict: Dict[str, float], Omega_dict,
+        J_function: Callable, Lambda: float,
+        wr: float, wv: float,
+    ) -> EvaluationResult:
+        """Dispatch to evaluate() so run_baseline uses FR-specific costs."""
+        return self.evaluate(
+            design, geodata, prob_dict, Omega_dict, J_function,
+            Lambda, wr, wv)
 
     # ------------------------------------------------------------------
     # Evaluate
@@ -1566,14 +1660,82 @@ class FRDetour(BaselineMethod):
         wr: float, wv: float,
         beta: float = BETA, road_network=None,
     ) -> EvaluationResult:
-        """Evaluation with stochastic demand and optimal deviations."""
+        """FR-specific evaluation.
+
+        Cost structure for fixed-route (with optional detour):
+          - No separate linehaul: depot→route→depot travel is already in
+            the tour_km computed by compute_route_costs.
+          - No ODD cost: vehicles run on a fixed schedule, not on-demand
+            dispatch.
+          - Provider cost = route_km / (discount * T) per district.
+          - User cost = T/2 (wait) + route_km/(2*speed) (in-vehicle)
+                       + walk_to_stop (walk).
+        """
         tour_km_overrides, avg_walk_time_h = self.compute_route_costs(
             design, geodata, prob_dict, Lambda, wr)
-        result = evaluate_design(
-            design, geodata, prob_dict, Omega_dict, J_function,
-            Lambda, wr, wv, beta, road_network,
-            walk_time_override=avg_walk_time_h,
-            tour_km_overrides=tour_km_overrides)
+
+        block_ids = geodata.short_geoid_list
+        N = len(block_ids)
+        assignment = design.assignment
+        discount = TSP_TRAVEL_DISCOUNT
+        speed = VEHICLE_SPEED_KMH
+
+        acc_in_district = 0.0
+        acc_wait = 0.0
+        acc_invehicle = 0.0
+        acc_fleet = 0.0
+        acc_T_weighted = 0.0
+        acc_prob = 0.0
+
+        for i, root in enumerate(block_ids):
+            if round(assignment[i, i]) != 1:
+                continue
+            assigned = [j for j in range(N) if round(assignment[j, i]) == 1]
+            if not assigned:
+                continue
+
+            T_i = design.dispatch_intervals.get(root, 1.0)
+            district_prob = sum(prob_dict.get(block_ids[j], 0.0)
+                                for j in assigned)
+
+            tour_km = tour_km_overrides.get(root, 0.0)
+            provider_in_district = tour_km / discount
+
+            acc_in_district += (provider_in_district / T_i) * district_prob
+            acc_wait += (T_i / 2.0) * district_prob
+            acc_invehicle += (tour_km / (2.0 * speed)) * district_prob
+            acc_fleet += tour_km / (speed * T_i)
+            acc_T_weighted += T_i * district_prob
+            acc_prob += district_prob
+
+        acc_prob = max(acc_prob, 1e-12)
+
+        avg_wait = acc_wait / acc_prob
+        avg_invehicle = acc_invehicle / acc_prob
+        avg_walk = avg_walk_time_h
+        total_user_time = avg_wait + avg_invehicle + avg_walk
+
+        in_district_cost = acc_in_district
+        fleet_size = acc_fleet
+        avg_dispatch_interval = acc_T_weighted / acc_prob
+
+        provider_cost = in_district_cost  # no linehaul, no ODD
+        user_cost = wr * total_user_time * acc_prob
+        total_cost = provider_cost + user_cost
+
         return EvaluationResult(
             name=self._name,
-            **{k: v for k, v in result.__dict__.items() if k != 'name'})
+            avg_wait_time=avg_wait,
+            avg_invehicle_time=avg_invehicle,
+            avg_walk_time=avg_walk,
+            total_user_time=total_user_time,
+            linehaul_cost=0.0,         # depot travel included in route tour
+            in_district_cost=in_district_cost,
+            total_travel_cost=in_district_cost,
+            fleet_size=fleet_size,
+            avg_dispatch_interval=avg_dispatch_interval,
+            odd_cost=0.0,              # no on-demand dispatch for FR
+            provider_cost=provider_cost,
+            user_cost=user_cost,
+            total_cost=total_cost,
+        )

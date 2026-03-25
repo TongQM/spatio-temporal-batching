@@ -255,6 +255,8 @@ def parse_args():
                    help='Random-search iterations for SP-Lit / Joint baselines')
     p.add_argument('--T_fixed', type=float, default=0.5,
                    help='Fixed headway for FR and SP-Lit (hours)')
+    p.add_argument('--delta', type=float, default=1.0,
+                   help='Max detour deviation for FR-Detour (km)')
     return p.parse_args()
 
 
@@ -280,7 +282,7 @@ def main():
     # Table order: FR, spatial, temporal, joint, VCC, OD
     baselines = [
         ("Multi-FR (Jacquillat)",        FRDetour(delta=0.0, max_iters=args.rs_iters, name="Multi-FR (Jacquillat)")),
-        ("Multi-FR-Detour (Jacquillat)", FRDetour(delta=0.3, max_iters=args.rs_iters)),
+        ("Multi-FR-Detour (Jacquillat)", FRDetour(delta=args.delta, max_iters=args.rs_iters)),
         ("SP-Lit (Carlsson)",            CarlssonPartition(T_fixed=args.T_fixed)),
         ("TP-Lit (Liu)",                 TemporalOnly()),
         ("Joint-Nom",                    JointNom(max_iters=args.rs_iters)),
