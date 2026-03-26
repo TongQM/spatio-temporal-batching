@@ -1,41 +1,53 @@
-"""Side-by-side FR vs FR-Detour with scattered (non-grid) demand.
+"""FR vs FR-Detour comparison and diagnostics.
 
-On a regular grid, every block sits at a grid intersection, so the
-optimizer can always make it a checkpoint.  With randomly scattered
-demand, some blocks naturally fall *near* a route but not *on* it —
-exactly where detour capability matters.
+This module provides:
+- a scattered-demand comparison on the same selected reference design
+- a uniform synthetic diagnostic with scenario-based served stops and skip arcs
 
-Each panel runs its own design (delta=0 vs delta>0) so the optimizer
-can exploit corridor reachability differently.
+The helper functions are also imported by `visualize_designs.py` so the
+fixed-route panels use the same second-stage service semantics.
 """
+from __future__ import annotations
+
 import os
 import sys
-import numpy as np
+from typing import Dict, Optional, Tuple
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, Polygon
 import networkx as nx
+import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from lib.baselines import FRDetour
-from lib.baselines.base import ServiceDesign
+from lib.baselines.base import EvaluationResult, VEHICLE_SPEED_KMH
+from lib.baselines.fr_detour import (
+    ReferenceLine,
+    _build_initial_arcs,
+    _crn_demand,
+    _solve_routing_lp_with_cg,
+    _tour_distance,
+)
+from lib.constants import TSP_TRAVEL_DISCOUNT
 
 
-# ── Custom geodata with arbitrary block positions ────────────────────────
-class ScatteredGeoData:
-    """Minimal GeoData with user-specified block positions."""
+PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#8c564b", "#17becf"]
+
+
+class SyntheticGeoData:
+    """Minimal GeoData with arbitrary point locations."""
 
     def __init__(self, positions_km):
         self.short_geoid_list = list(positions_km.keys())
         self.n_blocks = len(self.short_geoid_list)
         self.level = "block_group"
         self.gdf = None
-        # pos in METRES (GeoData convention)
-        self.pos = {b: (x * 1000.0, y * 1000.0)
-                    for b, (x, y) in positions_km.items()}
-        # Fully-connected contiguity graph
+        self.pos = {
+            b: (x * 1000.0, y * 1000.0) for b, (x, y) in positions_km.items()
+        }
         self.G = nx.complete_graph(self.short_geoid_list)
         self.block_graph = self.G
         self.arc_list = []
@@ -44,11 +56,12 @@ class ScatteredGeoData:
             self.arc_list.append((v, u))
 
     def get_dist(self, b1, b2):
-        p1, p2 = np.array(self.pos[b1]), np.array(self.pos[b2])
+        p1 = np.array(self.pos[b1], dtype=float)
+        p2 = np.array(self.pos[b2], dtype=float)
         return float(np.linalg.norm(p1 - p2))
 
     def get_area(self, _):
-        return 250_000.0  # 0.25 km² per block
+        return 0.25
 
     def get_K(self, _):
         return 2.0
@@ -60,89 +73,40 @@ class ScatteredGeoData:
         return self.arc_list
 
 
-# ── Scattered demand layout ──────────────────────────────────────────────
-rng = np.random.RandomState(7)
-n_blocks = 25
-positions_km = {}
-for i in range(n_blocks):
-    positions_km[f"B{i:02d}"] = (
-        round(rng.uniform(0.2, 4.8), 2),
-        round(rng.uniform(0.2, 4.8), 2),
-    )
-
-geodata = ScatteredGeoData(positions_km)
-block_ids = geodata.short_geoid_list
-N = len(block_ids)
-block_pos_km = np.array([
-    np.array(geodata.pos[b], dtype=float) / 1000.0 for b in block_ids
-])
-prob_dict = {b: 1.0 / N for b in block_ids}
-Omega_dict = {b: np.array([1.0]) for b in block_ids}
-
 def identity_J(omega):
     return float(np.sum(omega))
 
-# ── Settings ─────────────────────────────────────────────────────────────
-K = 2
-LAMBDA = 1000.0
-WR, WV = 1.0, 10.0
-RS_ITERS = 100
-DELTA_DETOUR = 0.8
 
-# ── Run separate designs for delta=0 and delta>0 ────────────────────────
-print(f"  Designing Multi-FR (K={K}, delta=0) ...", flush=True)
-fr0 = FRDetour(delta=0.0, max_iters=RS_ITERS, name="Multi-FR")
-design_fr = fr0.design(
-    geodata, prob_dict, Omega_dict, identity_J, K,
-    Lambda=LAMBDA, wr=WR, wv=WV,
-)
-
-print(f"  Designing Multi-FR-Detour (K={K}, delta={DELTA_DETOUR}) ...",
-      flush=True)
-fr_det = FRDetour(delta=DELTA_DETOUR, max_iters=RS_ITERS)
-design_det = fr_det.design(
-    geodata, prob_dict, Omega_dict, identity_J, K,
-    Lambda=LAMBDA, wr=WR, wv=WV,
-)
-
-# ── Evaluate both designs ────────────────────────────────────────────────
-print("  Evaluating ...", flush=True)
-eval_fr = fr0.evaluate(
-    design_fr, geodata, prob_dict, Omega_dict, identity_J,
-    LAMBDA, WR, WV,
-)
-eval_det = fr_det.evaluate(
-    design_det, geodata, prob_dict, Omega_dict, identity_J,
-    LAMBDA, WR, WV,
-)
-
-designs = {
-    "Multi-FR (delta=0)": (design_fr, eval_fr, 0.0),
-    f"Multi-FR-Detour (delta={DELTA_DETOUR})": (design_det, eval_det, DELTA_DETOUR),
-}
-
-for name, (d, ev, _) in designs.items():
-    routes = d.district_routes or {}
-    for root_id, route in routes.items():
-        cp_names = [block_ids[gi] for gi in route]
-        ri = block_ids.index(root_id)
-        assigned = [block_ids[j] for j in range(N)
-                    if round(d.assignment[j, ri]) == 1]
-        corridor_only = [b for b in assigned if block_ids.index(b) not in route]
-        print(f"  [{name}] Route {root_id}: {len(route)} CPs -> {cp_names}")
-        print(f"      Corridor-only: {corridor_only}")
-    print(f"  [{name}] total_cost={ev.total_cost:.4f}  "
-          f"user_time={ev.total_user_time:.4f}h  "
-          f"provider={ev.provider_cost:.4f}")
-print()
+def make_uniform_positions(seed=17, n_blocks=18, low=0.3, high=4.7):
+    rng = np.random.default_rng(seed)
+    return {
+        f"B{i:02d}": (float(rng.uniform(low, high)), float(rng.uniform(low, high)))
+        for i in range(n_blocks)
+    }
 
 
-# ── Visualization ────────────────────────────────────────────────────────
-PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+def make_scattered_positions(seed=7, n_blocks=25, low=0.2, high=4.8):
+    rng = np.random.RandomState(seed)
+    return {
+        f"B{i:02d}": (round(rng.uniform(low, high), 2), round(rng.uniform(low, high), 2))
+        for i in range(n_blocks)
+    }
+
+
+def build_synthetic_instance(positions_km):
+    geodata = SyntheticGeoData(positions_km)
+    block_ids = geodata.short_geoid_list
+    block_pos_km = _positions_array(geodata, block_ids)
+    prob_dict = {b: 1.0 / len(block_ids) for b in block_ids}
+    Omega_dict = {b: np.array([1.0]) for b in block_ids}
+    return geodata, block_ids, block_pos_km, prob_dict, Omega_dict
+
+
+def _positions_array(geodata, block_ids):
+    return np.array([np.array(geodata.pos[b], dtype=float) / 1000.0 for b in block_ids])
 
 
 def _pt_seg_dist(p, a, b):
-    """Distance from point p to segment a-b."""
     ab = b - a
     ab2 = np.dot(ab, ab)
     if ab2 < 1e-12:
@@ -151,79 +115,270 @@ def _pt_seg_dist(p, a, b):
     return float(np.linalg.norm(p - (a + t * ab)))
 
 
-def _in_corridor(j, route_global, delta):
-    """True if block j is within delta of any route segment (CP-to-CP)."""
-    pt = block_pos_km[j]
+def _in_corridor(block_idx, route_global, block_pos_km, delta):
+    if delta <= 0.0 or len(route_global) < 2:
+        return False
+    pt = block_pos_km[block_idx]
     for k in range(len(route_global) - 1):
-        if _pt_seg_dist(pt, block_pos_km[route_global[k]],
-                        block_pos_km[route_global[k + 1]]) <= delta + 1e-9:
+        a = block_pos_km[route_global[k]]
+        b = block_pos_km[route_global[k + 1]]
+        if _pt_seg_dist(pt, a, b) <= delta + 1e-9:
             return True
     return False
 
 
-def _plot_fr(ax, design, eval_result, title, delta):
+def _walk_geometry(geodata, block_ids, delta):
+    walk_saved = {}
+    for b in block_ids:
+        area_b = float(geodata.get_area(b))
+        r_b = np.sqrt(area_b / np.pi)
+        walk_no_det = 2.0 * r_b / 3.0
+        if delta < max(r_b, 1e-12):
+            walk_det = walk_no_det - delta + delta ** 3 / (3.0 * max(r_b, 1e-12) ** 2)
+        else:
+            walk_det = 0.0
+        walk_saved[b] = max(walk_no_det - max(walk_det, 0.0), 0.0)
+    return walk_saved
+
+
+def assigned_locations_by_root(design, block_ids):
+    meta = design.service_metadata.get("fr_detour", {})
+    assigned_meta = meta.get(
+        "assigned_locations_by_root",
+        meta.get("assigned_blocks_by_root", {}),
+    )
+    assigned = {}
+    for root in design.district_roots:
+        blocks = list(assigned_meta.get(root, []))
+        if not blocks and design.assignment is not None:
+            ri = block_ids.index(root)
+            blocks = [
+                block_ids[j] for j in range(len(block_ids))
+                if round(design.assignment[j, ri]) == 1
+            ]
+        assigned[root] = blocks
+    return assigned
+
+
+def solve_design_scenario(
+    design,
+    method,
+    geodata,
+    block_ids,
+    block_pos_km,
+    prob_dict,
+    crn_uniforms,
+    Lambda,
+    wr,
+    scenario_idx,
+):
+    """Solve one scenario and recover second-stage served stopping locations."""
+    depot_pos = np.array(geodata.pos[design.depot_id], dtype=float) / 1000.0
+    walk_saved_km = _walk_geometry(geodata, block_ids, method.delta)
+    assigned_by_root = assigned_locations_by_root(design, block_ids)
+    block_pos_map = {b: block_pos_km[i] for i, b in enumerate(block_ids)}
+    services = {}
+
+    for root in design.district_roots:
+        assigned_blocks = list(assigned_by_root.get(root, []))
+        route_global = design.district_routes.get(root, [])
+        checkpoints = [block_ids[gi] for gi in route_global]
+        T_i = design.dispatch_intervals[root]
+
+        line_obj = ReferenceLine(
+            idx=0,
+            checkpoints=checkpoints,
+            reachable_locations=set(assigned_blocks),
+            est_tour_km=_tour_distance(depot_pos, checkpoints, block_pos_map),
+        )
+        arcs = _build_initial_arcs(
+            line_obj, block_ids, block_pos_map,
+            method.delta, method.K_skip, VEHICLE_SPEED_KMH, method.alpha_time,
+        )
+
+        demand_matrix = _crn_demand(crn_uniforms, Lambda, T_i, prob_dict, block_ids)
+        demand_s = {block_ids[j]: int(demand_matrix[scenario_idx, j]) for j in range(len(block_ids))}
+        z_star = {b: 1.0 for b in assigned_blocks}
+        all_blocks = set(assigned_blocks)
+        cp_set = set(checkpoints)
+        cost_mult = 1.0 / (TSP_TRAVEL_DISCOUNT * T_i) + wr / (2.0 * VEHICLE_SPEED_KMH)
+        walk_penalties = {
+            b: (
+                method.coverage_penalty_factor
+                * wr
+                * walk_saved_km.get(b, 0.0)
+                * demand_s.get(b, 0)
+                / method.walk_speed_kmh
+            )
+            for b in all_blocks
+        }
+
+        u_vals = {b: 1.0 for b in assigned_blocks if b not in cp_set}
+        active_arcs = []
+        if len(checkpoints) > 1 and arcs and sum(demand_s.get(b, 0) for b in assigned_blocks) > 0:
+            result = _solve_routing_lp_with_cg(
+                arcs,
+                line_obj,
+                block_ids,
+                block_pos_map,
+                len(checkpoints),
+                method.capacity,
+                z_star,
+                demand_s,
+                all_blocks,
+                cp_set,
+                cost_mult,
+                walk_penalties,
+                method.delta,
+                VEHICLE_SPEED_KMH,
+                method.alpha_time,
+                method.K_skip,
+                max_cg_iters=method.max_cg_iters,
+                return_solution=True,
+                return_active_arcs=True,
+            )
+            if result[0] is not None:
+                _, _, _, u_vals, active_arcs = result
+
+        served_stops = {
+            b for b in assigned_blocks
+            if b not in cp_set and demand_s.get(b, 0) > 0 and u_vals.get(b, 1.0) < 0.5
+        }
+        skip_arcs = [(arc, flow) for arc, flow in active_arcs if arc.cp_to > arc.cp_from + 1]
+        services[root] = {
+            "root": root,
+            "checkpoints": checkpoints,
+            "assigned_blocks": assigned_blocks,
+            "served_stops": served_stops,
+            "skip_arcs": skip_arcs,
+            "demand_s": demand_s,
+            "route_global": route_global,
+        }
+    return services
+
+
+def find_first_skip_scenario(
+    design,
+    method,
+    geodata,
+    block_ids,
+    block_pos_km,
+    prob_dict,
+    crn_uniforms,
+    Lambda,
+    wr,
+):
+    for s in range(int(crn_uniforms.shape[0])):
+        services = solve_design_scenario(
+            design, method, geodata, block_ids, block_pos_km, prob_dict, crn_uniforms, Lambda, wr, s
+        )
+        for root in design.district_roots:
+            info = services.get(root)
+            if info and info["skip_arcs"]:
+                return s, info
+    return 0, None
+
+
+def find_first_served_stop_scenario(
+    design,
+    method,
+    geodata,
+    block_ids,
+    block_pos_km,
+    prob_dict,
+    crn_uniforms,
+    Lambda,
+    wr,
+):
+    for s in range(int(crn_uniforms.shape[0])):
+        services = solve_design_scenario(
+            design, method, geodata, block_ids, block_pos_km, prob_dict, crn_uniforms, Lambda, wr, s
+        )
+        for info in services.values():
+            if info.get("served_stops"):
+                return s, services
+    return 0, solve_design_scenario(
+        design, method, geodata, block_ids, block_pos_km, prob_dict, crn_uniforms, Lambda, wr, 0
+    )
+
+
+def _route_color_by_root(design):
+    active_roots = [root for root in design.district_roots if design.district_routes.get(root, [])]
+    return {root: PALETTE[i % len(PALETTE)] for i, root in enumerate(active_roots)}
+
+
+def plot_fixed_route_panel(
+    ax,
+    design,
+    eval_result: Optional[EvaluationResult],
+    title,
+    delta,
+    geodata,
+    block_ids,
+    block_pos_km,
+    services=None,
+    skip_info=None,
+):
     depot_idx = block_ids.index(design.depot_id)
     depot_pos = block_pos_km[depot_idx]
-
     routes = design.district_routes or {}
-    assignment = design.assignment
-
     active = [(rid, r) for rid, r in routes.items() if r]
-    n_lines = len(active)
+    route_colors = _route_color_by_root(design)
 
-    # Collect all checkpoint indices
     all_cps = set()
     for _, route in active:
         all_cps.update(route)
 
-    # Map blocks -> active routes, with geometric corridor check
-    block_route = np.full(N, -1, dtype=int)
-    for d, (root_id, route_global) in enumerate(active):
-        ri = block_ids.index(root_id)
-        for j in range(N):
-            if round(assignment[j, ri]) != 1:
-                continue
-            if j in all_cps:
-                block_route[j] = d
-            elif delta > 0 and _in_corridor(j, route_global, delta):
-                block_route[j] = d
+    block_route = np.full(len(block_ids), -1, dtype=int)
+    if services is not None:
+        route_order = [root_id for root_id, _ in active]
+        for d, root_id in enumerate(route_order):
+            info = services.get(root_id, {})
+            for cp in info.get("checkpoints", []):
+                block_route[block_ids.index(cp)] = d
+            for b in info.get("served_stops", set()):
+                block_route[block_ids.index(b)] = d
+    else:
+        assignment = design.assignment
+        for d, (root_id, route_global) in enumerate(active):
+            ri = block_ids.index(root_id)
+            for j in range(len(block_ids)):
+                if round(assignment[j, ri]) != 1:
+                    continue
+                if j in all_cps:
+                    block_route[j] = d
+                elif delta > 0 and _in_corridor(j, route_global, block_pos_km, delta):
+                    block_route[j] = d
 
-    # Draw blocks
-    for j in range(N):
+    for j, bid in enumerate(block_ids):
         x, y = block_pos_km[j]
+        ax.plot(x, y, "o", color="#bbbbbb", markersize=6,
+                markeredgecolor="black", markeredgewidth=0.4,
+                alpha=0.35, zorder=2.5)
         if block_route[j] >= 0:
-            d = block_route[j]
-            color = PALETTE[d % len(PALETTE)]
+            root_id = active[block_route[j]][0]
+            color = route_colors[root_id]
             is_cp = j in all_cps
             marker = "s" if is_cp else "o"
             size = 10 if is_cp else 7
             edge = "black" if is_cp else "white"
-            alpha = 0.9 if is_cp else 0.6
+            alpha = 0.9 if is_cp else 0.7
             ax.plot(x, y, marker, color=color, markersize=size,
                     markeredgecolor=edge, markeredgewidth=0.7,
                     alpha=alpha, zorder=4)
-        else:
-            ax.plot(x, y, "o", color="#bbbbbb", markersize=6,
-                    markeredgecolor="black", markeredgewidth=0.4,
-                    alpha=0.5, zorder=3)
         ax.text(x + 0.12, y + 0.12, block_ids[j][-3:], fontsize=5,
                 color="black", alpha=0.6, zorder=7)
 
-    # Draw closed route loops
-    for d, (root_id, route_global) in enumerate(active):
-        color = PALETTE[d % len(PALETTE)]
+    for root_id, route_global in active:
+        color = route_colors[root_id]
         cp_pos = np.array([block_pos_km[gi] for gi in route_global])
         if len(cp_pos) < 1:
             continue
         loop = np.vstack([[depot_pos], cp_pos, [depot_pos]])
-        ax.plot(loop[:, 0], loop[:, 1], "-", color=color,
-                linewidth=2.0, alpha=0.7, zorder=2)
+        ax.plot(loop[:, 0], loop[:, 1], "-", color=color, linewidth=2.0, alpha=0.7, zorder=2)
         if len(loop) >= 2:
             ax.annotate("", xy=loop[1], xytext=loop[0],
-                        arrowprops=dict(arrowstyle="-|>", color=color,
-                                        lw=2.0, mutation_scale=12), zorder=3)
-
-        # Corridor outline (FR-Detour only)
+                        arrowprops=dict(arrowstyle="-|>", color=color, lw=2.0, mutation_scale=12), zorder=3)
         if delta > 0 and len(cp_pos) >= 2:
             for k in range(len(cp_pos) - 1):
                 p1, p2 = cp_pos[k], cp_pos[k + 1]
@@ -233,73 +388,198 @@ def _plot_fr(ax, design, eval_result, title, delta):
                     continue
                 perp = np.array([-seg[1], seg[0]]) / seg_len * delta
                 corners = np.array([p1 + perp, p2 + perp, p2 - perp, p1 - perp])
-                poly = Polygon(corners, facecolor=color, edgecolor=color,
-                               alpha=0.06, linewidth=0.6, linestyle="--", zorder=0)
-                ax.add_patch(poly)
+                ax.add_patch(Polygon(corners, facecolor=color, edgecolor=color,
+                                     alpha=0.06, linewidth=0.6, linestyle="--", zorder=0))
             for cp in cp_pos:
-                circ = Circle(cp, delta, facecolor=color, edgecolor=color,
-                              alpha=0.06, linewidth=0.6, linestyle="--", zorder=0)
-                ax.add_patch(circ)
+                ax.add_patch(Circle(cp, delta, facecolor=color, edgecolor=color,
+                                    alpha=0.06, linewidth=0.6, linestyle="--", zorder=0))
 
-    # Depot
+    if skip_info is not None:
+        checkpoints = skip_info["checkpoints"]
+        for arc, _flow in skip_info["skip_arcs"]:
+            p1 = block_pos_km[block_ids.index(checkpoints[arc.cp_from])]
+            p2 = block_pos_km[block_ids.index(checkpoints[arc.cp_to])]
+            ax.plot([p1[0], p2[0]], [p1[1], p2[1]], "--", color="black", lw=3.0, alpha=0.9, zorder=4)
+
     ax.plot(*depot_pos, "*", color="red", markersize=16,
             markeredgecolor="black", markeredgewidth=0.8, zorder=6)
 
-    # Stats
+    n_lines = len(active)
     n_cp = len(all_cps)
-    n_corr = sum(1 for j in range(N) if block_route[j] >= 0
-                 and j not in all_cps)
-    n_uncov = sum(1 for j in range(N) if block_route[j] < 0)
+    n_corr = sum(1 for j in range(len(block_ids)) if block_route[j] >= 0 and j not in all_cps)
+    n_uncov = sum(1 for j in range(len(block_ids)) if block_route[j] < 0)
 
     T_info = design.dispatch_intervals
     T_vals = list(T_info.values()) if T_info else []
     t_str = (f"T={T_vals[0]:.2f}h"
              if T_vals and len(set(f"{t:.2f}" for t in T_vals)) == 1
-             else f"T={min(T_vals):.2f}-{max(T_vals):.2f}h" if T_vals
-             else "")
-
-    # Title with route stats
-    ax.set_title(f"{title}\n{n_lines} routes, {t_str}\n"
-                 f"{n_cp} CPs  {n_corr} corridor  {n_uncov} uncov",
+             else f"T={min(T_vals):.2f}-{max(T_vals):.2f}h" if T_vals else "")
+    ax.set_title(f"{title}\n{n_lines} routes, {t_str}\n{n_cp} CPs  {n_corr} corridor  {n_uncov} uncov",
                  fontsize=9)
 
-    # Evaluation metrics text box
-    ev = eval_result
-    textstr = (f"User: wait={ev.avg_wait_time:.3f} "
-               f"ride={ev.avg_invehicle_time:.3f} "
-               f"walk={ev.avg_walk_time:.3f}h\n"
-               f"Provider: {ev.provider_cost:.3f}  "
-               f"Fleet: {ev.fleet_size:.1f}\n"
-               f"Total cost: {ev.total_cost:.3f}")
-    props = dict(boxstyle="round,pad=0.3", facecolor="white",
-                 edgecolor="#cccccc", alpha=0.85)
-    ax.text(0.02, 0.02, textstr, transform=ax.transAxes, fontsize=6.5,
-            verticalalignment="bottom", bbox=props, zorder=10)
+    if eval_result is not None:
+        ev = eval_result
+        textstr = (f"User: wait={ev.avg_wait_time:.3f} "
+                   f"ride={ev.avg_invehicle_time:.3f} "
+                   f"walk={ev.avg_walk_time:.3f}h\n"
+                   f"Provider: {ev.provider_cost:.3f}  Fleet: {ev.fleet_size:.1f}\n"
+                   f"Total cost: {ev.total_cost:.3f}")
+        props = dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="#cccccc", alpha=0.85)
+        ax.text(0.02, 0.02, textstr, transform=ax.transAxes, fontsize=6.5,
+                verticalalignment="bottom", bbox=props, zorder=10)
 
     margin = 0.3
-    ax.set_xlim(block_pos_km[:, 0].min() - margin,
-                block_pos_km[:, 0].max() + margin)
-    ax.set_ylim(block_pos_km[:, 1].min() - margin,
-                block_pos_km[:, 1].max() + margin)
+    ax.set_xlim(block_pos_km[:, 0].min() - margin, block_pos_km[:, 0].max() + margin)
+    ax.set_ylim(block_pos_km[:, 1].min() - margin, block_pos_km[:, 1].max() + margin)
     ax.set_aspect("equal")
-    ax.tick_params(labelsize=6)
-    ax.set_xlabel("x (km)", fontsize=8)
-    ax.set_ylabel("y (km)", fontsize=8)
+    ax.set_xlabel("x (km)")
+    ax.set_ylabel("y (km)")
 
 
-# ── Figure ───────────────────────────────────────────────────────────────
-fig, axes = plt.subplots(1, 2, figsize=(11, 5.5))
+def run_uniform_comparison():
+    positions_km = make_uniform_positions()
+    geodata, block_ids, block_pos_km, prob_dict, Omega_dict = build_synthetic_instance(positions_km)
 
-for i, (name, (design, ev, delta)) in enumerate(designs.items()):
-    _plot_fr(axes[i], design, ev, name, delta)
+    budget = 2
+    Lambda = 8.0
+    wr, wv = 1.0, 10.0
+    rs_iters = 100
+    delta_detour = 0.8
 
-fig.suptitle(f"FR vs FR-Detour — scattered demand, K={K}, "
-             f"\u039b={LAMBDA:.0f}",
-             fontsize=13, fontweight="bold", y=1.02)
-fig.tight_layout()
+    shared_builder = FRDetour(delta=delta_detour, max_iters=rs_iters)
+    shared_inputs = shared_builder._prepare_shared_inputs(geodata, budget)
 
-out_dir = "results/baseline_comparison/figures"
-os.makedirs(out_dir, exist_ok=True)
-out = os.path.join(out_dir, "fr_detour_comparison.png")
-fig.savefig(out, dpi=150, bbox_inches="tight")
-print(f"Saved: {out}")
+    print(f"  Designing shared reference network (budget={budget}, delta={delta_detour}) ...", flush=True)
+    fr_det = FRDetour(delta=delta_detour, max_iters=rs_iters)
+    shared_design = fr_det.design(
+        geodata, prob_dict, Omega_dict, identity_J, budget,
+        Lambda=Lambda, wr=wr, wv=wv, **shared_inputs,
+    )
+    fr0 = FRDetour(delta=0.0, max_iters=rs_iters, name="Multi-FR")
+
+    print("  Evaluating ...", flush=True)
+    eval_fr = fr0.evaluate(
+        shared_design, geodata, prob_dict, Omega_dict, identity_J,
+        Lambda, wr, wv, crn_uniforms=shared_inputs["crn_uniforms"],
+    )
+    eval_det = fr_det.evaluate(
+        shared_design, geodata, prob_dict, Omega_dict, identity_J,
+        Lambda, wr, wv, crn_uniforms=shared_inputs["crn_uniforms"],
+    )
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    plot_fixed_route_panel(
+        axes[0], shared_design, eval_fr, "Multi-FR (delta=0)", 0.0,
+        geodata, block_ids, block_pos_km,
+    )
+    plot_fixed_route_panel(
+        axes[1], shared_design, eval_det, f"Multi-FR-Detour (delta={delta_detour})", delta_detour,
+        geodata, block_ids, block_pos_km,
+    )
+    fig.suptitle(
+        f"FR vs FR-Detour — uniform stopping locations, budget={budget}, Λ={Lambda}\n"
+        "same selected reference design + shared CRN samples",
+        fontsize=14, fontweight="bold", y=1.01,
+    )
+    fig.tight_layout()
+
+    out_dir = "results/baseline_comparison/figures"
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, "fr_detour_comparison.png")
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"Saved: {out}")
+
+
+def run_uniform_diagnostic(wr=500.0):
+    budget = 2
+    Lambda = 8.0
+    wv = 10.0
+    delta = 0.8
+    n_saa = 20
+    rs_iters = 30
+
+    positions_km = make_uniform_positions()
+    geodata, block_ids, block_pos_km, prob_dict, Omega_dict = build_synthetic_instance(positions_km)
+    n_blocks = len(block_ids)
+
+    shared_crn = np.random.default_rng(123).uniform(0.0, 1.0, size=(n_saa, n_blocks))
+    shared_builder = FRDetour(
+        delta=delta, max_iters=rs_iters, n_saa=n_saa, K_skip=2, T_values=[0.25, 0.5, 0.75, 1.0]
+    )
+    shared_inputs = shared_builder._prepare_shared_inputs(geodata, budget, crn_uniforms=shared_crn)
+
+    fr0 = FRDetour(delta=0.0, max_iters=rs_iters, n_saa=n_saa, K_skip=2,
+                   T_values=[0.25, 0.5, 0.75, 1.0], name="Multi-FR")
+    fr_det = FRDetour(delta=delta, max_iters=rs_iters, n_saa=n_saa, K_skip=2,
+                      T_values=[0.25, 0.5, 0.75, 1.0], name="Multi-FR-Detour")
+
+    print(f"Designing shared reference network (budget={budget}, delta={delta}, Lambda={Lambda}, wr={wr}) ...",
+          flush=True)
+    shared_design = fr_det.design(
+        geodata, prob_dict, Omega_dict, identity_J, budget,
+        Lambda=Lambda, wr=wr, wv=wv, **shared_inputs,
+    )
+
+    scenario_fr, skip_fr = find_first_skip_scenario(
+        shared_design, fr0, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, wr
+    )
+    scenario_det, skip_det = find_first_skip_scenario(
+        shared_design, fr_det, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, wr
+    )
+    scenario_to_plot = min(scenario_fr, scenario_det)
+    services_fr = solve_design_scenario(
+        shared_design, fr0, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, wr, scenario_to_plot
+    )
+    services_det = solve_design_scenario(
+        shared_design, fr_det, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, wr, scenario_to_plot
+    )
+
+    print("\n[FR] selected routes")
+    for root in shared_design.district_roots:
+        route = [block_ids[gi] for gi in shared_design.district_routes.get(root, [])]
+        print(f"  root={root}  T={shared_design.dispatch_intervals.get(root, 1.0):.2f}h  checkpoints={route}")
+    if skip_fr is not None:
+        print(f"  first skip observed on route {skip_fr['root']} in scenario {scenario_fr}")
+        for arc, flow in skip_fr["skip_arcs"]:
+            skipped = skip_fr["checkpoints"][arc.cp_from + 1:arc.cp_to]
+            print(f"    arc {skip_fr['checkpoints'][arc.cp_from]} -> {skip_fr['checkpoints'][arc.cp_to]} (flow={flow:.2f}) skips {skipped}")
+
+    print("\n[FR-Detour] selected routes")
+    for root in shared_design.district_roots:
+        route = [block_ids[gi] for gi in shared_design.district_routes.get(root, [])]
+        print(f"  root={root}  T={shared_design.dispatch_intervals.get(root, 1.0):.2f}h  checkpoints={route}")
+    if skip_det is not None:
+        print(f"  first skip observed on route {skip_det['root']} in scenario {scenario_det}")
+        for arc, flow in skip_det["skip_arcs"]:
+            skipped = skip_det["checkpoints"][arc.cp_from + 1:arc.cp_to]
+            print(f"    arc {skip_det['checkpoints'][arc.cp_from]} -> {skip_det['checkpoints'][arc.cp_to]} (flow={flow:.2f}) skips {skipped}")
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
+    plot_fixed_route_panel(
+        axes[0], shared_design, None, "FR (delta=0)", 0.0,
+        geodata, block_ids, block_pos_km, services=services_fr, skip_info=skip_fr,
+    )
+    plot_fixed_route_panel(
+        axes[1], shared_design, None, f"FR-Detour (delta={delta})", delta,
+        geodata, block_ids, block_pos_km, services=services_det, skip_info=skip_det,
+    )
+    fig.suptitle(
+        f"Uniform stopping locations, budget={budget}, Lambda={Lambda}, wr={wr}, scenario={scenario_to_plot}\n"
+        "Same selected reference design; colored circles = second-stage served stops",
+        fontsize=13, fontweight="bold", y=1.02,
+    )
+    fig.tight_layout()
+
+    out_dir = "results/baseline_comparison/figures"
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, "fr_detour_uniform_skip.png")
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"Saved: {out}")
+
+
+def main():
+    run_uniform_comparison()
+
+
+if __name__ == "__main__":
+    main()
