@@ -1,18 +1,27 @@
 """
-Temporal-only baseline (Liu & Luo 2023): single depot, fixed 15-min dispatch,
+Temporal-only baseline (Liu & Luo 2023): single depot, fixed dispatch interval,
 ADP-optimized fleet dispatch, VRP-optimized routing.
 
 Three-layer architecture following the paper:
-  Layer 1 (ADP): APT cost-to-go approximation for forward-looking dispatch
-  Layer 2 (Benders): Dispatch/routing separation — evaluate H^s(K) per K
+  Layer 1 (ADP): APT cost-to-go via LP allocation for forward-looking dispatch
+  Layer 2 (Benders): Iterative dispatch/routing refinement with cut-inspired
+                     sample concentration on promising K values
   Layer 3 (CG + route enum): VRP via set-partitioning + ESPPRC pricing
 
-No spatial partition. No BHH approximation. Continuous demand region.
+Demand model (paper-faithful): a finite set of candidate delivery locations
+I = {1, ..., I} is a hyperparameter.  Each dispatch period, per-location
+demands q_i ~ Poisson arise at a random subset I^n of these locations.
+
+Objective: minimize total expected delivery time (sum of customer arrival
+times), faithful to the paper.  No spatial partition.  No BHH approximation.
+
+Evaluation: scenario-based VRP simulation with realized delivery times.
+No linehaul cost (single depot, non-partition mode).
 """
 from __future__ import annotations
 
 import math
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -24,7 +33,33 @@ from lib.constants import TSP_TRAVEL_DISCOUNT
 
 
 # ---------------------------------------------------------------------------
-# Continuous-space demand sampler
+# Discrete demand sampling at candidate locations (paper-faithful)
+# ---------------------------------------------------------------------------
+
+def _sample_discrete_demand(
+    probs: np.ndarray,
+    positions_km: np.ndarray,
+    Lambda_T: float,
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Sample per-location Poisson demands at candidate locations.
+
+    Following the paper, I = {1,...,I} is the fixed set of candidate
+    locations.  Each period, q_i ~ Poisson(Lambda * T * p_i) orders
+    arise at location i.  Active locations I^n = {i : q_i > 0}.
+
+    Returns (active_positions_km, demands) where:
+      active_positions_km : (n_active, 2)
+      demands             : (n_active,) integer demand at each location
+    """
+    q = rng.poisson(Lambda_T * probs)
+    active = q > 0
+    return positions_km[active], q[active]
+
+
+# ---------------------------------------------------------------------------
+# Continuous-space demand sampler (kept for backward compatibility)
 # ---------------------------------------------------------------------------
 
 class DemandSampler:
@@ -76,13 +111,20 @@ class DemandSampler:
 
 
 # ---------------------------------------------------------------------------
-# VRP solver: MTZ formulation (small instances, n <= 15)
+# VRP solver: CVRP via Miller-Tucker-Zemlin formulation (small instances)
 # ---------------------------------------------------------------------------
 
 def _vrp_mtz(depot_km: np.ndarray, customer_km: np.ndarray,
-             K: int, time_limit: float = 10.0):
+             K: int, capacity: int = 20,
+             demands: Optional[np.ndarray] = None,
+             time_limit: float = 10.0):
     """
-    Exact VRP via Miller-Tucker-Zemlin formulation with Gurobi.
+    Exact CVRP via Miller-Tucker-Zemlin formulation with Gurobi.
+
+    Parameters
+    ----------
+    demands : optional (n,) array of per-customer demand.
+              If None, unit demand is assumed.
 
     Returns (routes, total_km, per_veh_km).
     """
@@ -96,12 +138,16 @@ def _vrp_mtz(depot_km: np.ndarray, customer_km: np.ndarray,
         d = float(np.linalg.norm(customer_km[0] - depot_km))
         return [[0]], 2.0 * d, [2.0 * d] + [0.0] * (K - 1)
 
+    if demands is None:
+        demands = np.ones(n, dtype=float)
+    Q = float(capacity)
+
     # 0 = depot, 1..n = customers
     all_pts = np.vstack([depot_km[None], customer_km])
     V = n + 1
     dist = np.linalg.norm(all_pts[:, None] - all_pts[None, :], axis=2)
 
-    model = gp.Model("VRP_MTZ")
+    model = gp.Model("CVRP_MTZ")
     model.setParam("OutputFlag", 0)
     model.setParam("TimeLimit", time_limit)
 
@@ -110,7 +156,9 @@ def _vrp_mtz(depot_km: np.ndarray, customer_km: np.ndarray,
         for j in range(V):
             if i != j:
                 x[i, j] = model.addVar(vtype=GRB.BINARY)
-    u = {i: model.addVar(lb=1.0, ub=float(n), vtype=GRB.CONTINUOUS)
+    # u[i] = cumulative demand on the route upon arrival at customer i
+    u = {i: model.addVar(lb=float(demands[i - 1]), ub=Q,
+                         vtype=GRB.CONTINUOUS)
          for i in range(1, V)}
 
     model.setObjective(
@@ -129,11 +177,12 @@ def _vrp_mtz(depot_km: np.ndarray, customer_km: np.ndarray,
         model.addConstr(
             gp.quicksum(x[j, i] for i in range(V) if i != j) == 1)
 
-    # MTZ subtour elimination
+    # CVRP subtour elimination + capacity
     for i in range(1, V):
         for j in range(1, V):
             if i != j:
-                model.addConstr(u[i] - u[j] + n * x[i, j] <= n - 1)
+                model.addConstr(
+                    u[i] - u[j] + Q * x[i, j] <= Q - demands[j - 1])
 
     model.optimize()
 
@@ -181,23 +230,29 @@ def _vrp_mtz(depot_km: np.ndarray, customer_km: np.ndarray,
 
 def _espprc_pricing(dist: np.ndarray, n: int,
                     pi: Dict[int, float], mu: float,
-                    capacity: int, max_labels: int = 200_000):
+                    capacity: int,
+                    demands: Optional[np.ndarray] = None,
+                    max_labels: int = 200_000):
     """
     Find a route with minimum reduced cost via label-setting.
 
     dist : (n+1)x(n+1), node 0 = depot, 1..n = customers.
     pi   : dual for customer coverage (0-indexed customer key).
     mu   : dual for fleet constraint.
+    demands : optional (n,) per-customer demand; default unit.
 
     Returns route dict or None.
     """
     import heapq
 
-    # Label: (reduced_cost, cost, node, visited_bits, count, prev_label_id)
-    # visited_bits: integer bitmask for n <= 30; frozenset otherwise
+    if demands is None:
+        demands_arr = np.ones(n, dtype=float)
+    else:
+        demands_arr = np.asarray(demands, dtype=float)
+    Q = float(capacity)
+
     use_bits = n <= 30
 
-    # label storage: id -> (rc, cost, node, visited, count, sequence)
     labels_store: list = []
 
     def _make_visited_empty():
@@ -210,17 +265,15 @@ def _espprc_pricing(dist: np.ndarray, n: int,
         return bool(v & (1 << j)) if use_bits else (j in v)
 
     def _is_subset(v1, v2):
-        # v1 ⊆ v2
         return (v1 & v2) == v1 if use_bits else v1 <= v2
 
-    # Best labels per node for dominance: node -> list of (rc, visited)
     node_labels: Dict[int, list] = {j: [] for j in range(n + 1)}
 
-    # Priority queue: (rc, label_id)
     heap: list = []
     initial_rc = -mu
     lid = 0
-    labels_store.append((initial_rc, 0.0, 0, _make_visited_empty(), 0, []))
+    # Label: (rc, cost, node, visited, demand_sum, seq)
+    labels_store.append((initial_rc, 0.0, 0, _make_visited_empty(), 0.0, []))
     heapq.heappush(heap, (initial_rc, lid))
 
     best_route = None
@@ -230,21 +283,21 @@ def _espprc_pricing(dist: np.ndarray, n: int,
         rc_cur, cur_lid = heapq.heappop(heap)
         if rc_cur >= best_rc:
             continue
-        rc, cost, node, visited, count, seq = labels_store[cur_lid]
+        rc, cost, node, visited, demand_sum, seq = labels_store[cur_lid]
         if rc != rc_cur:
             continue  # stale
-
-        if count >= capacity:
-            continue
 
         for j in range(1, n + 1):
             if _in_visited(visited, j):
                 continue
 
+            new_demand = demand_sum + demands_arr[j - 1]
+            if new_demand > Q:
+                continue  # capacity exceeded
+
             new_cost = cost + dist[node, j]
             new_rc = rc + dist[node, j] - pi.get(j - 1, 0.0)
             new_visited = _add_to_visited(visited, j)
-            new_count = count + 1
             new_seq = seq + [j - 1]
 
             # Dominance check at node j
@@ -256,7 +309,6 @@ def _espprc_pricing(dist: np.ndarray, n: int,
             if dominated:
                 continue
 
-            # Remove dominated labels at node j
             node_labels[j] = [
                 (lrc, lv) for (lrc, lv) in node_labels[j]
                 if not (new_rc <= lrc + 1e-9 and _is_subset(new_visited, lv))
@@ -274,10 +326,9 @@ def _espprc_pricing(dist: np.ndarray, n: int,
                     "reduced_cost": return_rc,
                 }
 
-            # Continue extending
             lid += 1
             labels_store.append(
-                (new_rc, new_cost, j, new_visited, new_count, new_seq))
+                (new_rc, new_cost, j, new_visited, new_demand, new_seq))
             heapq.heappush(heap, (new_rc, lid))
 
     return best_route
@@ -288,9 +339,11 @@ def _espprc_pricing(dist: np.ndarray, n: int,
 # ---------------------------------------------------------------------------
 
 def _solve_vrp_cg(depot_km: np.ndarray, customer_km: np.ndarray,
-                  K: int, capacity: int = 20, time_limit: float = 30.0):
+                  K: int, capacity: int = 20,
+                  demands: Optional[np.ndarray] = None,
+                  time_limit: float = 30.0):
     """
-    Solve VRP for K vehicles via set partitioning with column generation.
+    Solve CVRP for K vehicles via set partitioning with column generation.
 
     Returns (routes, total_km, per_veh_km).
     """
@@ -301,37 +354,42 @@ def _solve_vrp_cg(depot_km: np.ndarray, customer_km: np.ndarray,
     if n == 0:
         return [[] for _ in range(K)], 0.0, [0.0] * K
 
+    if demands is None:
+        demands_arr = np.ones(n, dtype=float)
+    else:
+        demands_arr = np.asarray(demands, dtype=float)
+    Q = float(capacity)
+
     all_pts = np.vstack([depot_km[None], customer_km])
     dist = np.linalg.norm(all_pts[:, None] - all_pts[None, :], axis=2)
 
-    # Initial columns: K disjoint routes covering all customers (angular partition)
+    # Initial columns: capacity-feasible groups in angular order
     columns: List[dict] = []
 
-    # Angular partition from depot: exactly K groups, each ≤ capacity
     angles = np.arctan2(customer_km[:, 1] - depot_km[1],
                         customer_km[:, 0] - depot_km[0])
     order = np.argsort(angles)
-    # Balanced partition: K groups of floor(n/K) or ceil(n/K) customers
-    base_size = n // K
-    extra = n % K  # first `extra` groups get one more customer
-    final_groups: List[List[int]] = []
-    start = 0
-    for k in range(K):
-        size = base_size + (1 if k < extra else 0)
-        if start >= n or size == 0:
-            break
-        end = min(start + size, n)
-        grp = [int(order[i]) for i in range(start, end)]
-        final_groups.append(grp)
-        start = end
 
-    for grp in final_groups:
-        # NN-TSP ordering within group
-        grp_pts = customer_km[grp]
+    # Greedy grouping respecting capacity
+    groups: List[List[int]] = []
+    grp: List[int] = []
+    grp_demand = 0.0
+    for i in range(n):
+        idx = int(order[i])
+        d = demands_arr[idx]
+        if grp_demand + d > Q and grp:
+            groups.append(grp)
+            grp = []
+            grp_demand = 0.0
+        grp.append(idx)
+        grp_demand += d
+    if grp:
+        groups.append(grp)
+
+    for grp in groups:
         if len(grp) <= 1:
             seq = list(grp)
         else:
-            visited = set()
             seq = []
             cur = depot_km.copy()
             remaining = list(grp)
@@ -342,7 +400,6 @@ def _solve_vrp_cg(depot_km: np.ndarray, customer_km: np.ndarray,
                 seq.append(remaining[best])
                 cur = customer_km[remaining[best]]
                 remaining.pop(best)
-        # Compute route cost
         c = float(dist[0, seq[0] + 1])
         for i in range(1, len(seq)):
             c += float(dist[seq[i - 1] + 1, seq[i] + 1])
@@ -353,7 +410,7 @@ def _solve_vrp_cg(depot_km: np.ndarray, customer_km: np.ndarray,
             "sequence": list(seq),
         })
 
-    # Also add single-customer routes for CG flexibility
+    # Single-customer routes for CG flexibility
     for j in range(n):
         columns.append({
             "customers": {j},
@@ -370,14 +427,12 @@ def _solve_vrp_cg(depot_km: np.ndarray, customer_km: np.ndarray,
 
         theta = model.addVars(R, lb=0.0, vtype=GRB.CONTINUOUS)
 
-        # Coverage: each customer exactly once
         cover = {}
         for j in range(n):
             col_idx = [r for r in range(R) if j in columns[r]["customers"]]
             cover[j] = model.addConstr(
                 gp.quicksum(theta[r] for r in col_idx) == 1)
 
-        # Fleet constraint: exactly K vehicles
         fleet_c = model.addConstr(gp.quicksum(theta[r] for r in range(R)) == K)
 
         model.setObjective(
@@ -391,12 +446,13 @@ def _solve_vrp_cg(depot_km: np.ndarray, customer_km: np.ndarray,
         pi = {j: cover[j].Pi for j in range(n)}
         mu_val = fleet_c.Pi
 
-        new_route = _espprc_pricing(dist, n, pi, mu_val, capacity)
+        new_route = _espprc_pricing(dist, n, pi, mu_val, capacity,
+                                    demands=demands_arr)
         if new_route is None:
             break
         columns.append(new_route)
 
-    # Integer phase: solve MIP with all generated columns
+    # Integer phase
     R = len(columns)
     model_int = gp.Model("SPM_MIP")
     model_int.setParam("OutputFlag", 0)
@@ -434,20 +490,60 @@ def _solve_vrp_cg(depot_km: np.ndarray, customer_km: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def _solve_vrp(depot_km: np.ndarray, customer_km: np.ndarray,
-               K: int, capacity: int = 20, time_limit: float = 15.0):
-    """Route K vehicles from depot to serve all customers."""
+               K: int, capacity: int = 20,
+               demands: Optional[np.ndarray] = None,
+               time_limit: float = 15.0):
+    """Route K vehicles from depot to serve all customers (CVRP)."""
     n = len(customer_km)
     if n == 0:
         return [], 0.0, []
     if K >= n:
-        # Each vehicle serves at most 1 customer
         routes = [[j] for j in range(n)]
         per_veh = [2.0 * float(np.linalg.norm(customer_km[j] - depot_km))
                    for j in range(n)]
         return routes, sum(per_veh), per_veh
     if n <= 15:
-        return _vrp_mtz(depot_km, customer_km, K, time_limit)
-    return _solve_vrp_cg(depot_km, customer_km, K, capacity, time_limit)
+        return _vrp_mtz(depot_km, customer_km, K, capacity,
+                        demands=demands, time_limit=time_limit)
+    return _solve_vrp_cg(depot_km, customer_km, K, capacity,
+                         demands=demands, time_limit=time_limit)
+
+
+# ---------------------------------------------------------------------------
+# Delivery-time computation from VRP routes (paper-faithful objective)
+# ---------------------------------------------------------------------------
+
+def _delivery_times_from_routes(
+    depot_km: np.ndarray,
+    customer_km: np.ndarray,
+    routes: List[List[int]],
+    speed: float,
+    demands: Optional[np.ndarray] = None,
+) -> Tuple[float, int]:
+    """
+    Compute total delivery time = sum of arrival times at each customer.
+
+    When demands is provided, each location j contributes demands[j]
+    orders, all sharing the same arrival time (one stop serves all
+    orders at that candidate location).
+
+    Returns (sum_of_weighted_arrival_times_h, total_orders_served).
+    """
+    total_arrival_h = 0.0
+    n_served = 0
+    for route in routes:
+        if not route:
+            continue
+        cum_dist = 0.0
+        prev = depot_km
+        for idx in route:
+            cum_dist += float(np.linalg.norm(customer_km[idx] - prev))
+            arrival_h = cum_dist / speed
+            d = int(demands[idx]) if demands is not None else 1
+            total_arrival_h += arrival_h * d
+            n_served += d
+            prev = customer_km[idx]
+    return total_arrival_h, n_served
 
 
 # ---------------------------------------------------------------------------
@@ -461,10 +557,19 @@ class TemporalOnly(BaselineMethod):
     Single depot, fixed dispatch interval T, ADP-optimized fleet dispatch,
     VRP-optimized routing.  No spatial partition, no BHH.
 
+    Demand model: a finite set of candidate locations I = {1,...,I} (the
+    block centroids) is a hyperparameter.  Each period, per-location
+    demands q_i ~ Poisson(Lambda * T * p_i) arise at a random subset.
+
     Three-layer architecture:
-      Layer 1 (ADP): APT cost-to-go for forward-looking dispatch
-      Layer 2 (Benders): Dispatch/routing separation — evaluate H^s(K) per K
-      Layer 3 (CG): VRP via set partitioning + ESPPRC pricing
+      Layer 1 (ADP): APT cost-to-go via LP allocation for forward-looking
+                     dispatch.
+      Layer 2 (Benders): Iterative refinement — concentrate MC samples on
+                     K values selected by the APT.
+      Layer 3 (CG): VRP via set partitioning + ESPPRC pricing.
+
+    Evaluation: custom VRP-based simulation with realized delivery times.
+    No linehaul cost, no ODD cost (single depot, non-partition mode).
     """
 
     def __init__(
@@ -474,19 +579,206 @@ class TemporalOnly(BaselineMethod):
         max_fleet: int = 200,
         horizon: int = 40,
         capacity: int = 20,
+        benders_iters: int = 2,
+        n_eval_scenarios: int = 500,
+        n_candidates: int = 0,
+        region_km: float = 10.0,
+        region_low: float = 0.0,
     ):
         self.T_fixed = T_fixed
         self.n_mc = n_mc
         self.max_fleet = max_fleet
         self.horizon = horizon
         self.capacity = capacity
+        self.benders_iters = benders_iters
+        self.n_eval_scenarios = n_eval_scenarios
+        self.n_candidates = n_candidates
+        self.region_km = region_km
+        self.region_low = region_low
 
         # Populated by design()
         self._cost_table: Dict[int, dict] = {}
         self._fleet_size: int = 1
         self._dispatch_K: int = 1
-        self._sampler: DemandSampler | None = None
-        self._depot_km: np.ndarray | None = None
+        self._candidate_pos_km: Optional[np.ndarray] = None
+        self._candidate_probs: Optional[np.ndarray] = None
+        self._depot_km: Optional[np.ndarray] = None
+
+    # ------------------------------------------------------------------
+    # H^s(K) estimation via Monte Carlo  (Layer 2 + 3)
+    # ------------------------------------------------------------------
+    def _compute_Hs_samples(
+        self,
+        K: int,
+        n_samples: int,
+        candidate_pos_km: np.ndarray,
+        candidate_probs: np.ndarray,
+        depot_km: np.ndarray,
+        Lambda_T: float,
+        rng: np.random.Generator,
+    ) -> Dict[str, list]:
+        """
+        Compute MC samples of H^s(K) using discrete candidate locations.
+
+        Each sample: draw per-location Poisson demands, solve CVRP for K
+        vehicles, compute sum of arrival times (delivery-time objective).
+        """
+        speed = VEHICLE_SPEED_KMH
+        T = self.T_fixed
+
+        arrival_sums: list = []
+        total_kms: list = []
+        max_tour_hs: list = []
+        n_served_list: list = []
+
+        for _ in range(n_samples):
+            active_pos, demands = _sample_discrete_demand(
+                candidate_probs, candidate_pos_km, Lambda_T, rng)
+            n_active = len(active_pos)
+            n_cust = int(demands.sum())
+
+            if n_active == 0:
+                arrival_sums.append(0.0)
+                total_kms.append(0.0)
+                max_tour_hs.append(0.0)
+                n_served_list.append(0)
+                continue
+
+            # Cap demand to feasible capacity
+            total_demand = int(demands.sum())
+            if total_demand > K * self.capacity:
+                # Truncate: keep locations with highest demand first
+                order = np.argsort(-demands)
+                cum = np.cumsum(demands[order])
+                keep = int(np.searchsorted(cum, K * self.capacity, side="right")) + 1
+                keep = min(keep, n_active)
+                sel = order[:keep]
+                active_pos = active_pos[sel]
+                demands = demands[sel]
+                n_active = len(active_pos)
+
+            K_eff = min(K, n_active)
+
+            routes, total_km, per_veh = _solve_vrp(
+                depot_km, active_pos, K_eff, self.capacity,
+                demands=demands)
+
+            sum_arrival, n_served = _delivery_times_from_routes(
+                depot_km, active_pos, routes, speed, demands=demands)
+
+            total_kms.append(total_km)
+            max_h = max((pv / speed for pv in per_veh), default=0.0)
+            max_tour_hs.append(max_h)
+            arrival_sums.append(sum_arrival)
+            n_served_list.append(n_served)
+
+        return {
+            "arrival_sums": arrival_sums,
+            "total_kms": total_kms,
+            "max_tour_hs": max_tour_hs,
+            "n_served": n_served_list,
+        }
+
+    @staticmethod
+    def _aggregate_Hs(samples: Dict[str, list], T: float) -> dict:
+        """Aggregate MC samples into cost_table entry."""
+        arrival_sums = samples["arrival_sums"]
+        total_kms = samples["total_kms"]
+        max_tour_hs = samples["max_tour_hs"]
+        n_served = samples["n_served"]
+
+        E_arrival = float(np.mean(arrival_sums))
+        E_n = float(np.mean(n_served))
+        E_total_km = float(np.mean(total_kms))
+        E_max_h = float(np.mean(max_tour_hs))
+        D_K = max(1, int(math.ceil(E_max_h / T))) if E_max_h > 0 else 1
+
+        # Paper objective: total delivery time = wait + in-vehicle
+        H_s = E_n * T / 2.0 + E_arrival
+
+        avg_inveh = E_arrival / max(E_n, 1e-12)
+
+        return {
+            "H_s": H_s,
+            "arrival_sum": E_arrival,
+            "avg_inveh_h": avg_inveh,
+            "total_km": E_total_km,
+            "max_tour_h": E_max_h,
+            "D": D_K,
+            "n_samples": len(arrival_sums),
+        }
+
+    # ------------------------------------------------------------------
+    # APT allocation via LP  (Layer 1)
+    # ------------------------------------------------------------------
+    def _solve_apt(
+        self,
+        M: int,
+        cost_table: Dict[int, dict],
+        K_max: int,
+        horizon: int,
+    ) -> Tuple[float, Dict[int, int]]:
+        """
+        Solve the APT allocation LP for a given fleet size M.
+
+        Variables: y[m, k] = 1 if K_m = k  (binary)
+        Constraints: driver-availability carryover.
+        Returns (avg_cost_per_period, dispatch_profile).
+        """
+        import gurobipy as gp
+        from gurobipy import GRB
+
+        H = horizon
+        all_k = sorted(k for k in cost_table if cost_table[k]["H_s"] < 1e5)
+        if 0 not in all_k:
+            all_k = [0] + all_k
+
+        model = gp.Model("APT")
+        model.setParam("OutputFlag", 0)
+        model.setParam("TimeLimit", 30.0)
+
+        y = {}
+        for m in range(H):
+            for k in all_k:
+                y[m, k] = model.addVar(vtype=GRB.BINARY)
+
+        for m in range(H):
+            model.addConstr(
+                gp.quicksum(y[m, k] for k in all_k) == 1)
+
+        for m in range(H):
+            busy = gp.LinExpr()
+            for k in all_k:
+                busy += k * y[m, k]
+            for m_prev in range(m):
+                delta = m - m_prev
+                for k in all_k:
+                    if k == 0:
+                        continue
+                    D_k = cost_table[k]["D"]
+                    if D_k > delta:
+                        busy += k * y[m_prev, k]
+            model.addConstr(busy <= M)
+
+        obj = gp.LinExpr()
+        for m in range(H):
+            for k in all_k:
+                obj += cost_table[k]["H_s"] * y[m, k]
+        model.setObjective(obj, GRB.MINIMIZE)
+        model.optimize()
+
+        if model.status not in (GRB.OPTIMAL, GRB.TIME_LIMIT) or model.SolCount == 0:
+            return float("inf"), {}
+
+        profile: Dict[int, int] = {}
+        for m in range(H):
+            for k in all_k:
+                if y[m, k].X > 0.5:
+                    profile[m] = k
+                    break
+
+        avg_cost = model.ObjVal / H
+        return avg_cost, profile
 
     # ------------------------------------------------------------------
     # design
@@ -503,224 +795,319 @@ class TemporalOnly(BaselineMethod):
         wv: float = 10.0,
         **kwargs,
     ) -> ServiceDesign:
-        block_ids = geodata.short_geoid_list
-        N = len(block_ids)
         T = self.T_fixed
         speed = VEHICLE_SPEED_KMH
-        discount = TSP_TRAVEL_DISCOUNT
-        demand_rate = Lambda * T
-
-        # Depot: geographic centroid block
-        positions = np.array([_get_pos(geodata, b) for b in block_ids])
-        centroid = positions.mean(axis=0)
-        depot_idx = int(np.argmin(np.linalg.norm(positions - centroid, axis=1)))
-        depot_id = block_ids[depot_idx]
-        depot_km = positions[depot_idx] / 1000.0
-        self._depot_km = depot_km
-
-        # Demand sampler
-        sampler = DemandSampler(geodata, prob_dict)
-        self._sampler = sampler
+        Lambda_T = Lambda * T
 
         rng = np.random.default_rng(42)
 
-        # Upper bound on vehicles per dispatch:
-        # need at least ceil(demand / capacity) vehicles; search a range above that
-        K_min_needed = max(1, int(math.ceil(demand_rate / max(self.capacity, 1))))
-        K_max = max(K_min_needed, min(self.max_fleet, K_min_needed + 10))
+        if self.n_candidates > 0:
+            # Paper-faithful: random uniform candidate locations in a square
+            N = self.n_candidates
+            candidate_pos_km = rng.uniform(self.region_low, self.region_km, size=(N, 2))
+            candidate_probs = np.ones(N) / N  # uniform probability
+        else:
+            # Fall back to geodata block positions
+            block_ids = geodata.short_geoid_list
+            N = len(block_ids)
+            positions_m = np.array([_get_pos(geodata, b) for b in block_ids])
+            candidate_pos_km = positions_m / 1000.0
+            candidate_probs = np.array([prob_dict.get(b, 0.0) for b in block_ids])
+            total_p = candidate_probs.sum()
+            if total_p > 1e-15:
+                candidate_probs = candidate_probs / total_p
 
-        # ---- Pre-compute E[H^s(K)] for K = K_min..K_max  (Layer 2 + 3) ----
-        # Only evaluate K that can feasibly serve demand given capacity
-        K_min_feasible = K_min_needed  # = ceil(demand / capacity)
-        print(f"    Pre-computing VRP costs for K={K_min_feasible}..{K_max} "
-              f"({self.n_mc} MC samples, demand_rate={demand_rate:.1f}) …",
-              flush=True)
+        self._candidate_pos_km = candidate_pos_km
+        self._candidate_probs = candidate_probs
+
+        # Depot: centroid of candidate locations
+        centroid_km = candidate_pos_km.mean(axis=0)
+        depot_idx = int(np.argmin(np.linalg.norm(candidate_pos_km - centroid_km, axis=1)))
+        depot_km = candidate_pos_km[depot_idx]
+        self._depot_km = depot_km
+
+        # Expected total demand per period
+        demand_rate = Lambda_T  # = Lambda * T (since probs sum to 1)
+
+        # Dispatch-K range
+        K_min_feasible = max(1, int(math.ceil(demand_rate / max(self.capacity, 1))))
+        K_max = max(K_min_feasible, min(self.max_fleet, K_min_feasible + 10))
+
+        # ---- Layer 2+3: Pre-compute E[H^s(K)] via MC + CVRP ----
+        print(f"    Pre-computing H^s(K) for K={K_min_feasible}..{K_max} "
+              f"({self.n_mc} MC samples, demand_rate={demand_rate:.1f}, "
+              f"{N} candidate locations) ...", flush=True)
 
         cost_table: Dict[int, dict] = {}
-        for K in range(K_min_feasible, K_max + 1):
-            total_veh_kms: list = []
-            max_tour_hs: list = []
-            avg_inveh_hs: list = []
-
-            for _ in range(self.n_mc):
-                n_cust = rng.poisson(demand_rate)
-                if n_cust == 0:
-                    total_veh_kms.append(0.0)
-                    max_tour_hs.append(0.0)
-                    avg_inveh_hs.append(0.0)
-                    continue
-
-                # Cap at capacity for Poisson tail; keeps VRP feasible
-                n_serve = min(n_cust, K * self.capacity)
-                customers = sampler.sample(n_serve, rng)
-                K_eff = min(K, n_serve)
-
-                routes, total_km, per_veh = _solve_vrp(
-                    depot_km, customers, K_eff, self.capacity)
-
-                total_veh_kms.append(total_km)
-                max_h = max((pv / speed for pv in per_veh), default=0.0)
-                max_tour_hs.append(max_h)
-
-                # Per-customer in-vehicle time ≈ tour_k / (2 * speed)
-                tot_inv = 0.0
-                for ri, route in enumerate(routes):
-                    if route and ri < len(per_veh):
-                        tot_inv += per_veh[ri] / (2.0 * speed) * len(route)
-                avg_inveh_hs.append(tot_inv / max(n_serve, 1))
-
-            E_total_km = float(np.mean(total_veh_kms))
-            E_max_h = float(np.mean(max_tour_hs))
-            E_inv = float(np.mean(avg_inveh_hs))
-            D_K = max(1, int(math.ceil(E_max_h / T)))
-
-            # Steady-state cost matching evaluate_design convention:
-            #   provider = total_veh_km / (discount * T)   [km/hour rate]
-            #   user     = wr * (T/2 + avg_inveh)          [per-rider time cost]
-            # total_cost = provider + user  (same units as baseline comparison)
-            provider_rate = E_total_km / (discount * T)
-            user_per_rider = wr * (T / 2.0 + E_inv)
-            H_s = provider_rate + user_per_rider
-
-            cost_table[K] = {
-                "H_s": H_s,
-                "total_km": E_total_km,
-                "max_tour_h": E_max_h,
-                "avg_inveh_h": E_inv,
-                "D": D_K,
-            }
-
-        # K < K_min_feasible: infeasible due to capacity — large penalty
         for K in range(0, K_min_feasible):
             cost_table[K] = {
-                "H_s": 1e6,
-                "total_km": 0.0, "max_tour_h": 0.0, "avg_inveh_h": 0.0, "D": 0,
+                "H_s": 1e6, "arrival_sum": 0.0, "avg_inveh_h": 0.0,
+                "total_km": 0.0, "max_tour_h": 0.0, "D": 0, "n_samples": 0,
             }
+        all_samples: Dict[int, Dict[str, list]] = {}
+        for K in range(K_min_feasible, K_max + 1):
+            samples = self._compute_Hs_samples(
+                K, self.n_mc, candidate_pos_km, candidate_probs,
+                depot_km, Lambda_T, rng)
+            all_samples[K] = samples
+            cost_table[K] = self._aggregate_Hs(samples, T)
+
         self._cost_table = cost_table
 
-        # ---- ADP: optimise fleet M  (Layer 1) ----
-        # Fleet upper bound: K_min * max_D (enough to dispatch every period)
-        max_D = max((v["D"] for k, v in cost_table.items() if k >= K_min_feasible),
-                    default=1)
-        fleet_upper = min(self.max_fleet, K_max * max_D + K_max)
-        print(f"    Running ADP for fleet optimisation (M=1..{fleet_upper}) …",
-              flush=True)
+        # ---- Layer 1: APT fleet optimisation ----
+        candidate_fleets = set()
+        for K in range(K_min_feasible, K_max + 1):
+            M_needed = K * cost_table[K]["D"]
+            candidate_fleets.add(M_needed)
+            candidate_fleets.add(M_needed + K)
+        candidate_fleets = sorted(
+            m for m in candidate_fleets if 1 <= m <= self.max_fleet)
+        if not candidate_fleets:
+            candidate_fleets = [K_min_feasible]
 
-        best_M = 1
+        print(f"    Running APT LP for fleet optimisation "
+              f"({len(candidate_fleets)} candidates) ...", flush=True)
+
+        best_M = candidate_fleets[0]
         best_cost = float("inf")
-        for M in range(1, fleet_upper + 1):
-            avg = self._simulate_apt_policy(M, cost_table, K_max)
-            if avg < best_cost:
-                best_cost = avg
+        best_profile: Dict[int, int] = {}
+        for M in candidate_fleets:
+            avg_cost, profile = self._solve_apt(
+                M, cost_table, K_max, self.horizon)
+            if avg_cost < best_cost:
+                best_cost = avg_cost
                 best_M = M
+                best_profile = profile
 
+        # ---- Layer 2 (Benders): Refine H^s for selected K values ----
+        for benders_iter in range(self.benders_iters):
+            K_used = set(best_profile.values())
+            K_refine = set()
+            for K in K_used:
+                if K > 0:
+                    for dk in range(-1, 2):
+                        Kc = K + dk
+                        if K_min_feasible <= Kc <= K_max:
+                            K_refine.add(Kc)
+
+            if not K_refine:
+                break
+
+            changed = False
+            for K in K_refine:
+                new_samples = self._compute_Hs_samples(
+                    K, self.n_mc, candidate_pos_km, candidate_probs,
+                    depot_km, Lambda_T, rng)
+                old = all_samples.get(K, {
+                    "arrival_sums": [], "total_kms": [],
+                    "max_tour_hs": [], "n_served": [],
+                })
+                merged = {
+                    key: old.get(key, []) + new_samples[key]
+                    for key in new_samples
+                }
+                all_samples[K] = merged
+                new_entry = self._aggregate_Hs(merged, T)
+                old_Hs = cost_table[K]["H_s"]
+                cost_table[K] = new_entry
+                if abs(new_entry["H_s"] - old_Hs) > 0.01 * abs(old_Hs + 1e-12):
+                    changed = True
+
+            if not changed:
+                break
+
+            for M in candidate_fleets:
+                avg_cost, profile = self._solve_apt(
+                    M, cost_table, K_max, self.horizon)
+                if avg_cost < best_cost:
+                    best_cost = avg_cost
+                    best_M = M
+                    best_profile = profile
+
+        self._cost_table = cost_table
         self._fleet_size = best_M
 
-        # Steady-state dispatch K: best feasible K given fleet M
-        best_K = K_min_feasible
-        best_H = float("inf")
-        for K in range(K_min_feasible, K_max + 1):
-            info = cost_table[K]
-            if K * info["D"] <= best_M and info["H_s"] < best_H:
-                best_H = info["H_s"]
-                best_K = K
-        self._dispatch_K = best_K
+        # Steady-state dispatch K: most common K in APT profile
+        if best_profile:
+            from collections import Counter
+            K_counts = Counter(
+                k for k in best_profile.values() if k > 0)
+            self._dispatch_K = (K_counts.most_common(1)[0][0]
+                                if K_counts else K_min_feasible)
+        else:
+            self._dispatch_K = K_min_feasible
 
-        print(f"    ADP → fleet={best_M}, dispatch_K={best_K}, "
-              f"cost/period={best_cost:.4f}")
-
-        # ServiceDesign: single district
-        assignment = np.zeros((N, N))
-        assignment[:, 0] = 1.0
-        root = block_ids[0]
+        print(f"    APT -> fleet={best_M}, dispatch_K={self._dispatch_K}, "
+              f"H^s/period={best_cost:.4f}")
 
         return ServiceDesign(
             name="TP-Lit",
-            assignment=assignment,
-            depot_id=depot_id,
-            district_roots=[root],
-            dispatch_intervals={root: T},
+            assignment=None,
+            depot_id=f"candidate_{depot_idx}",
+            district_roots=[],
+            dispatch_intervals={},
+            service_mode="temporal",
+            service_metadata={
+                "fleet_size": best_M,
+                "dispatch_K": self._dispatch_K,
+                "T_fixed": T,
+                "capacity": self.capacity,
+                "demand_rate": demand_rate,
+                "n_candidate_locations": N,
+                "n_eval_scenarios": self.n_eval_scenarios,
+            },
         )
 
     # ------------------------------------------------------------------
-    # APT simulation
+    # Evaluation: custom VRP-based simulation (no BHH, no linehaul)
     # ------------------------------------------------------------------
-    def _simulate_apt_policy(self, M: int, cost_table: dict, K_max: int) -> float:
-        """Forward-simulate APT dispatch policy; return avg cost per period."""
-        horizon = self.horizon
-        T = self.T_fixed
-        return_queue: List[Tuple[int, int]] = []  # (return_period, count)
-        z = M
-        total_cost = 0.0
+    def custom_simulate(
+        self,
+        design: ServiceDesign,
+        geodata,
+        prob_dict: Dict[str, float],
+        Omega_dict,
+        J_function: Callable,
+        Lambda: float,
+        wr: float,
+        wv: float,
+    ) -> EvaluationResult:
+        """
+        Scenario-based VRP evaluation with realized delivery times.
 
-        for period in range(horizon):
-            # Process returns
-            new_q: list = []
-            for rp, cnt in return_queue:
-                if rp <= period:
-                    z = min(z + cnt, M)
-                else:
-                    new_q.append((rp, cnt))
-            return_queue = new_q
+        Each scenario is an independent dispatch period:
+          1. Sample per-location Poisson demands at candidate locations.
+          2. Solve CVRP with K vehicles.
+          3. Compute per-customer delivery time from route structure.
 
-            # Dispatch decision: minimise immediate + lookahead
-            best_K = 0
-            best_val = float("inf")
-            for K in range(0, min(z, K_max) + 1):
-                if K not in cost_table:
-                    continue
-                immediate = cost_table[K]["H_s"]
-                future = self._apt_lookahead(
-                    z - K, return_queue, K, period, cost_table, K_max, M)
-                val = immediate + future
-                if val < best_val:
-                    best_val = val
-                    best_K = K
+        No linehaul, no ODD, no walk (single depot, non-partition mode).
+        """
+        meta = design.service_metadata
+        T = float(meta.get("T_fixed", self.T_fixed))
+        K = int(meta.get("dispatch_K", self._dispatch_K))
+        capacity = int(meta.get("capacity", self.capacity))
+        n_scenarios = int(meta.get("n_eval_scenarios", self.n_eval_scenarios))
+        Lambda_T = Lambda * T
 
-            total_cost += cost_table[best_K]["H_s"]
+        # Rebuild candidate arrays if needed (e.g. fresh instance)
+        candidate_pos_km = self._candidate_pos_km
+        candidate_probs = self._candidate_probs
+        depot_km = self._depot_km
+        if candidate_pos_km is None:
+            block_ids = geodata.short_geoid_list
+            positions_m = np.array([_get_pos(geodata, b) for b in block_ids])
+            candidate_pos_km = positions_m / 1000.0
+            candidate_probs = np.array([prob_dict.get(b, 0.0)
+                                        for b in block_ids])
+            total_p = candidate_probs.sum()
+            if total_p > 1e-15:
+                candidate_probs = candidate_probs / total_p
+            self._candidate_pos_km = candidate_pos_km
+            self._candidate_probs = candidate_probs
+        if depot_km is None:
+            block_ids = geodata.short_geoid_list
+            positions_m = np.array([_get_pos(geodata, b) for b in block_ids])
+            centroid = positions_m.mean(axis=0)
+            depot_idx = int(np.argmin(
+                np.linalg.norm(positions_m - centroid, axis=1)))
+            depot_km = positions_m[depot_idx] / 1000.0
+            self._depot_km = depot_km
 
-            D_K = cost_table[best_K]["D"]
-            if best_K > 0 and D_K > 0:
-                return_queue.append((period + D_K, best_K))
-            z -= best_K
+        speed = VEHICLE_SPEED_KMH
+        discount = TSP_TRAVEL_DISCOUNT
 
-        return total_cost / max(horizon, 1)
+        rng = np.random.default_rng(123)
 
-    def _apt_lookahead(self, z_after: int, return_queue, K_disp: int,
-                       period: int, cost_table: dict, K_max: int,
-                       M: int, lookahead: int = 10) -> float:
-        """APT cost-to-go: greedy forward capacity allocation."""
-        future_returns: Dict[int, int] = {}
-        for rp, cnt in return_queue:
-            if rp > period:
-                future_returns[rp] = future_returns.get(rp, 0) + cnt
-        D_K = cost_table[K_disp]["D"] if K_disp > 0 else 0
-        if K_disp > 0 and D_K > 0:
-            rp = period + D_K
-            future_returns[rp] = future_returns.get(rp, 0) + K_disp
+        sum_wait_h = 0.0
+        sum_invehicle_h = 0.0
+        sum_travel_km = 0.0
+        sum_customers = 0
 
-        z = z_after
-        total = 0.0
-        for m in range(period + 1, period + 1 + lookahead):
-            z = min(z + future_returns.get(m, 0), M)
-            best_K = 0
-            best_H = cost_table[0]["H_s"]
-            for k in range(1, min(z, K_max) + 1):
-                if k in cost_table and cost_table[k]["H_s"] < best_H:
-                    best_H = cost_table[k]["H_s"]
-                    best_K = k
-            total += best_H
-            z -= best_K
-            if best_K > 0:
-                D = cost_table[best_K]["D"]
-                if D > 0:
-                    rp2 = m + D
-                    future_returns[rp2] = future_returns.get(rp2, 0) + best_K
-        return total
+        for _ in range(n_scenarios):
+            active_pos, demands = _sample_discrete_demand(
+                candidate_probs, candidate_pos_km, Lambda_T, rng)
+            n_active = len(active_pos)
+            if n_active == 0:
+                continue
 
-    # ------------------------------------------------------------------
-    # Evaluation: delegates to simulate_design for consistency
-    # ------------------------------------------------------------------
+            total_demand = int(demands.sum())
+            # Cap to feasible capacity
+            if total_demand > K * capacity:
+                order = np.argsort(-demands)
+                cum = np.cumsum(demands[order])
+                keep = int(np.searchsorted(cum, K * capacity, side="right")) + 1
+                keep = min(keep, n_active)
+                sel = order[:keep]
+                active_pos = active_pos[sel]
+                demands = demands[sel]
+                n_active = len(active_pos)
+                total_demand = int(demands.sum())
+
+            K_eff = min(K, n_active)
+
+            routes, total_km, per_veh = _solve_vrp(
+                depot_km, active_pos, K_eff, capacity, demands=demands)
+
+            sum_arrival, n_served = _delivery_times_from_routes(
+                depot_km, active_pos, routes, speed, demands=demands)
+
+            sum_wait_h += total_demand * T / 2.0
+            sum_invehicle_h += sum_arrival
+            sum_travel_km += total_km
+            sum_customers += total_demand
+
+        if sum_customers == 0:
+            return EvaluationResult(
+                name=design.name,
+                avg_wait_time=T / 2.0,
+                avg_invehicle_time=0.0,
+                avg_walk_time=0.0,
+                total_user_time=T / 2.0,
+                linehaul_cost=0.0,
+                in_district_cost=0.0,
+                total_travel_cost=0.0,
+                fleet_size=float(meta.get("fleet_size", self._fleet_size)),
+                avg_dispatch_interval=T,
+                odd_cost=0.0,
+                provider_cost=0.0,
+                user_cost=wr * T / 2.0,
+                total_cost=wr * T / 2.0,
+            )
+
+        avg_wait = sum_wait_h / sum_customers
+        avg_invehicle = sum_invehicle_h / sum_customers
+        avg_walk = 0.0
+        total_user_time = avg_wait + avg_invehicle + avg_walk
+
+        avg_travel_km = sum_travel_km / n_scenarios
+        in_district_cost = avg_travel_km / (discount * T)
+        linehaul_cost = 0.0
+        odd_cost = 0.0
+        total_travel_cost = in_district_cost
+        fleet_size = float(meta.get("fleet_size", self._fleet_size))
+        avg_dispatch_interval = T
+
+        provider_cost = total_travel_cost
+        user_cost = wr * total_user_time
+        total_cost = provider_cost + user_cost
+
+        return EvaluationResult(
+            name=design.name,
+            avg_wait_time=avg_wait,
+            avg_invehicle_time=avg_invehicle,
+            avg_walk_time=avg_walk,
+            total_user_time=total_user_time,
+            linehaul_cost=linehaul_cost,
+            in_district_cost=in_district_cost,
+            total_travel_cost=total_travel_cost,
+            fleet_size=fleet_size,
+            avg_dispatch_interval=avg_dispatch_interval,
+            odd_cost=odd_cost,
+            provider_cost=provider_cost,
+            user_cost=user_cost,
+            total_cost=total_cost,
+        )
+
     def evaluate(
         self,
         design: ServiceDesign,
@@ -734,8 +1121,7 @@ class TemporalOnly(BaselineMethod):
         beta: float = BETA,
         road_network=None,
     ) -> EvaluationResult:
-        from lib.baselines.base import simulate_design
-        return simulate_design(
+        return self.custom_simulate(
             design, geodata, prob_dict, Omega_dict, J_function,
             Lambda, wr, wv,
         )

@@ -257,6 +257,10 @@ def parse_args():
                    help='Fixed headway for FR and SP-Lit (hours)')
     p.add_argument('--delta', type=float, default=1.0,
                    help='Max detour deviation for FR-Detour (km)')
+    p.add_argument('--tp_candidates', type=int, default=25,
+                   help='Number of random candidate locations for TP-Lit (0 = use geodata blocks)')
+    p.add_argument('--tp_region_km', type=float, default=10.0,
+                   help='Side length of square region for TP-Lit candidate locations (km)')
     return p.parse_args()
 
 
@@ -284,7 +288,8 @@ def main():
         ("Multi-FR (Jacquillat)",        FRDetour(delta=0.0, max_iters=args.rs_iters, name="Multi-FR (Jacquillat)")),
         ("Multi-FR-Detour (Jacquillat)", FRDetour(delta=args.delta, max_iters=args.rs_iters)),
         ("SP-Lit (Carlsson)",            CarlssonPartition(T_fixed=args.T_fixed)),
-        ("TP-Lit (Liu)",                 TemporalOnly()),
+        ("TP-Lit (Liu)",                 TemporalOnly(n_candidates=args.tp_candidates,
+                                                      region_km=args.tp_region_km)),
         ("Joint-Nom",                    JointNom(max_iters=args.rs_iters)),
         ("Joint-DRO",                    JointDRO(epsilon=args.epsilon, max_iters=args.rs_iters)),
         ("VCC",                          VCC()),
