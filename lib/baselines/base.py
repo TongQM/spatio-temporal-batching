@@ -56,7 +56,7 @@ class EvaluationResult:
     linehaul_cost      : Σ K_i / T_i  (amortised, per-district weighted)
     in_district_cost   : Σ (in-district tour) / discount / T_i  (weighted)
     total_travel_cost  : linehaul_cost + in_district_cost
-    fleet_size         : total vehicles needed  Σ_i ceil(tour_i / (speed * T_i))
+    fleet_size         : amortized fleet requirement / average active vehicles
     avg_dispatch_interval : demand-weighted mean T* across districts (hours)
 
     Aggregates

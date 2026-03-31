@@ -1066,7 +1066,7 @@ class TemporalOnly(BaselineMethod):
                 linehaul_cost=0.0,
                 in_district_cost=0.0,
                 total_travel_cost=0.0,
-                fleet_size=float(meta.get("fleet_size", self._fleet_size)),
+                fleet_size=0.0,
                 avg_dispatch_interval=T,
                 odd_cost=0.0,
                 provider_cost=0.0,
@@ -1084,7 +1084,7 @@ class TemporalOnly(BaselineMethod):
         linehaul_cost = 0.0
         odd_cost = 0.0
         total_travel_cost = in_district_cost
-        fleet_size = float(meta.get("fleet_size", self._fleet_size))
+        fleet_size = avg_travel_km / (VEHICLE_SPEED_KMH * T)
         avg_dispatch_interval = T
 
         provider_cost = total_travel_cost

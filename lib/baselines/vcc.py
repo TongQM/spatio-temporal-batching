@@ -1,13 +1,13 @@
 """
-Paper-aligned offline DAR-VCC baseline.
+Depot-origin offline VCC baseline for last-mile service.
 
-This baseline replaces the old partition-based approximation with a
-non-partition, offline vehicle-customer coordination service:
-  - full OD requests sampled from the block probability vector
-  - explicit fleet size and vehicle capacity
-  - coordinated pickup and dropoff meeting points
-  - deadline-style service feasibility
-  - scenario-by-scenario service simulation
+This baseline models a non-partition, offline vehicle-customer coordination
+service where:
+  - all passengers originate at the depot
+  - only destinations are sampled from the spatial demand distribution
+  - vehicles coordinate destination-side dropoff meeting points
+  - explicit fleet size and vehicle capacity are enforced
+  - deadline-style service feasibility is checked scenario by scenario
 
 It remains adapted to this repository's comparison framework:
   - results are reported through EvaluationResult
@@ -36,9 +36,7 @@ from lib.baselines.base import (
 @dataclass(frozen=True)
 class _Request:
     req_id: int
-    origin_block: str
     dest_block: str
-    origin_pos: np.ndarray
     dest_pos: np.ndarray
     release_h: float
     deadline_h: float
@@ -49,7 +47,6 @@ class _Request:
 @dataclass(frozen=True)
 class _Event:
     req_id: int
-    kind: str  # "pickup" or "dropoff"
 
 
 @dataclass
@@ -59,8 +56,7 @@ class _RouteEval:
     finish_time_h: float
     events: List[_Event]
     positions: List[np.ndarray]
-    pickup_wait_h: Dict[int, float]
-    pickup_walk_h: Dict[int, float]
+    depot_wait_h: Dict[int, float]
     drop_walk_h: Dict[int, float]
     invehicle_h: Dict[int, float]
 
@@ -100,11 +96,7 @@ def _optimize_stop_on_segment(
 
 
 def _route_anchors(events: Sequence[_Event], request_map: Dict[int, _Request]) -> List[np.ndarray]:
-    anchors: List[np.ndarray] = []
-    for event in events:
-        req = request_map[event.req_id]
-        anchors.append(req.origin_pos if event.kind == "pickup" else req.dest_pos)
-    return anchors
+    return [request_map[event.req_id].dest_pos for event in events]
 
 
 def _optimize_route_positions(
@@ -123,7 +115,7 @@ def _optimize_route_positions(
         changed = False
         for i, event in enumerate(events):
             req = request_map[event.req_id]
-            anchor = req.origin_pos if event.kind == "pickup" else req.dest_pos
+            anchor = req.dest_pos
             if len(events) == 1:
                 new_pos = _project_to_ball(start_pos, anchor, max_walk_km)
             elif i == len(events) - 1:
@@ -153,11 +145,10 @@ def _evaluate_route(
     planning_horizon_h: Optional[float] = None,
 ) -> Optional[_RouteEval]:
     """
-    Evaluate a vehicle route with coordinated pickup/dropoff meeting points.
+    Evaluate a depot-origin route with coordinated dropoff meeting points.
 
     Feasibility rules:
-      - pickup before dropoff for each request
-      - onboard load never exceeds vehicle_capacity
+      - the route serves at most vehicle_capacity requests
       - dropoff arrival + final walk must meet the request deadline
       - vehicle must be able to return to depot before the planning horizon
     """
@@ -168,23 +159,22 @@ def _evaluate_route(
             finish_time_h=0.0,
             events=[],
             positions=[],
-            pickup_wait_h={},
-            pickup_walk_h={},
+            depot_wait_h={},
             drop_walk_h={},
             invehicle_h={},
         )
 
+    if len(events) > vehicle_capacity:
+        return None
+
     positions = _optimize_route_positions(events, request_map, start_pos, max_walk_km)
 
-    load = 0
+    departure_h = max(request_map[event.req_id].release_h for event in events)
     current_pos = start_pos.copy()
-    current_time = 0.0
+    current_time = departure_h
     total_distance = 0.0
 
-    pickup_ready: Dict[int, float] = {}
-    pickup_service: Dict[int, float] = {}
-    pickup_wait: Dict[int, float] = {}
-    pickup_walk: Dict[int, float] = {}
+    depot_wait: Dict[int, float] = {}
     drop_walk: Dict[int, float] = {}
     invehicle: Dict[int, float] = {}
 
@@ -194,30 +184,14 @@ def _evaluate_route(
         arrival_h = current_time + travel_km / vehicle_speed_kmh
         total_distance += travel_km
 
-        if event.kind == "pickup":
-            walk_km = float(np.linalg.norm(stop_pos - req.origin_pos))
-            ready_h = req.release_h + walk_km / walk_speed_kmh
-            service_h = max(arrival_h, ready_h)
-            load += 1
-            if load > vehicle_capacity:
-                return None
-            pickup_ready[event.req_id] = ready_h
-            pickup_service[event.req_id] = service_h
-            pickup_wait[event.req_id] = max(0.0, service_h - ready_h)
-            pickup_walk[event.req_id] = walk_km / walk_speed_kmh
-        else:
-            if event.req_id not in pickup_service:
-                return None
-            walk_km = float(np.linalg.norm(stop_pos - req.dest_pos))
-            service_h = arrival_h
-            arrival_at_dest_h = service_h + walk_km / walk_speed_kmh
-            if arrival_at_dest_h > req.deadline_h + 1e-9:
-                return None
-            invehicle[event.req_id] = max(0.0, service_h - pickup_service[event.req_id])
-            drop_walk[event.req_id] = walk_km / walk_speed_kmh
-            load -= 1
-            if load < 0:
-                return None
+        walk_km = float(np.linalg.norm(stop_pos - req.dest_pos))
+        service_h = arrival_h
+        arrival_at_dest_h = service_h + walk_km / walk_speed_kmh
+        if arrival_at_dest_h > req.deadline_h + 1e-9:
+            return None
+        depot_wait[event.req_id] = max(0.0, departure_h - req.release_h)
+        invehicle[event.req_id] = max(0.0, service_h - departure_h)
+        drop_walk[event.req_id] = walk_km / walk_speed_kmh
 
         current_time = service_h
         current_pos = stop_pos
@@ -230,8 +204,7 @@ def _evaluate_route(
     current_time += return_time_h
 
     user_time = (
-        sum(pickup_wait.values())
-        + sum(pickup_walk.values())
+        sum(depot_wait.values())
         + sum(drop_walk.values())
         + sum(invehicle.values())
     )
@@ -242,36 +215,29 @@ def _evaluate_route(
         finish_time_h=current_time,
         events=list(events),
         positions=positions,
-        pickup_wait_h=pickup_wait,
-        pickup_walk_h=pickup_walk,
+        depot_wait_h=depot_wait,
         drop_walk_h=drop_walk,
         invehicle_h=invehicle,
     )
 
 
 def _insert_request_events(events: Sequence[_Event], req_id: int) -> List[List[_Event]]:
-    """All pickup/dropoff insertion positions for one request."""
+    """All insertion positions for one depot-origin destination request."""
     base = list(events)
     out: List[List[_Event]] = []
     m = len(base)
     for pick_idx in range(m + 1):
-        for drop_idx in range(pick_idx + 1, m + 2):
-            cand = base[:pick_idx] + [_Event(req_id, "pickup")]
-            cand += base[pick_idx:drop_idx - 1]
-            cand += [_Event(req_id, "dropoff")]
-            cand += base[drop_idx - 1:]
-            out.append(cand)
+        out.append(base[:pick_idx] + [_Event(req_id)] + base[pick_idx:])
     return out
 
 
 def _fallback_request_metrics(req: _Request, start_pos: np.ndarray) -> Dict[str, float]:
     """Direct-service fallback if no coordinated feasible insertion exists."""
-    deadhead_out = float(np.linalg.norm(req.origin_pos - start_pos))
-    deadhead_back = float(np.linalg.norm(req.dest_pos - start_pos))
+    deadhead_out = float(np.linalg.norm(req.dest_pos - start_pos))
+    deadhead_back = deadhead_out
     return {
-        "travel_km": deadhead_out + req.direct_km + deadhead_back,
+        "travel_km": deadhead_out + deadhead_back,
         "wait_h": 0.0,
-        "pickup_walk_h": 0.0,
         "drop_walk_h": 0.0,
         "invehicle_h": req.direct_time_h,
     }
@@ -414,9 +380,10 @@ def _sample_requests(
     Lambda: float,
     planning_horizon_h: float,
     deadline_slack_h: float,
+    depot_id: str,
     rng: np.random.Generator,
 ) -> List[_Request]:
-    """Sample one offline batch of OD requests."""
+    """Sample one offline batch of depot-origin last-mile requests."""
     block_ids = geodata.short_geoid_list
     probs = np.array([prob_dict.get(b, 0.0) for b in block_ids], dtype=float)
     probs = probs / max(float(probs.sum()), 1e-12)
@@ -426,25 +393,19 @@ def _sample_requests(
 
     veh_speed = VEHICLE_SPEED_KMH
     requests: List[_Request] = []
+    depot_pos = np.array(_get_pos(geodata, depot_id), dtype=float) / 1000.0
     for req_id in range(n_requests):
-        origin_idx = int(rng.choice(len(block_ids), p=probs))
         dest_idx = int(rng.choice(len(block_ids), p=probs))
-        while dest_idx == origin_idx:
-            dest_idx = int(rng.choice(len(block_ids), p=probs))
-        origin_block = block_ids[origin_idx]
         dest_block = block_ids[dest_idx]
-        origin_pos = np.array(_get_pos(geodata, origin_block), dtype=float) / 1000.0
         dest_pos = np.array(_get_pos(geodata, dest_block), dtype=float) / 1000.0
-        direct_km = float(np.linalg.norm(dest_pos - origin_pos))
+        direct_km = float(np.linalg.norm(dest_pos - depot_pos))
         direct_time_h = direct_km / veh_speed
         release_h = float(rng.uniform(0.0, planning_horizon_h))
         deadline_h = release_h + direct_time_h + deadline_slack_h
         requests.append(
             _Request(
                 req_id=req_id,
-                origin_block=origin_block,
                 dest_block=dest_block,
-                origin_pos=origin_pos,
                 dest_pos=dest_pos,
                 release_h=release_h,
                 deadline_h=deadline_h,
@@ -459,7 +420,6 @@ def _scenario_metrics(
     route_evals: Sequence[_RouteEval],
     rejected: Sequence[_Request],
     requests: Sequence[_Request],
-    planning_horizon_h: float,
     start_pos: np.ndarray,
 ) -> Dict[str, float]:
     """Aggregate one scenario into shared evaluation metrics."""
@@ -480,9 +440,8 @@ def _scenario_metrics(
 
     for route in route_evals:
         total_travel_km += route.total_distance_km
-        for req_id in route.pickup_wait_h:
-            total_wait += route.pickup_wait_h.get(req_id, 0.0)
-            total_walk += route.pickup_walk_h.get(req_id, 0.0)
+        for req_id in route.depot_wait_h:
+            total_wait += route.depot_wait_h.get(req_id, 0.0)
             total_walk += route.drop_walk_h.get(req_id, 0.0)
             total_invehicle += route.invehicle_h.get(req_id, 0.0)
 
@@ -490,13 +449,13 @@ def _scenario_metrics(
         fallback = _fallback_request_metrics(req, start_pos)
         total_travel_km += fallback["travel_km"]
         total_wait += fallback["wait_h"]
-        total_walk += fallback["pickup_walk_h"] + fallback["drop_walk_h"]
+        total_walk += fallback["drop_walk_h"]
         total_invehicle += fallback["invehicle_h"]
 
     # Defensive accounting if a request somehow never appears in either set.
     accounted = set()
     for route in route_evals:
-        accounted.update(route.pickup_wait_h.keys())
+        accounted.update(route.depot_wait_h.keys())
     accounted.update(req.req_id for req in rejected)
     for req_id, req in req_by_id.items():
         if req_id in accounted:
@@ -515,10 +474,11 @@ def _scenario_metrics(
 
 class VCC(BaselineMethod):
     """
-    Offline DAR-VCC baseline aligned with Zhang et al. (2023).
+    Depot-origin last-mile VCC baseline adapted from Zhang et al. (2023).
 
     The design step specifies service parameters only. Actual assignment and
-    routing are solved per scenario in custom_simulate().
+    destination-side coordination and routing are solved per scenario in
+    custom_simulate().
     """
 
     def __init__(
@@ -611,6 +571,7 @@ class VCC(BaselineMethod):
             Lambda,
             horizon_h,
             float(meta["deadline_slack_h"]),
+            design.depot_id,
             rng,
         )
         if not requests:
@@ -634,7 +595,7 @@ class VCC(BaselineMethod):
             exact_limit=int(meta["max_exact_requests"]),
             planning_horizon_h=horizon_h,
         )
-        return _scenario_metrics(routes, rejected, requests, horizon_h, start_pos)
+        return _scenario_metrics(routes, rejected, requests, start_pos)
 
     def custom_simulate(
         self,
@@ -667,7 +628,10 @@ class VCC(BaselineMethod):
         linehaul_cost = 0.0
         odd_cost = 0.0
         total_travel_cost = in_district_cost
-        fleet_size = float(meta["fleet_size"])
+        horizon_h = float(meta["planning_horizon_h"])
+        fleet_size = in_district_cost / (
+            float(meta["vehicle_speed_kmh"]) * max(horizon_h, 1e-9)
+        )
         avg_dispatch_interval = 0.0
 
         provider_cost = total_travel_cost

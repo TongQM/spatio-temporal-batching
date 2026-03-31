@@ -1141,6 +1141,14 @@ class Partition:
         block_ids = self.short_geoid_list
         N = len(block_ids)
         district_omega_dict = {}
+
+        # When ODD is disabled, baseline experiments pass an empty Omega_dict.
+        # Treat every district as having zero ODD in that case.
+        if not Omega_dict:
+            for i, root_id in enumerate(block_ids):
+                if round(assignment[i, i]) == 1:
+                    district_omega_dict[root_id] = 0.0
+            return district_omega_dict
         
         # Get first ODD vector to determine dimensionality
         first_omega = next(iter(Omega_dict.values()))

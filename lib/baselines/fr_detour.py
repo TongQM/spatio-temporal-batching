@@ -2044,6 +2044,7 @@ class FRDetour(BaselineMethod):
                         "assigned_blocks_by_root": {},
                         "reachable_blocks_by_root": {},
                         "selected_trip_indices_by_root": {},
+                        "planned_fleet_size": 1.0,
                         "depot_id": depot_id,
                         "shared_candidate_library": shared_candidate_library,
                         "shared_crn": shared_crn,
@@ -2122,6 +2123,14 @@ class FRDetour(BaselineMethod):
             ]
             route_info.append((root_id, li, ti, line_obj, z_scores))
 
+        planned_fleet_size = 0.0
+        for root_id, _li, _ti, line_obj, _z_scores in route_info:
+            T_root = dispatch_intervals.get(root_id, 1.0)
+            planned_fleet_size += (
+                _route_execution_km(line_obj, depot_pos, block_pos_km, self.K_skip)
+                / (speed * max(T_root, 1e-9))
+            )
+
         # Recover one route-level compatibility set per selected trip from the
         # optimized z values, without forcing a full nearest-root partition.
         for root_id, _li, _ti, line_obj, _z_scores in route_info:
@@ -2168,11 +2177,12 @@ class FRDetour(BaselineMethod):
                     "assigned_blocks_by_root": assigned_locations_by_root,
                     "reachable_blocks_by_root": reachable_locations_by_root,
                     "selected_trip_indices_by_root": selected_trip_indices_by_root,
+                    "planned_fleet_size": planned_fleet_size,
                     "depot_id": depot_id,
                     "shared_candidate_library": shared_candidate_library,
                     "shared_crn": shared_crn,
                 }
-            },
+	            },
         )
 
         return design
@@ -2434,7 +2444,7 @@ class FRDetour(BaselineMethod):
         total_user_time = avg_wait + avg_invehicle + avg_walk
 
         in_district_cost = acc_in_district
-        fleet_size = acc_fleet
+        fleet_size = float(acc_fleet)
         avg_dispatch_interval = acc_T_weighted / acc_prob
 
         provider_cost = in_district_cost  # no linehaul, no ODD
