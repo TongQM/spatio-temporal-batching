@@ -72,7 +72,7 @@ def make_toy_geodata(grid_size: int):
             for e in self.G.edges():
                 self.arc_list.append(e)
                 self.arc_list.append((e[1], e[0]))
-            # Precompute Manhattan distances
+            # Precompute Euclidean distances on the synthetic grid
             self._dist = {}
             for b1 in self.short_geoid_list:
                 i1 = self.short_geoid_list.index(b1)
@@ -80,7 +80,7 @@ def make_toy_geodata(grid_size: int):
                 for b2 in self.short_geoid_list:
                     i2 = self.short_geoid_list.index(b2)
                     r2, c2 = self.block_to_coord[i2]
-                    self._dist[(b1, b2)] = float(abs(r1 - r2) + abs(c1 - c2))
+                    self._dist[(b1, b2)] = float(np.hypot(r1 - r2, c1 - c2))
 
         def get_dist(self, b1, b2):
             return self._dist.get((b1, b2), float('inf'))
@@ -106,6 +106,10 @@ def make_toy_geodata(grid_size: int):
 
 def identity_J(omega):
     return float(np.sum(omega))
+
+
+def zero_J(_omega):
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +164,9 @@ def build_prob_dict(geodata):
     return {b: p for b in block_ids}
 
 
-def build_omega_dict(geodata):
+def build_omega_dict(geodata, use_odd: bool = False):
+    if not use_odd:
+        return {}
     return {b: np.array([1.0]) for b in geodata.short_geoid_list}
 
 
@@ -251,16 +257,34 @@ def parse_args():
                    help='Vehicle operating cost weight (per km)')
     p.add_argument('--epsilon', type=float, default=1e-3,
                    help='Wasserstein radius for Joint-DRO')
+    p.add_argument('--use_odd', action='store_true',
+                   help='Enable nonzero ODD costs (default: disabled, ODD cost = 0)')
     p.add_argument('--rs_iters', type=int, default=100,
                    help='Random-search iterations for SP-Lit / Joint baselines')
     p.add_argument('--T_fixed', type=float, default=0.5,
                    help='Fixed headway for FR and SP-Lit (hours)')
     p.add_argument('--delta', type=float, default=1.0,
                    help='Max detour deviation for FR-Detour (km)')
+    # TP-Lit parameters
     p.add_argument('--tp_candidates', type=int, default=25,
                    help='Number of random candidate locations for TP-Lit (0 = use geodata blocks)')
-    p.add_argument('--tp_region_km', type=float, default=10.0,
-                   help='Side length of square region for TP-Lit candidate locations (km)')
+    p.add_argument('--tp_region_km', type=float, default=4.5,
+                   help='Upper bound of square region for TP-Lit candidate locations (km)')
+    p.add_argument('--tp_region_low', type=float, default=-0.5,
+                   help='Lower bound of square region for TP-Lit candidate locations (km)')
+    # FR parameters
+    p.add_argument('--fr_n_blocks', type=int, default=18,
+                   help='Number of uniform random stopping locations for FR baselines')
+    p.add_argument('--fr_region_low', type=float, default=0.3,
+                   help='Lower bound for FR uniform positions (km)')
+    p.add_argument('--fr_region_high', type=float, default=4.7,
+                   help='Upper bound for FR uniform positions (km)')
+    p.add_argument('--fr_seed', type=int, default=17,
+                   help='Random seed for FR position generation')
+    p.add_argument('--fr_lambda', type=float, default=None,
+                   help='Arrival rate override for FR baselines (default: use --Lambda)')
+    p.add_argument('--fr_wr', type=float, default=None,
+                   help='Rider cost weight override for FR baselines (default: use --wr)')
     return p.parse_args()
 
 
@@ -272,41 +296,92 @@ def main():
     args = parse_args()
     out_dir = make_output_dir(args)
 
-    geodata = build_geodata(args)
-    prob_dict = build_prob_dict(geodata)
-    Omega_dict = build_omega_dict(geodata)
-    J_function = identity_J
+    J_function = identity_J if args.use_odd else zero_J
     road_network = build_road_network(args) if args.mode == 'real' else None
+
+    # -- Spatial group 1: Grid (partition-based methods) --------------------
+    grid_geodata = build_geodata(args)
+    grid_prob = build_prob_dict(grid_geodata)
+    grid_omega = build_omega_dict(grid_geodata, use_odd=args.use_odd)
+
+    # -- Spatial group 2: FR (uniform random stopping locations) ------------
+    if args.mode == 'real':
+        # In real mode, FR uses the same real geodata
+        fr_geodata, fr_prob, fr_omega = grid_geodata, grid_prob, grid_omega
+    else:
+        from lib.synthetic import make_uniform_positions, build_synthetic_instance
+        fr_positions = make_uniform_positions(
+            seed=args.fr_seed, n_blocks=args.fr_n_blocks,
+            low=args.fr_region_low, high=args.fr_region_high,
+        )
+        fr_geodata, _, _, fr_prob, _ = build_synthetic_instance(fr_positions)
+        fr_omega = build_omega_dict(fr_geodata, use_odd=args.use_odd)
+
+    fr_lambda = args.fr_lambda if args.fr_lambda is not None else args.Lambda
+    fr_wr = args.fr_wr if args.fr_wr is not None else args.wr
+
+    # -- Spatial group 3: TP-Lit (self-contained random candidates) ---------
+    # TP-Lit generates its own candidate locations internally when
+    # n_candidates > 0. It still receives geodata for the interface but
+    # ignores it. We pass grid geodata as a placeholder.
+    tp_geodata, tp_prob, tp_omega = grid_geodata, grid_prob, grid_omega
+
+    # -- Spatial group 4: VCC / OD (non-partition, use grid for demand) -----
+    od_geodata, od_prob, od_omega = grid_geodata, grid_prob, grid_omega
 
     from lib.baselines import (
         FullyOD, TemporalOnly,
         JointNom, JointDRO, VCC, FRDetour, CarlssonPartition,
     )
 
-    # Table order: FR, spatial, temporal, joint, VCC, OD
+    # Each entry: (name, method, geodata, prob_dict, Omega_dict,
+    #              num_districts, Lambda, wr)
     baselines = [
-        ("Multi-FR (Jacquillat)",        FRDetour(delta=0.0, max_iters=args.rs_iters, name="Multi-FR (Jacquillat)")),
-        ("Multi-FR-Detour (Jacquillat)", FRDetour(delta=args.delta, max_iters=args.rs_iters)),
-        ("SP-Lit (Carlsson)",            CarlssonPartition(T_fixed=args.T_fixed)),
-        ("TP-Lit (Liu)",                 TemporalOnly(n_candidates=args.tp_candidates,
-                                                      region_km=args.tp_region_km)),
-        ("Joint-Nom",                    JointNom(max_iters=args.rs_iters)),
-        ("Joint-DRO",                    JointDRO(epsilon=args.epsilon, max_iters=args.rs_iters)),
-        ("VCC",                          VCC()),
-        ("OD",                           FullyOD()),
+        ("Multi-FR (Jacquillat)",
+         FRDetour(delta=0.0, max_iters=args.rs_iters, name="Multi-FR (Jacquillat)"),
+         fr_geodata, fr_prob, fr_omega, args.districts, fr_lambda, fr_wr),
+        ("Multi-FR-Detour (Jacquillat)",
+         FRDetour(delta=args.delta, max_iters=args.rs_iters),
+         fr_geodata, fr_prob, fr_omega, args.districts, fr_lambda, fr_wr),
+        ("SP-Lit (Carlsson)",
+         CarlssonPartition(T_fixed=args.T_fixed),
+         grid_geodata, grid_prob, grid_omega, args.districts, args.Lambda, args.wr),
+        ("TP-Lit (Liu)",
+         TemporalOnly(n_candidates=args.tp_candidates,
+                      region_km=args.tp_region_km,
+                      region_low=args.tp_region_low),
+         tp_geodata, tp_prob, tp_omega, args.districts, args.Lambda, args.wr),
+        ("Joint-Nom",
+         JointNom(max_iters=args.rs_iters),
+         grid_geodata, grid_prob, grid_omega, args.districts, args.Lambda, args.wr),
+        ("Joint-DRO",
+         JointDRO(epsilon=args.epsilon, max_iters=args.rs_iters),
+         grid_geodata, grid_prob, grid_omega, args.districts, args.Lambda, args.wr),
+        ("VCC",
+         VCC(),
+         od_geodata, od_prob, od_omega, args.districts, args.Lambda, args.wr),
+        ("OD",
+         FullyOD(),
+         od_geodata, od_prob, od_omega, args.districts, args.Lambda, args.wr),
     ]
 
     print(f"\nRunning {len(baselines)} baselines")
     print(f"  mode={args.mode}, K={args.districts}, Λ={args.Lambda}, "
-          f"wr={args.wr}, wv={args.wv}, ε={args.epsilon}\n")
+          f"wr={args.wr}, wv={args.wv}, ε={args.epsilon}")
+    if args.mode == 'synthetic':
+        print(f"  grid={args.grid_size}x{args.grid_size} (partition/VCC/OD), "
+              f"FR: {args.fr_n_blocks} random stops, "
+              f"TP-Lit: {args.tp_candidates} candidates")
+    print()
 
     results = []
-    for name, method in baselines:
+    for (name, method, bl_geodata, bl_prob, bl_omega,
+         bl_K, bl_Lambda, bl_wr) in baselines:
         result = run_baseline(
-            method, name, geodata, prob_dict, Omega_dict, J_function,
-            num_districts=args.districts,
-            Lambda=args.Lambda,
-            wr=args.wr,
+            method, name, bl_geodata, bl_prob, bl_omega, J_function,
+            num_districts=bl_K,
+            Lambda=bl_Lambda,
+            wr=bl_wr,
             wv=args.wv,
             road_network=road_network,
         )
@@ -329,11 +404,21 @@ def main():
         "wr":           args.wr,
         "wv":           args.wv,
         "epsilon":      args.epsilon,
+        "use_odd":      args.use_odd,
         "T_fixed":      args.T_fixed,
         "rs_iters":     args.rs_iters,
         "road_network": args.road_network,
         "shapefile":    args.shapefile,
         "bbox":         args.bbox,
+        # FR-specific
+        "fr_n_blocks":    args.fr_n_blocks,
+        "fr_region":      [args.fr_region_low, args.fr_region_high],
+        "fr_seed":        args.fr_seed,
+        "fr_lambda":      fr_lambda,
+        "fr_wr":          fr_wr,
+        # TP-Lit-specific
+        "tp_candidates":  args.tp_candidates,
+        "tp_region":      [args.tp_region_low, args.tp_region_km],
     }
 
     json_payload = {

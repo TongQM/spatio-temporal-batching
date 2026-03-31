@@ -24,7 +24,7 @@ import numpy as np
 
 from lib.baselines.base import (
     BETA, BaselineMethod, EvaluationResult, ServiceDesign,
-    _get_pos, evaluate_design,
+    _get_pos, simulate_design,
 )
 
 
@@ -468,9 +468,9 @@ class CarlssonPartition(BaselineMethod):
         beta: float = BETA,
         road_network=None,
     ) -> EvaluationResult:
-        result = evaluate_design(
+        result = simulate_design(
             design, geodata, prob_dict, Omega_dict, J_function,
-            Lambda, wr, wv, beta, road_network,
+            Lambda, wr, wv, beta,
         )
         return EvaluationResult(
             name=self._name,
