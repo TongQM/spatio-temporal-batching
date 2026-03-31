@@ -24,7 +24,7 @@ import numpy as np
 
 from lib.baselines.base import (
     BETA, BaselineMethod, EvaluationResult, ServiceDesign,
-    _get_pos, simulate_design,
+    VEHICLE_SPEED_KMH, _get_pos,
 )
 
 
@@ -352,6 +352,200 @@ def _recursive_partition(
 
 
 # ---------------------------------------------------------------------------
+# Continuous-space last-mile simulation for SP-Lit
+# ---------------------------------------------------------------------------
+
+def _nn_route_from_depot(
+    depot_pos_km: np.ndarray,
+    points_km: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Nearest-neighbour route from depot through all points.
+
+    Returns
+    -------
+    order : permutation of point indices in visit order
+    cumulative_km : cumulative travel from depot to each visited point
+    total_route_km : depot -> points -> depot route length
+    """
+    n = len(points_km)
+    if n == 0:
+        return np.array([], dtype=int), np.array([], dtype=float), 0.0
+
+    remaining = list(range(n))
+    order: List[int] = []
+    cumulative: List[float] = []
+    cur = depot_pos_km.copy()
+    dist_so_far = 0.0
+
+    while remaining:
+        dists = [float(np.linalg.norm(points_km[j] - cur)) for j in remaining]
+        pos = int(np.argmin(dists))
+        nxt = remaining.pop(pos)
+        leg = float(np.linalg.norm(points_km[nxt] - cur))
+        dist_so_far += leg
+        order.append(nxt)
+        cumulative.append(dist_so_far)
+        cur = points_km[nxt]
+
+    dist_so_far += float(np.linalg.norm(cur - depot_pos_km))
+    return np.array(order, dtype=int), np.array(cumulative, dtype=float), dist_so_far
+
+
+def _simulate_carlsson_design(
+    design: ServiceDesign,
+    geodata,
+    prob_dict: Dict[str, float],
+    Lambda: float,
+    wr: float,
+    resolution: int,
+    n_scenarios: int = 500,
+) -> EvaluationResult:
+    """Passenger-level simulation for depot-origin last-mile service.
+
+    In each district and dispatch cycle:
+      1. Sample passenger arrivals to the depot via a Poisson process.
+      2. Sample each passenger's destination from the continuous density.
+      3. Batch all passengers to the next dispatch.
+      4. Route a district vehicle from the depot to destinations via NN.
+      5. Measure realized wait and in-vehicle time per passenger.
+    """
+    block_ids = geodata.short_geoid_list
+    block_pos_m = np.array([_get_pos(geodata, b) for b in block_ids], dtype=float)
+    block_pos_km = block_pos_m / 1000.0
+    depot_idx = block_ids.index(design.depot_id)
+    depot_pos_km = block_pos_km[depot_idx]
+
+    assignment = design.assignment
+    if assignment is None:
+        raise ValueError("Carlsson simulation requires a partition assignment.")
+
+    roots = [i for i in range(len(block_ids)) if round(assignment[i, i]) == 1]
+    root_to_district = {root_idx: d for d, root_idx in enumerate(roots)}
+    block_district = np.full(len(block_ids), -1, dtype=int)
+    for root_idx, d in root_to_district.items():
+        for j in range(len(block_ids)):
+            if round(assignment[j, root_idx]) == 1:
+                block_district[j] = d
+
+    depot_pos_m = block_pos_m[depot_idx]
+    grid_pos_m, _, _ = _build_grid(geodata, prob_dict, depot_pos_m, resolution)
+    grid_pos_km = grid_pos_m / 1000.0
+
+    span_km = block_pos_km.max(axis=0) - block_pos_km.min(axis=0)
+    pad_km = float(span_km.max()) * 0.05 + 0.05
+    lo_km = block_pos_km.min(axis=0) - pad_km
+    hi_km = block_pos_km.max(axis=0) + pad_km
+    xs = np.linspace(lo_km[0], hi_km[0], resolution)
+    ys = np.linspace(lo_km[1], hi_km[1], resolution)
+    dA = float((xs[1] - xs[0]) * (ys[1] - ys[0])) if resolution > 1 else 1.0
+    cell_dx = float(xs[1] - xs[0]) if len(xs) > 1 else 0.0
+    cell_dy = float(ys[1] - ys[0]) if len(ys) > 1 else 0.0
+
+    dists_gb = np.linalg.norm(
+        grid_pos_m[:, None, :] - block_pos_m[None, :, :], axis=2,
+    )
+    nearest_block = np.argmin(dists_gb, axis=1)
+    areas_km2 = np.array([max(float(geodata.get_area(b)), 1e-12) for b in block_ids])
+    probs = np.array([prob_dict.get(b, 0.0) for b in block_ids])
+    f_dA = np.maximum(probs[nearest_block] / areas_km2[nearest_block], 0.0) * dA
+
+    grid_label = design.service_metadata.get("grid_label")
+    if grid_label is None or len(grid_label) != len(grid_pos_km):
+        grid_label = block_district[nearest_block]
+    else:
+        grid_label = np.asarray(grid_label, dtype=int)
+
+    district_cells = []
+    T_dist = []
+    root_ids = []
+    for d, root_idx in enumerate(roots):
+        root_id = block_ids[root_idx]
+        root_ids.append(root_id)
+        T_i = float(design.dispatch_intervals.get(root_id, 1.0))
+        T_dist.append(T_i)
+
+        cell_idx = np.where(grid_label == d)[0]
+        mass = f_dA[cell_idx]
+        total_mass = float(mass.sum())
+        if len(cell_idx) > 0 and total_mass > 1e-15:
+            cell_prob = mass / total_mass
+        else:
+            cell_prob = np.ones(max(len(cell_idx), 1), dtype=float) / max(len(cell_idx), 1)
+        district_cells.append((cell_idx, grid_pos_km[cell_idx], cell_prob, total_mass))
+
+    rng = np.random.default_rng(42)
+
+    total_wait_h = 0.0
+    total_invehicle_h = 0.0
+    total_passengers = 0
+    route_km_sum = np.zeros(len(roots), dtype=float)
+
+    for s in range(n_scenarios):
+        for d, root_id in enumerate(root_ids):
+            T_i = T_dist[d]
+            cell_idx, cell_pos_km, cell_prob, district_mass = district_cells[d]
+            if len(cell_idx) == 0 or district_mass <= 1e-15:
+                continue
+
+            n_d = int(rng.poisson(Lambda * T_i * district_mass))
+            if n_d == 0:
+                continue
+
+            arrivals = rng.uniform(0.0, T_i, size=n_d)
+            waits = T_i - arrivals
+
+            sampled = rng.choice(len(cell_idx), size=n_d, p=cell_prob)
+            dest_points = cell_pos_km[sampled].copy()
+            dest_points[:, 0] += rng.uniform(-0.5 * cell_dx, 0.5 * cell_dx, size=n_d)
+            dest_points[:, 1] += rng.uniform(-0.5 * cell_dy, 0.5 * cell_dy, size=n_d)
+
+            _, cumulative_km, route_km = _nn_route_from_depot(depot_pos_km, dest_points)
+            invehicle_h = cumulative_km / VEHICLE_SPEED_KMH
+
+            total_wait_h += float(waits.sum())
+            total_invehicle_h += float(invehicle_h.sum())
+            total_passengers += n_d
+            route_km_sum[d] += route_km
+
+    avg_route_km = route_km_sum / max(n_scenarios, 1)
+    provider_travel_rate = float(sum(
+        avg_route_km[d] / max(T_dist[d], 1e-9) for d in range(len(T_dist))
+    ))
+    fleet_size = float(sum(
+        avg_route_km[d] / (VEHICLE_SPEED_KMH * max(T_dist[d], 1e-9))
+        for d in range(len(T_dist))
+    ))
+
+    if total_passengers > 0:
+        avg_wait_h = total_wait_h / total_passengers
+        avg_invehicle_h = total_invehicle_h / total_passengers
+    else:
+        avg_wait_h = 0.0
+        avg_invehicle_h = 0.0
+
+    total_user_time = avg_wait_h + avg_invehicle_h
+    avg_dispatch_interval = float(np.mean(T_dist)) if T_dist else 0.0
+    user_cost = wr * total_user_time
+
+    return EvaluationResult(
+        name=design.name,
+        avg_wait_time=avg_wait_h,
+        avg_invehicle_time=avg_invehicle_h,
+        avg_walk_time=0.0,
+        total_user_time=total_user_time,
+        linehaul_cost=0.0,
+        in_district_cost=provider_travel_rate,
+        total_travel_cost=provider_travel_rate,
+        fleet_size=fleet_size,
+        avg_dispatch_interval=avg_dispatch_interval,
+        odd_cost=0.0,
+        provider_cost=provider_travel_rate,
+        user_cost=user_cost,
+        total_cost=provider_travel_rate + user_cost,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Baseline class
 # ---------------------------------------------------------------------------
 
@@ -453,6 +647,30 @@ class CarlssonPartition(BaselineMethod):
             depot_id=depot_id,
             district_roots=roots,
             dispatch_intervals={r: self.T_fixed for r in roots},
+            service_metadata={
+                "grid_label": grid_label.copy(),
+                "resolution": self.resolution,
+            },
+        )
+
+    def custom_simulate(
+        self,
+        design: ServiceDesign,
+        geodata,
+        prob_dict: Dict[str, float],
+        Omega_dict,
+        J_function: Callable,
+        Lambda: float,
+        wr: float,
+        wv: float,
+    ) -> EvaluationResult:
+        return _simulate_carlsson_design(
+            design=design,
+            geodata=geodata,
+            prob_dict=prob_dict,
+            Lambda=Lambda,
+            wr=wr,
+            resolution=int(design.service_metadata.get("resolution", self.resolution)),
         )
 
     def evaluate(
@@ -468,9 +686,9 @@ class CarlssonPartition(BaselineMethod):
         beta: float = BETA,
         road_network=None,
     ) -> EvaluationResult:
-        result = simulate_design(
+        result = self.custom_simulate(
             design, geodata, prob_dict, Omega_dict, J_function,
-            Lambda, wr, wv, beta,
+            Lambda, wr, wv,
         )
         return EvaluationResult(
             name=self._name,

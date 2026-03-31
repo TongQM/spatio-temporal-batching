@@ -1,13 +1,17 @@
-"""Scatter plot: user performance vs provider cost rate across service modes.
+"""Scatter plot: user time vs provider cost across service modes.
 
-Provider cost is already a rate (cost per unit time), computed as
-  Sigma_d (K_d/T_d + tour_d/(discount*T_d) + F_d/T_d) * p_d
-in the evaluation.  Different modes have different dispatch intervals,
-but the /T_d normalization makes costs comparable per unit time.
+This script does not recompute evaluation metrics. It reads the method-specific
+outputs stored in `results.json` by `baseline_comparison.py` and plots:
 
-User time is hours per rider (demand-weighted average).
+  - x-axis: provider cost reported by each method's evaluation
+  - y-axis: total user time (hours per rider)
+  - labels: total cost from the same stored evaluation
 
-Total-cost iso-curves show the combined trade-off.
+The underlying evaluation semantics can differ by method. For example,
+partition-based methods may use Monte Carlo dispatch-cycle simulation,
+while other baselines may use custom simulators. This figure is therefore
+a comparison of reported outputs, not a reimplementation of a single common
+cost formula inside the plotting script.
 """
 import json
 import sys
@@ -134,7 +138,7 @@ for i in range(len(names)):
 
 # Axes
 ax.set_xscale("log")
-ax.set_xlim(1.0, 400)
+ax.set_xlim(max(0.5, provider_cost.min() * 0.5), provider_cost.max() * 1.5)
 ax.set_ylim(-0.02, max(user_time) * 1.15)
 ax.set_xlabel("Provider cost rate", fontsize=12)
 ax.set_ylabel("User time (hours per rider)", fontsize=12)
@@ -153,9 +157,11 @@ ax.legend(handles, labels, fontsize=7, loc="upper left",
           framealpha=0.92, borderpad=0.6, handletextpad=0.4)
 
 # Title + experiment info
+odd_label = "on" if meta.get("use_odd", False) else "off"
 info = (f"K={meta.get('districts', '?')}, "
         f"\u039b={meta.get('Lambda', '?')}, "
-        f"wr={meta.get('wr', '?')}, wv={meta.get('wv', '?')}")
+        f"wr={meta.get('wr', '?')}, wv={meta.get('wv', '?')}, "
+        f"ODD={odd_label}")
 ax.set_title(f"User vs Provider Performance by Service Mode\n"
              f"{info}", fontsize=12, fontweight="bold", pad=12)
 

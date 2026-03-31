@@ -299,6 +299,289 @@ def _block_geometry(areas_km2: np.ndarray, delta: float):
     return corridor_r, walk_det, walk_no_det
 
 
+def _sample_walk_distances(
+    demand_s: Dict[str, int],
+    assigned_blocks: List[str],
+    block_pos_km: Dict[str, np.ndarray],
+    cp_set: set,
+    u_vals: Dict[str, float],
+    areas_km2: Dict[str, float],
+    rng: np.random.Generator,
+) -> float:
+    """Simulation-based walk distance computation for FR-Detour evaluation.
+
+    For each demand in a block, sample a random position uniformly within the
+    block's circular area, then assign to nearest checkpoint or stopping location.
+
+    Walk rules:
+      - Demand assigned to a checkpoint: walk = Euclidean distance to checkpoint.
+      - Demand assigned to a stopping location AND detour happens (u ≈ 0):
+        walk = distance to that stopping location.
+      - Demand assigned to a stopping location AND no detour (u ≈ 1):
+        walk = distance to the nearest checkpoint instead.
+
+    Returns total walk_km * n_riders (unnormalized, to be accumulated).
+    """
+    # Build arrays of checkpoint and stopping-location positions
+    cp_list = [b for b in assigned_blocks if b in cp_set]
+    stop_list = [b for b in assigned_blocks if b not in cp_set]
+    if not cp_list:
+        # No checkpoints — fallback: all blocks are service points
+        cp_list = assigned_blocks
+        stop_list = []
+
+    cp_pos = np.array([block_pos_km[b] for b in cp_list])   # (n_cp, 2)
+    if stop_list:
+        stop_pos = np.array([block_pos_km[b] for b in stop_list])  # (n_stop, 2)
+    else:
+        stop_pos = np.empty((0, 2))
+
+    # Precompute which stopping locations are served (detour happens)
+    stop_served = np.array([
+        u_vals.get(b, 1.0) < 0.5 for b in stop_list
+    ], dtype=bool)
+
+    total_walk_riders = 0.0
+
+    for b in assigned_blocks:
+        d_b = demand_s.get(b, 0)
+        if d_b == 0:
+            continue
+
+        # Sample d_b positions within block b's circular area
+        center = block_pos_km[b]
+        area_b = areas_km2.get(b, 0.25)
+        r_b = math.sqrt(area_b / math.pi)
+
+        if r_b < 1e-9:
+            # Degenerate block — all demands at center
+            positions = np.tile(center, (d_b, 1))
+        else:
+            # Uniform sampling in a disk: r * sqrt(U), theta ~ Uniform(0, 2pi)
+            radii = r_b * np.sqrt(rng.uniform(0, 1, size=d_b))
+            angles = rng.uniform(0, 2 * math.pi, size=d_b)
+            offsets = np.column_stack([radii * np.cos(angles),
+                                       radii * np.sin(angles)])
+            positions = center + offsets  # (d_b, 2)
+
+        # Distance from each demand to each checkpoint
+        dist_to_cp = np.linalg.norm(
+            positions[:, None, :] - cp_pos[None, :, :], axis=2)  # (d_b, n_cp)
+        min_cp_dist = dist_to_cp.min(axis=1)  # (d_b,)
+
+        if len(stop_list) == 0:
+            # No stopping locations — all walk to nearest checkpoint
+            total_walk_riders += float(min_cp_dist.sum())
+            continue
+
+        # Distance from each demand to each stopping location
+        dist_to_stop = np.linalg.norm(
+            positions[:, None, :] - stop_pos[None, :, :], axis=2)  # (d_b, n_stop)
+
+        # Assign each demand to nearest service point (checkpoint or stop)
+        min_stop_dist = dist_to_stop.min(axis=1)  # (d_b,)
+        nearest_stop_idx = dist_to_stop.argmin(axis=1)  # (d_b,)
+
+        # Is nearest point a checkpoint or stopping location?
+        assign_to_stop = min_stop_dist < min_cp_dist  # True → nearest is a stop
+
+        for p in range(d_b):
+            if not assign_to_stop[p]:
+                # Assigned to checkpoint — always walk there
+                total_walk_riders += min_cp_dist[p]
+            else:
+                # Assigned to stopping location
+                si = nearest_stop_idx[p]
+                if stop_served[si]:
+                    # Detour happens — walk to stopping location
+                    total_walk_riders += min_stop_dist[p]
+                else:
+                    # No detour — must walk to nearest checkpoint
+                    total_walk_riders += min_cp_dist[p]
+
+    return total_walk_riders
+
+
+def _sample_passenger_assignments(
+    demand_s: Dict[str, int],
+    assigned_blocks: List[str],
+    block_pos_km: Dict[str, np.ndarray],
+    cp_set: set,
+    u_vals: Dict[str, float],
+    areas_km2: Dict[str, float],
+    rng: np.random.Generator,
+):
+    """Sample passenger locations and assign each passenger to a service point.
+
+    Returns
+    -------
+    total_walk_riders_km : float
+        Sum of passenger walk distances in km.
+    service_counts : Dict[str, int]
+        Number of passengers delivered to each service point.
+    total_riders : int
+        Total passengers in the scenario/district.
+    """
+    cp_list = [b for b in assigned_blocks if b in cp_set]
+    stop_list = [b for b in assigned_blocks if b not in cp_set]
+    if not cp_list:
+        cp_list = assigned_blocks
+        stop_list = []
+
+    cp_pos = np.array([block_pos_km[b] for b in cp_list]) if cp_list else np.empty((0, 2))
+    stop_pos = np.array([block_pos_km[b] for b in stop_list]) if stop_list else np.empty((0, 2))
+    stop_served = np.array([u_vals.get(b, 1.0) < 0.5 for b in stop_list], dtype=bool)
+
+    total_walk_riders = 0.0
+    service_counts: Dict[str, int] = {}
+    total_riders = 0
+
+    for b in assigned_blocks:
+        d_b = int(demand_s.get(b, 0))
+        if d_b <= 0:
+            continue
+        total_riders += d_b
+
+        center = block_pos_km[b]
+        area_b = areas_km2.get(b, 0.25)
+        r_b = math.sqrt(area_b / math.pi)
+
+        if r_b < 1e-9:
+            positions = np.tile(center, (d_b, 1))
+        else:
+            radii = r_b * np.sqrt(rng.uniform(0, 1, size=d_b))
+            angles = rng.uniform(0, 2 * math.pi, size=d_b)
+            offsets = np.column_stack([radii * np.cos(angles), radii * np.sin(angles)])
+            positions = center + offsets
+
+        dist_to_cp = np.linalg.norm(positions[:, None, :] - cp_pos[None, :, :], axis=2)
+        min_cp_dist = dist_to_cp.min(axis=1)
+        nearest_cp_idx = dist_to_cp.argmin(axis=1)
+
+        if len(stop_list) == 0:
+            total_walk_riders += float(min_cp_dist.sum())
+            for idx in nearest_cp_idx:
+                sp = cp_list[int(idx)]
+                service_counts[sp] = service_counts.get(sp, 0) + 1
+            continue
+
+        dist_to_stop = np.linalg.norm(positions[:, None, :] - stop_pos[None, :, :], axis=2)
+        min_stop_dist = dist_to_stop.min(axis=1)
+        nearest_stop_idx = dist_to_stop.argmin(axis=1)
+        assign_to_stop = min_stop_dist < min_cp_dist
+
+        for p in range(d_b):
+            cp_name = cp_list[int(nearest_cp_idx[p])]
+            if not assign_to_stop[p]:
+                total_walk_riders += float(min_cp_dist[p])
+                service_counts[cp_name] = service_counts.get(cp_name, 0) + 1
+                continue
+
+            si = int(nearest_stop_idx[p])
+            if stop_served[si]:
+                stop_name = stop_list[si]
+                total_walk_riders += float(min_stop_dist[p])
+                service_counts[stop_name] = service_counts.get(stop_name, 0) + 1
+            else:
+                total_walk_riders += float(min_cp_dist[p])
+                service_counts[cp_name] = service_counts.get(cp_name, 0) + 1
+
+    return total_walk_riders, service_counts, total_riders
+
+
+def _ordered_subpath_locations(
+    start_loc: str,
+    end_loc: str,
+    served_locations: List[str],
+    block_pos_km: Dict[str, np.ndarray],
+) -> List[str]:
+    """Greedy service ordering between two checkpoints.
+
+    Mirrors the NN heuristic used in `_subpath_cost`.
+    """
+    if not served_locations:
+        return []
+
+    remaining = list(served_locations)
+    ordered: List[str] = []
+    cur = np.array(block_pos_km[start_loc], dtype=float)
+    while remaining:
+        dists = [float(np.linalg.norm(block_pos_km[loc] - cur)) for loc in remaining]
+        idx = int(np.argmin(dists))
+        nxt = remaining.pop(idx)
+        ordered.append(nxt)
+        cur = np.array(block_pos_km[nxt], dtype=float)
+    return ordered
+
+
+def _build_service_arrival_times(
+    depot_pos_km: np.ndarray,
+    checkpoints: List[str],
+    block_pos_km: Dict[str, np.ndarray],
+    active_arc_flows,
+    speed_kmh: float,
+) -> Dict[str, float]:
+    """Arrival time at each service point along the realized route."""
+    if not checkpoints:
+        return {}
+
+    arrival_h: Dict[str, float] = {}
+    cur_pos = depot_pos_km.copy()
+    cur_time = 0.0
+
+    first_cp = checkpoints[0]
+    cur_time += float(np.linalg.norm(block_pos_km[first_cp] - cur_pos)) / speed_kmh
+    arrival_h[first_cp] = cur_time
+    cur_pos = np.array(block_pos_km[first_cp], dtype=float)
+
+    if not active_arc_flows:
+        for cp in checkpoints[1:]:
+            nxt = np.array(block_pos_km[cp], dtype=float)
+            cur_time += float(np.linalg.norm(nxt - cur_pos)) / speed_kmh
+            arrival_h[cp] = cur_time
+            cur_pos = nxt
+        return arrival_h
+
+    active_by_from = {}
+    for arc, flow in active_arc_flows:
+        if flow <= 1e-9:
+            continue
+        prev = active_by_from.get(arc.cp_from)
+        if prev is None or flow > prev[1]:
+            active_by_from[arc.cp_from] = (arc, flow)
+
+    cp_idx = 0
+    while cp_idx < len(checkpoints) - 1:
+        selected = active_by_from.get(cp_idx)
+        if selected is None:
+            next_idx = cp_idx + 1
+            next_cp = checkpoints[next_idx]
+            nxt = np.array(block_pos_km[next_cp], dtype=float)
+            cur_time += float(np.linalg.norm(nxt - cur_pos)) / speed_kmh
+            arrival_h[next_cp] = cur_time
+            cur_pos = nxt
+            cp_idx = next_idx
+            continue
+
+        arc = selected[0]
+        end_idx = min(max(arc.cp_to, cp_idx + 1), len(checkpoints) - 1)
+        end_cp = checkpoints[end_idx]
+        served = [loc for loc in arc.served_locations if loc != checkpoints[cp_idx] and loc != end_cp]
+        ordered = _ordered_subpath_locations(checkpoints[cp_idx], end_cp, served, block_pos_km)
+        for loc in ordered:
+            nxt = np.array(block_pos_km[loc], dtype=float)
+            cur_time += float(np.linalg.norm(nxt - cur_pos)) / speed_kmh
+            arrival_h[loc] = cur_time
+            cur_pos = nxt
+        nxt = np.array(block_pos_km[end_cp], dtype=float)
+        cur_time += float(np.linalg.norm(nxt - cur_pos)) / speed_kmh
+        arrival_h[end_cp] = cur_time
+        cur_pos = nxt
+        cp_idx = end_idx
+
+    return arrival_h
+
+
 def _fr_detour_tour_stochastic(
     points_km, depot_km, areas_km2, delta, prob_weights,
     Lambda, T, route_order, wr=1.0,
@@ -1082,7 +1365,9 @@ def _solve_routing_lp_with_cg(initial_arcs, line, block_ids, block_pos_km,
             all_blocks, cp_set, cost_mult, walk_penalties)
 
         if obj is None:
-            return (None, None, None, None) if return_solution else (None, None)
+            if return_solution:
+                return (None, None, None, None, None) if return_active_arcs else (None, None, None, None)
+            return (None, None)
 
         # Price new arcs
         new_arcs = _price_subpaths(
@@ -1937,12 +2222,15 @@ class FRDetour(BaselineMethod):
         depot_pos_km = np.array(_get_pos(geodata, depot_id),
                                 dtype=float) / 1000.0
 
-        # Pre-compute walking geometry per block
+        # Pre-compute walking geometry per block (still needed for optimization
+        # walk penalties in the detour trade-off LP)
         walk_saved_km: Dict[str, float] = {}
         walk_det_km: Dict[str, float] = {}
         walk_no_det_km: Dict[str, float] = {}
+        areas_km2: Dict[str, float] = {}
         for b in block_ids:
             area_b = float(geodata.get_area(b))
+            areas_km2[b] = area_b
             r_b = math.sqrt(area_b / math.pi)
             r_safe = max(r_b, 1e-12)
             wnd = 2.0 * r_b / 3.0
@@ -1955,6 +2243,9 @@ class FRDetour(BaselineMethod):
             walk_det_km[b] = wd
             walk_saved_km[b] = wnd - wd
 
+        # RNG for simulation-based walk distance sampling
+        walk_rng = np.random.default_rng(42)
+
         # SAA: generate demand scenarios
         if crn_uniforms is not None:
             U_base = _coerce_crn_uniforms(crn_uniforms, self.num_scenarios, N)
@@ -1964,8 +2255,8 @@ class FRDetour(BaselineMethod):
             U_base = _coerce_crn_uniforms(None, n_eval, N)
 
         acc_in_district = 0.0
-        acc_wait = 0.0
-        acc_invehicle = 0.0
+        acc_wait_h = 0.0
+        acc_invehicle_h = 0.0
         acc_walk_riders = 0.0  # walk_km * n_riders accumulated
         acc_riders = 0.0       # total riders accumulated
         acc_fleet = 0.0
@@ -2065,6 +2356,7 @@ class FRDetour(BaselineMethod):
                         / walk_speed
                     )
 
+                active_arc_flows = None
                 if m > 1 and arcs:
                     # Solve with CG — same cost model as master subproblem
                     result = _solve_routing_lp_with_cg(
@@ -2072,52 +2364,61 @@ class FRDetour(BaselineMethod):
                         m, self.capacity, z_star, demand_s,
                         all_blocks_set, cp_set, eval_cost_mult, wp,
                         self.delta, speed, self.alpha_time, self.K_skip,
-                        max_cg_iters=15, return_solution=True)
-                    _, _, detour_km, u_vals = result
+                        max_cg_iters=15, return_solution=True,
+                        return_active_arcs=True)
+                    _, _, detour_km, u_vals, active_arc_flows = result
 
                     if detour_km is not None:
                         acc_route_km += access_km + detour_km
-                        # Walk: walk_det for served blocks, walk_no_det for unserved
-                        for b in assigned_blocks:
-                            d_b = demand_s.get(b, 0)
-                            if d_b == 0:
-                                continue
-                            u_b = u_vals.get(b, 1.0) if b not in cp_set else 0.0
-                            # Checkpoint blocks: always visited, walk = walk_det
-                            # Corridor served (u≈0): walk = walk_det
-                            # Corridor unserved (u≈1): walk = walk_no_det
-                            w = (walk_det_km.get(b, 0.0) * (1.0 - u_b)
-                                 + walk_no_det_km.get(b, 0.0) * u_b)
-                            district_walk_riders += w * d_b
-                        district_riders += n_total
+                        district_walk_km, service_counts, district_riders_s = _sample_passenger_assignments(
+                            demand_s, assigned_blocks, block_pos_km,
+                            cp_set, u_vals, areas_km2, walk_rng)
+                        district_walk_riders += district_walk_km
+                        district_riders += district_riders_s
+                        arrival_h = _build_service_arrival_times(
+                            depot_pos_km, checkpoints, block_pos_km,
+                            active_arc_flows, speed,
+                        )
                     else:
-                        # Fallback: checkpoint-only route
+                        # Fallback: checkpoint-only route, no detours
                         acc_route_km += base_route_km
-                        for b in assigned_blocks:
-                            d_b = demand_s.get(b, 0)
-                            if b in cp_set:
-                                district_walk_riders += walk_det_km.get(b, 0.0) * d_b
-                            else:
-                                district_walk_riders += walk_no_det_km.get(b, 0.0) * d_b
-                        district_riders += n_total
+                        u_none = {b: 1.0 for b in assigned_blocks
+                                  if b not in cp_set}
+                        district_walk_km, service_counts, district_riders_s = _sample_passenger_assignments(
+                            demand_s, assigned_blocks, block_pos_km,
+                            cp_set, u_none, areas_km2, walk_rng)
+                        district_walk_riders += district_walk_km
+                        district_riders += district_riders_s
+                        arrival_h = _build_service_arrival_times(
+                            depot_pos_km, checkpoints, block_pos_km,
+                            None, speed,
+                        )
                 else:
-                    # Singleton or no arcs: just checkpoint tour
+                    # Singleton or no arcs: just checkpoint tour, no detours
                     acc_route_km += base_route_km
-                    for b in assigned_blocks:
-                        d_b = demand_s.get(b, 0)
-                        if b in cp_set:
-                            district_walk_riders += walk_det_km.get(b, 0.0) * d_b
-                        else:
-                            district_walk_riders += walk_no_det_km.get(b, 0.0) * d_b
-                    district_riders += n_total
+                    u_none = {b: 1.0 for b in assigned_blocks
+                              if b not in cp_set}
+                    district_walk_km, service_counts, district_riders_s = _sample_passenger_assignments(
+                        demand_s, assigned_blocks, block_pos_km,
+                        cp_set, u_none, areas_km2, walk_rng)
+                    district_walk_riders += district_walk_km
+                    district_riders += district_riders_s
+                    arrival_h = _build_service_arrival_times(
+                        depot_pos_km, checkpoints, block_pos_km,
+                        None, speed,
+                    )
+
+                if n_total > 0:
+                    arrivals_h = walk_rng.uniform(0.0, T_i, size=n_total)
+                    acc_wait_h += float((T_i - arrivals_h).sum())
+                    for loc, count in service_counts.items():
+                        acc_invehicle_h += float(arrival_h.get(loc, 0.0)) * count
 
             avg_tour_km = acc_route_km / n_eval
 
             # Accumulate into overall metrics
             provider_d = (avg_tour_km / discount / T_i) * district_prob
             acc_in_district += provider_d
-            acc_wait += (T_i / 2.0) * district_prob
-            acc_invehicle += (avg_tour_km / (2.0 * speed)) * district_prob
             acc_fleet += avg_tour_km / (speed * T_i)
             acc_walk_riders += district_walk_riders
             acc_riders += district_riders
@@ -2126,8 +2427,8 @@ class FRDetour(BaselineMethod):
 
         acc_prob = max(acc_prob, 1e-12)
 
-        avg_wait = acc_wait / acc_prob
-        avg_invehicle = acc_invehicle / acc_prob
+        avg_wait = acc_wait_h / max(acc_riders, 1.0)
+        avg_invehicle = acc_invehicle_h / max(acc_riders, 1.0)
         avg_walk_km = acc_walk_riders / max(acc_riders, 1.0)
         avg_walk = avg_walk_km / walk_speed
         total_user_time = avg_wait + avg_invehicle + avg_walk

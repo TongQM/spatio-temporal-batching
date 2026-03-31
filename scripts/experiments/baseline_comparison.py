@@ -249,7 +249,7 @@ def parse_args():
     p.add_argument('--bbox', type=float, nargs=4,
                    metavar=('NORTH', 'SOUTH', 'EAST', 'WEST'))
     p.add_argument('--road_network', action='store_true')
-    p.add_argument('--Lambda', type=float, default=1000.0,
+    p.add_argument('--Lambda', type=float, default=300.0,
                    help='Overall arrival rate (passengers/hour)')
     p.add_argument('--wr', type=float, default=1.0,
                    help='Rider time cost weight')
