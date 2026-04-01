@@ -273,8 +273,10 @@ def parse_args():
     p.add_argument('--tp_region_low', type=float, default=-0.5,
                    help='Lower bound of square region for TP-Lit candidate locations (km)')
     # FR parameters
-    p.add_argument('--fr_n_blocks', type=int, default=18,
-                   help='Number of uniform random stopping locations for FR baselines')
+    p.add_argument('--fr_n_checkpoints', type=int, default=10,
+                   help='Number of checkpoint locations for FR baselines')
+    p.add_argument('--fr_n_stops', type=int, default=30,
+                   help='Number of stopping locations for FR baselines')
     p.add_argument('--fr_region_low', type=float, default=0.3,
                    help='Lower bound for FR uniform positions (km)')
     p.add_argument('--fr_region_high', type=float, default=4.7,
@@ -310,11 +312,14 @@ def main():
         fr_geodata, fr_prob, fr_omega = grid_geodata, grid_prob, grid_omega
     else:
         from lib.synthetic import make_uniform_positions, build_synthetic_instance
-        fr_positions = make_uniform_positions(
-            seed=args.fr_seed, n_blocks=args.fr_n_blocks,
+        fr_positions, fr_checkpoint_ids = make_uniform_positions(
+            seed=args.fr_seed,
+            n_checkpoints=args.fr_n_checkpoints,
+            n_stops=args.fr_n_stops,
             low=args.fr_region_low, high=args.fr_region_high,
         )
-        fr_geodata, _, _, fr_prob, _ = build_synthetic_instance(fr_positions)
+        fr_geodata, _, _, fr_prob, _ = build_synthetic_instance(
+            fr_positions, fr_checkpoint_ids)
         fr_omega = build_omega_dict(fr_geodata, use_odd=args.use_odd)
 
     fr_lambda = args.fr_lambda if args.fr_lambda is not None else args.Lambda
@@ -358,7 +363,7 @@ def main():
          JointDRO(epsilon=args.epsilon, max_iters=args.rs_iters),
          grid_geodata, grid_prob, grid_omega, args.districts, args.Lambda, args.wr),
         ("VCC",
-         VCC(),
+         VCC(fleet_size=30),
          od_geodata, od_prob, od_omega, args.districts, args.Lambda, args.wr),
         ("OD",
          FullyOD(),
@@ -370,7 +375,7 @@ def main():
           f"wr={args.wr}, wv={args.wv}, ε={args.epsilon}")
     if args.mode == 'synthetic':
         print(f"  grid={args.grid_size}x{args.grid_size} (partition/VCC/OD), "
-              f"FR: {args.fr_n_blocks} random stops, "
+              f"FR: {args.fr_n_checkpoints} checkpoints + {args.fr_n_stops} stops, "
               f"TP-Lit: {args.tp_candidates} candidates")
     print()
 
@@ -411,7 +416,8 @@ def main():
         "shapefile":    args.shapefile,
         "bbox":         args.bbox,
         # FR-specific
-        "fr_n_blocks":    args.fr_n_blocks,
+        "fr_n_checkpoints": args.fr_n_checkpoints,
+        "fr_n_stops":       args.fr_n_stops,
         "fr_region":      [args.fr_region_low, args.fr_region_high],
         "fr_seed":        args.fr_seed,
         "fr_lambda":      fr_lambda,

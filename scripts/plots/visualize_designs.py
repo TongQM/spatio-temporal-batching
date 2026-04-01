@@ -9,7 +9,7 @@ Each service mode gets a visualization matching its operational model:
         colored districts + depot-originating TSP tours
   - Temporal-only (TP-Lit):
         one dispatch wave with sampled demand + serving tour
-  - VCC:  sampled OD requests + coordinated non-partition fleet
+  - VCC:  sampled depot-origin requests + coordinated non-partition fleet
   - On-demand (OD):  sample direct-service trips from depot
 """
 import os
@@ -33,10 +33,9 @@ from lib.baselines import (
     FullyOD, TemporalOnly,
     JointNom, JointDRO, VCC, FRDetour, CarlssonPartition,
 )
+from lib.synthetic import make_uniform_positions, build_synthetic_instance
 from scripts.plots.fr_detour_comparison import (
-    build_synthetic_instance,
     find_first_served_stop_scenario,
-    make_uniform_positions,
     plot_fixed_route_panel,
     solve_design_scenario,
 )
@@ -63,9 +62,9 @@ block_pos_km = np.array([
 ])
 
 # ── Uniform synthetic geodata for FR / FR-Detour ─────────────────────────
-_fr_positions_km = make_uniform_positions()
+_fr_positions_km, _fr_checkpoint_ids = make_uniform_positions()
 fr_geodata, fr_block_ids, fr_block_pos_km, fr_prob_dict, fr_Omega_dict = (
-    build_synthetic_instance(_fr_positions_km)
+    build_synthetic_instance(_fr_positions_km, _fr_checkpoint_ids)
 )
 
 DELTA_DETOUR = 0.8
@@ -110,7 +109,7 @@ grid_baselines = [
     ("TP-Lit",          TemporalOnly(n_candidates=25, region_low=-0.5, region_km=4.5)),
     ("Joint-Nom",       JointNom(max_iters=RS_ITERS)),
     ("Joint-DRO",       JointDRO(epsilon=EPS, max_iters=RS_ITERS)),
-    ("VCC",             VCC()),
+    ("VCC",             VCC(fleet_size=30)),
     ("OD",              FullyOD()),
 ]
 
@@ -587,7 +586,7 @@ def _plot_partition(ax, design, title):
 
 # ── VCC: meeting-point coordination ──────────────────────────────────────
 def _plot_vcc(ax, design, title):
-    """VCC: sampled OD requests and a shared non-partition coordinated fleet."""
+    """VCC: sampled depot-origin requests and a shared coordinated fleet."""
     depot_idx = block_ids.index(design.depot_id)
     depot_pos = block_pos_km[depot_idx]
     meta = design.service_metadata or {}
@@ -603,11 +602,7 @@ def _plot_vcc(ax, design, title):
     probs = np.array([prob_dict.get(b, 0.0) for b in block_ids], dtype=float)
     probs = probs / probs.sum()
     n_req = 6
-    req_orig = rng.choice(N, size=n_req, p=probs)
     req_dest = rng.choice(N, size=n_req, p=probs)
-    for i in range(n_req):
-        if req_dest[i] == req_orig[i]:
-            req_dest[i] = (req_dest[i] + 1) % N
 
     # Group requests to vehicles just for illustration.
     groups = [[] for _ in range(max(fleet_size, 1))]
@@ -620,28 +615,17 @@ def _plot_vcc(ax, design, title):
             continue
         stops = [depot_pos]
         for rid in req_ids:
-            origin = block_pos_km[req_orig[rid]]
             dest = block_pos_km[req_dest[rid]]
-            meet_pick = origin + 0.6 * (depot_pos - origin)
-            if np.linalg.norm(meet_pick - origin) > lw:
-                direction = depot_pos - origin
-                meet_pick = origin + lw * direction / np.linalg.norm(direction)
             meet_drop = dest + 0.4 * (depot_pos - dest)
             if np.linalg.norm(meet_drop - dest) > lw:
                 direction = depot_pos - dest
                 meet_drop = dest + lw * direction / np.linalg.norm(direction)
-            stops.extend([meet_pick, meet_drop])
+            stops.append(meet_drop)
 
-            ax.plot(*origin, "o", color=color, markersize=4.5,
-                    markeredgecolor="white", markeredgewidth=0.5, zorder=4)
             ax.plot(*dest, "x", color=color, markersize=5.5,
                     markeredgewidth=1.0, zorder=4)
-            ax.add_patch(Circle(origin, lw, facecolor=color, edgecolor=color,
-                                alpha=0.06, linewidth=0.8, linestyle="--", zorder=1))
             ax.add_patch(Circle(dest, lw, facecolor=color, edgecolor=color,
                                 alpha=0.06, linewidth=0.8, linestyle="--", zorder=1))
-            ax.plot(*meet_pick, "D", color=color, markersize=4.5,
-                    markeredgecolor="black", markeredgewidth=0.4, zorder=5)
             ax.plot(*meet_drop, "s", color=color, markersize=4.5,
                     markeredgecolor="black", markeredgewidth=0.4, zorder=5)
 

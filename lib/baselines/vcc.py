@@ -231,13 +231,24 @@ def _insert_request_events(events: Sequence[_Event], req_id: int) -> List[List[_
     return out
 
 
-def _fallback_request_metrics(req: _Request, start_pos: np.ndarray) -> Dict[str, float]:
-    """Direct-service fallback if no coordinated feasible insertion exists."""
+def _overflow_request_metrics(
+    req: _Request,
+    start_pos: np.ndarray,
+    planning_horizon_h: float,
+) -> Dict[str, float]:
+    """Overflow direct trip used when the coordinated fleet cannot serve a request.
+
+    Requests rejected by the coordinated insertion heuristic are treated as an
+    explicit overflow service dispatched at the end of the offline batch. This
+    preserves service completion while making overload visible in the reported
+    wait metric instead of silently assigning zero-wait direct service.
+    """
     deadhead_out = float(np.linalg.norm(req.dest_pos - start_pos))
     deadhead_back = deadhead_out
+    overflow_wait_h = max(0.0, planning_horizon_h - req.release_h)
     return {
         "travel_km": deadhead_out + deadhead_back,
-        "wait_h": 0.0,
+        "wait_h": overflow_wait_h,
         "drop_walk_h": 0.0,
         "invehicle_h": req.direct_time_h,
     }
@@ -305,9 +316,18 @@ def _choose_best_insertion(
                 served = len(ordered) - len(rejected)
                 total_obj = sum(r.objective for r in routes)
                 total_obj += sum(
-                    _fallback_request_metrics(req, start_pos)["travel_km"]
-                    + wr * _fallback_request_metrics(req, start_pos)["invehicle_h"]
+                    (
+                        overflow["travel_km"]
+                        + wr * (
+                            overflow["wait_h"]
+                            + overflow["drop_walk_h"]
+                            + overflow["invehicle_h"]
+                        )
+                    )
                     for req in rejected
+                    for overflow in [
+                        _overflow_request_metrics(req, start_pos, planning_horizon_h or 0.0)
+                    ]
                 )
                 score = (served, -total_obj)
                 if best_score is None or score > best_score:
@@ -421,6 +441,7 @@ def _scenario_metrics(
     rejected: Sequence[_Request],
     requests: Sequence[_Request],
     start_pos: np.ndarray,
+    planning_horizon_h: float,
 ) -> Dict[str, float]:
     """Aggregate one scenario into shared evaluation metrics."""
     n_requests = len(requests)
@@ -446,11 +467,11 @@ def _scenario_metrics(
             total_invehicle += route.invehicle_h.get(req_id, 0.0)
 
     for req in rejected:
-        fallback = _fallback_request_metrics(req, start_pos)
-        total_travel_km += fallback["travel_km"]
-        total_wait += fallback["wait_h"]
-        total_walk += fallback["drop_walk_h"]
-        total_invehicle += fallback["invehicle_h"]
+        overflow = _overflow_request_metrics(req, start_pos, planning_horizon_h)
+        total_travel_km += overflow["travel_km"]
+        total_wait += overflow["wait_h"]
+        total_walk += overflow["drop_walk_h"]
+        total_invehicle += overflow["invehicle_h"]
 
     # Defensive accounting if a request somehow never appears in either set.
     accounted = set()
@@ -460,9 +481,11 @@ def _scenario_metrics(
     for req_id, req in req_by_id.items():
         if req_id in accounted:
             continue
-        fallback = _fallback_request_metrics(req, start_pos)
-        total_travel_km += fallback["travel_km"]
-        total_invehicle += fallback["invehicle_h"]
+        overflow = _overflow_request_metrics(req, start_pos, planning_horizon_h)
+        total_travel_km += overflow["travel_km"]
+        total_wait += overflow["wait_h"]
+        total_walk += overflow["drop_walk_h"]
+        total_invehicle += overflow["invehicle_h"]
 
     return {
         "wait_h": total_wait / n_requests,
@@ -483,6 +506,7 @@ class VCC(BaselineMethod):
 
     def __init__(
         self,
+        fleet_size: Optional[int] = None,
         vehicle_capacity: int = 3,
         max_walk_km: float = 0.3,
         deadline_slack_h: float = 0.5,
@@ -493,6 +517,7 @@ class VCC(BaselineMethod):
         max_exact_requests: int = 4,
         random_seed: int = 42,
     ):
+        self.fleet_size = None if fleet_size is None else int(fleet_size)
         self.vehicle_capacity = int(vehicle_capacity)
         self.max_walk_km = float(max_walk_km)
         self.deadline_slack_h = float(deadline_slack_h)
@@ -528,7 +553,11 @@ class VCC(BaselineMethod):
         """Create a non-partition DAR-VCC service template."""
         block_ids = geodata.short_geoid_list
         depot_id = _centroid_block(geodata, block_ids)
-        fleet_size = int(num_districts)
+        fleet_size = (
+            int(self.fleet_size)
+            if self.fleet_size is not None
+            else int(num_districts)
+        )
         horizon_h = self._planning_horizon(Lambda, fleet_size)
         metadata = {
             "fleet_size": fleet_size,
@@ -541,6 +570,7 @@ class VCC(BaselineMethod):
             "n_scenarios": self.n_scenarios,
             "max_exact_requests": self.max_exact_requests,
             "random_seed": self.random_seed,
+            "overflow_mode": "direct_at_horizon",
         }
         return ServiceDesign(
             name="VCC",
@@ -595,7 +625,7 @@ class VCC(BaselineMethod):
             exact_limit=int(meta["max_exact_requests"]),
             planning_horizon_h=horizon_h,
         )
-        return _scenario_metrics(routes, rejected, requests, start_pos)
+        return _scenario_metrics(routes, rejected, requests, start_pos, horizon_h)
 
     def custom_simulate(
         self,
@@ -624,15 +654,16 @@ class VCC(BaselineMethod):
         avg_invehicle = float(np.mean([s["invehicle_h"] for s in scenario_stats]))
         total_user_time = avg_wait + avg_walk + avg_invehicle
 
-        in_district_cost = float(np.mean([s["travel_km"] for s in scenario_stats]))
+        raw_avg_travel_km = float(np.mean([s["travel_km"] for s in scenario_stats]))
+        horizon_h = float(meta["planning_horizon_h"])
+        in_district_cost = raw_avg_travel_km / max(horizon_h, 1e-9)
         linehaul_cost = 0.0
         odd_cost = 0.0
         total_travel_cost = in_district_cost
-        horizon_h = float(meta["planning_horizon_h"])
-        fleet_size = in_district_cost / (
+        fleet_size = raw_avg_travel_km / (
             float(meta["vehicle_speed_kmh"]) * max(horizon_h, 1e-9)
         )
-        avg_dispatch_interval = 0.0
+        avg_dispatch_interval = horizon_h
 
         provider_cost = total_travel_cost
         user_cost = wr * total_user_time

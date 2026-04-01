@@ -32,78 +32,20 @@ from lib.baselines.fr_detour import (
     _tour_distance,
 )
 from lib.constants import TSP_TRAVEL_DISCOUNT
+from lib.synthetic import (
+    SyntheticGeoData,
+    make_uniform_positions,
+    make_scattered_positions,
+    build_synthetic_instance,
+    positions_array as _positions_array,
+)
 
 
 PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#8c564b", "#17becf"]
 
 
-class SyntheticGeoData:
-    """Minimal GeoData with arbitrary point locations."""
-
-    def __init__(self, positions_km):
-        self.short_geoid_list = list(positions_km.keys())
-        self.n_blocks = len(self.short_geoid_list)
-        self.level = "block_group"
-        self.gdf = None
-        self.pos = {
-            b: (x * 1000.0, y * 1000.0) for b, (x, y) in positions_km.items()
-        }
-        self.G = nx.complete_graph(self.short_geoid_list)
-        self.block_graph = self.G
-        self.arc_list = []
-        for u, v in self.G.edges():
-            self.arc_list.append((u, v))
-            self.arc_list.append((v, u))
-
-    def get_dist(self, b1, b2):
-        p1 = np.array(self.pos[b1], dtype=float)
-        p2 = np.array(self.pos[b2], dtype=float)
-        return float(np.linalg.norm(p1 - p2))
-
-    def get_area(self, _):
-        return 0.25
-
-    def get_K(self, _):
-        return 2.0
-
-    def get_F(self, _):
-        return 0.0
-
-    def get_arc_list(self):
-        return self.arc_list
-
-
 def identity_J(omega):
     return float(np.sum(omega))
-
-
-def make_uniform_positions(seed=17, n_blocks=18, low=0.3, high=4.7):
-    rng = np.random.default_rng(seed)
-    return {
-        f"B{i:02d}": (float(rng.uniform(low, high)), float(rng.uniform(low, high)))
-        for i in range(n_blocks)
-    }
-
-
-def make_scattered_positions(seed=7, n_blocks=25, low=0.2, high=4.8):
-    rng = np.random.RandomState(seed)
-    return {
-        f"B{i:02d}": (round(rng.uniform(low, high), 2), round(rng.uniform(low, high), 2))
-        for i in range(n_blocks)
-    }
-
-
-def build_synthetic_instance(positions_km):
-    geodata = SyntheticGeoData(positions_km)
-    block_ids = geodata.short_geoid_list
-    block_pos_km = _positions_array(geodata, block_ids)
-    prob_dict = {b: 1.0 / len(block_ids) for b in block_ids}
-    Omega_dict = {b: np.array([1.0]) for b in block_ids}
-    return geodata, block_ids, block_pos_km, prob_dict, Omega_dict
-
-
-def _positions_array(geodata, block_ids):
-    return np.array([np.array(geodata.pos[b], dtype=float) / 1000.0 for b in block_ids])
 
 
 def _pt_seg_dist(p, a, b):
@@ -160,6 +102,24 @@ def assigned_locations_by_root(design, block_ids):
     return assigned
 
 
+def reachable_locations_by_root(design, block_ids):
+    """Geometric reachable set per root (wider than assigned partition)."""
+    meta = design.service_metadata.get("fr_detour", {})
+    reachable_meta = meta.get(
+        "reachable_locations_by_root",
+        meta.get("reachable_blocks_by_root", {}),
+    )
+    result = {}
+    for root in design.district_roots:
+        blocks = list(reachable_meta.get(root, []))
+        if not blocks:
+            # Fallback: use assigned blocks
+            assigned = assigned_locations_by_root(design, block_ids)
+            blocks = assigned.get(root, [])
+        result[root] = blocks
+    return result
+
+
 def solve_design_scenario(
     design,
     method,
@@ -176,19 +136,23 @@ def solve_design_scenario(
     depot_pos = np.array(geodata.pos[design.depot_id], dtype=float) / 1000.0
     walk_saved_km = _walk_geometry(geodata, block_ids, method.delta)
     assigned_by_root = assigned_locations_by_root(design, block_ids)
+    reachable_by_root = reachable_locations_by_root(design, block_ids)
     block_pos_map = {b: block_pos_km[i] for i, b in enumerate(block_ids)}
     services = {}
 
     for root in design.district_roots:
         assigned_blocks = list(assigned_by_root.get(root, []))
+        reachable_blocks = list(reachable_by_root.get(root, assigned_blocks))
         route_global = design.district_routes.get(root, [])
         checkpoints = [block_ids[gi] for gi in route_global]
         T_i = design.dispatch_intervals[root]
 
+        # Use reachable blocks (paper-faithful: shared global network)
+        all_blocks = set(reachable_blocks)
         line_obj = ReferenceLine(
             idx=0,
             checkpoints=checkpoints,
-            reachable_locations=set(assigned_blocks),
+            reachable_locations=all_blocks,
             est_tour_km=_tour_distance(depot_pos, checkpoints, block_pos_map),
         )
         arcs = _build_initial_arcs(
@@ -198,8 +162,7 @@ def solve_design_scenario(
 
         demand_matrix = _crn_demand(crn_uniforms, Lambda, T_i, prob_dict, block_ids)
         demand_s = {block_ids[j]: int(demand_matrix[scenario_idx, j]) for j in range(len(block_ids))}
-        z_star = {b: 1.0 for b in assigned_blocks}
-        all_blocks = set(assigned_blocks)
+        z_star = {b: 1.0 for b in all_blocks}
         cp_set = set(checkpoints)
         cost_mult = 1.0 / (TSP_TRAVEL_DISCOUNT * T_i) + wr / (2.0 * VEHICLE_SPEED_KMH)
         walk_penalties = {
@@ -213,7 +176,7 @@ def solve_design_scenario(
             for b in all_blocks
         }
 
-        u_vals = {b: 1.0 for b in assigned_blocks if b not in cp_set}
+        u_vals = {b: 1.0 for b in all_blocks if b not in cp_set}
         active_arcs = []
         if len(checkpoints) > 1 and arcs and sum(demand_s.get(b, 0) for b in assigned_blocks) > 0:
             result = _solve_routing_lp_with_cg(
@@ -241,7 +204,7 @@ def solve_design_scenario(
                 _, _, _, u_vals, active_arcs = result
 
         served_stops = {
-            b for b in assigned_blocks
+            b for b in all_blocks
             if b not in cp_set and demand_s.get(b, 0) > 0 and u_vals.get(b, 1.0) < 0.5
         }
         skip_arcs = [(arc, flow) for arc, flow in active_arcs if arc.cp_to > arc.cp_from + 1]
@@ -329,15 +292,36 @@ def plot_fixed_route_panel(
     for _, route in active:
         all_cps.update(route)
 
+    # Per-route checkpoint sets (global indices) for per-block CP/corridor distinction
+    route_cp_sets = {}
+    for d, (root_id, route_global) in enumerate(active):
+        route_cp_sets[d] = set(route_global)
+
     block_route = np.full(len(block_ids), -1, dtype=int)
+    block_is_cp = np.ones(len(block_ids), dtype=bool)  # per-block: CP on its coloring route?
     if services is not None:
+        # With shared stops, a block may be a checkpoint on one route and
+        # a corridor stop on another.  Assign each block to its "primary"
+        # route: prefer showing it as a corridor stop (more informative
+        # for the detour visualization) over a checkpoint.
         route_order = [root_id for root_id, _ in active]
+        # First pass: corridor stops (served_stops) — these are the
+        # interesting detour-served blocks.
+        for d, root_id in enumerate(route_order):
+            info = services.get(root_id, {})
+            for b in info.get("served_stops", set()):
+                ji = block_ids.index(b)
+                if block_route[ji] < 0:
+                    block_route[ji] = d
+                    block_is_cp[ji] = False
+        # Second pass: checkpoints (fill in remaining unclaimed blocks)
         for d, root_id in enumerate(route_order):
             info = services.get(root_id, {})
             for cp in info.get("checkpoints", []):
-                block_route[block_ids.index(cp)] = d
-            for b in info.get("served_stops", set()):
-                block_route[block_ids.index(b)] = d
+                ji = block_ids.index(cp)
+                if block_route[ji] < 0:
+                    block_route[ji] = d
+                    block_is_cp[ji] = True
     else:
         assignment = design.assignment
         for d, (root_id, route_global) in enumerate(active):
@@ -347,8 +331,10 @@ def plot_fixed_route_panel(
                     continue
                 if j in all_cps:
                     block_route[j] = d
+                    block_is_cp[j] = True
                 elif delta > 0 and _in_corridor(j, route_global, block_pos_km, delta):
                     block_route[j] = d
+                    block_is_cp[j] = False
 
     for j, bid in enumerate(block_ids):
         x, y = block_pos_km[j]
@@ -358,7 +344,7 @@ def plot_fixed_route_panel(
         if block_route[j] >= 0:
             root_id = active[block_route[j]][0]
             color = route_colors[root_id]
-            is_cp = j in all_cps
+            is_cp = block_is_cp[j]
             marker = "s" if is_cp else "o"
             size = 10 if is_cp else 7
             edge = "black" if is_cp else "white"
@@ -405,8 +391,8 @@ def plot_fixed_route_panel(
             markeredgecolor="black", markeredgewidth=0.8, zorder=6)
 
     n_lines = len(active)
-    n_cp = len(all_cps)
-    n_corr = sum(1 for j in range(len(block_ids)) if block_route[j] >= 0 and j not in all_cps)
+    n_cp = sum(1 for j in range(len(block_ids)) if block_route[j] >= 0 and block_is_cp[j])
+    n_corr = sum(1 for j in range(len(block_ids)) if block_route[j] >= 0 and not block_is_cp[j])
     n_uncov = sum(1 for j in range(len(block_ids)) if block_route[j] < 0)
 
     T_info = design.dispatch_intervals
@@ -437,8 +423,8 @@ def plot_fixed_route_panel(
 
 
 def run_uniform_comparison():
-    positions_km = make_uniform_positions()
-    geodata, block_ids, block_pos_km, prob_dict, Omega_dict = build_synthetic_instance(positions_km)
+    positions_km, checkpoint_ids = make_uniform_positions()
+    geodata, block_ids, block_pos_km, prob_dict, Omega_dict = build_synthetic_instance(positions_km, checkpoint_ids)
 
     budget = 2
     Lambda = 8.0
@@ -498,8 +484,8 @@ def run_uniform_diagnostic(wr=500.0):
     n_saa = 20
     rs_iters = 30
 
-    positions_km = make_uniform_positions()
-    geodata, block_ids, block_pos_km, prob_dict, Omega_dict = build_synthetic_instance(positions_km)
+    positions_km, checkpoint_ids = make_uniform_positions()
+    geodata, block_ids, block_pos_km, prob_dict, Omega_dict = build_synthetic_instance(positions_km, checkpoint_ids)
     n_blocks = len(block_ids)
 
     shared_crn = np.random.default_rng(123).uniform(0.0, 1.0, size=(n_saa, n_blocks))

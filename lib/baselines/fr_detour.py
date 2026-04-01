@@ -410,8 +410,18 @@ def _sample_passenger_assignments(
     u_vals: Dict[str, float],
     areas_km2: Dict[str, float],
     rng: np.random.Generator,
+    service_blocks: Optional[List[str]] = None,
 ):
     """Sample passenger locations and assign each passenger to a service point.
+
+    Parameters
+    ----------
+    assigned_blocks : list
+        Blocks that generate demand for this trip (partition-based accounting).
+    service_blocks : list, optional
+        All blocks that can act as service points for this trip (may be wider
+        than assigned_blocks when stops are shared across routes).  If None,
+        defaults to assigned_blocks for backward compatibility.
 
     Returns
     -------
@@ -422,8 +432,10 @@ def _sample_passenger_assignments(
     total_riders : int
         Total passengers in the scenario/district.
     """
-    cp_list = [b for b in assigned_blocks if b in cp_set]
-    stop_list = [b for b in assigned_blocks if b not in cp_set]
+    if service_blocks is None:
+        service_blocks = assigned_blocks
+    cp_list = [b for b in service_blocks if b in cp_set]
+    stop_list = [b for b in service_blocks if b not in cp_set]
     if not cp_list:
         cp_list = assigned_blocks
         stop_list = []
@@ -715,7 +727,10 @@ def _tour_distance(depot_km, checkpoints, block_pos_km):
 
 def _generate_line_library(geodata, depot_id, block_ids, n_angular,
                            num_districts=None):
-    """Generate candidate reference lines from depot through block subsets.
+    """Generate candidate reference lines from depot through checkpoint subsets.
+
+    Routes are built through checkpoints only.  Stopping locations (non-
+    checkpoint blocks) are served via corridor detours in the second stage.
 
     Includes sector lines, merged-sector lines, partition lines (sized for
     K-way coverage), and singleton fallbacks.
@@ -726,15 +741,20 @@ def _generate_line_library(geodata, depot_id, block_ids, n_angular,
     for b in block_ids:
         block_pos_km[b] = np.array(_get_pos(geodata, b), dtype=float) / 1000.0
 
-    # Angular position of each block relative to depot
-    positions = np.array([block_pos_km[b] for b in block_ids])
+    # Use only checkpoint IDs for building route geometry.
+    # Stopping locations are reachable via corridor detours.
+    cp_ids = getattr(geodata, 'checkpoint_ids', block_ids)
+
+    # Angular position of each checkpoint relative to depot
+    positions = np.array([block_pos_km[b] for b in cp_ids])
     dx = positions[:, 0] - depot_pos[0]
     dy = positions[:, 1] - depot_pos[1]
     angles = np.arctan2(dy, dx)
 
-    # Sort blocks by angle
+    # Sort checkpoints by angle
+    N_cp = len(cp_ids)
     order = np.argsort(angles)
-    sorted_blocks = [block_ids[i] for i in order]
+    sorted_blocks = [cp_ids[i] for i in order]
 
     def _make_line(block_list, idx_counter):
         """Helper to create a ReferenceLine from a block list."""
@@ -749,11 +769,11 @@ def _generate_line_library(geodata, depot_id, block_ids, n_angular,
     lines: List[ReferenceLine] = []
     idx = 0
 
-    # Build sector lists
+    # Build sector lists (from checkpoints only)
     n_ang = max(n_angular, 1)
     sector_lists: List[List[str]] = [[] for _ in range(n_ang)]
     for rank, b in enumerate(sorted_blocks):
-        sector_lists[rank * n_ang // N].append(b)
+        sector_lists[rank * n_ang // N_cp].append(b)
 
     # 1. Sector lines (single sectors)
     for sector in sector_lists:
@@ -780,20 +800,19 @@ def _generate_line_library(geodata, depot_id, block_ids, n_angular,
         lines.append(_make_line(merged, idx))
         idx += 1
 
-    # 4. Partition lines: divide blocks into K equal groups by angle.
-    #    Guarantees that selecting these K lines covers all blocks.
+    # 4. Partition lines: divide checkpoints into K equal groups by angle.
     if num_districts is not None and num_districts > 0:
         K = num_districts
-        part_size = max(1, (N + K - 1) // K)
+        part_size = max(1, (N_cp + K - 1) // K)
         for g in range(K):
-            group = sorted_blocks[g * part_size: min((g + 1) * part_size, N)]
+            group = sorted_blocks[g * part_size: min((g + 1) * part_size, N_cp)]
             if not group:
                 continue
             lines.append(_make_line(group, idx))
             idx += 1
 
-    # 5. Singleton fallback lines (every block reachable by at least one line)
-    for b in block_ids:
+    # 5. Singleton fallback lines (every checkpoint reachable by at least one line)
+    for b in cp_ids:
         est_km = 2.0 * float(np.linalg.norm(block_pos_km[b] - depot_pos))
         lines.append(ReferenceLine(idx=idx, checkpoints=[b],
                                    reachable_locations=set(), est_tour_km=est_km))
@@ -875,11 +894,14 @@ def _build_initial_arcs(line, block_ids, block_pos_km, delta, K_skip,
             skipped_cps = frozenset(
                 checkpoints[k] for k in range(i + 1, j))
 
-            # Corridor blocks: off-checkpoint blocks within δ of segment
+            # Corridor blocks: off-checkpoint blocks within δ of segment,
+            # restricted to blocks reachable by this line (avoids leaking
+            # demand from blocks assigned to other routes into arc loads).
             corridor: List[str] = []
             if delta > 0:
+                reachable = line.reachable_locations
                 for b in block_ids:
-                    if b in cp_set:
+                    if b in cp_set or b not in reachable:
                         continue
                     d = _point_to_segment_dist(block_pos_km[b], ci_pos, cj_pos)
                     if d <= delta + 1e-9:
@@ -911,10 +933,20 @@ def _build_initial_arcs(line, block_ids, block_pos_km, delta, K_skip,
                     arc_id += 1
 
             # --- Seed arcs: small multi-block combinations (≤ 3) ---
-            max_enum = min(len(corridor), 3)
+            # Cap at nearest 6 corridor blocks to avoid combinatorial explosion
+            # when the reachable set is large.  CG pricing discovers the rest.
+            if len(corridor) > 6:
+                seg_mid = (ci_pos + cj_pos) / 2.0
+                dists = [float(np.linalg.norm(block_pos_km[b] - seg_mid))
+                         for b in corridor]
+                nearest = sorted(range(len(corridor)), key=lambda i: dists[i])[:6]
+                corridor_enum = [corridor[i] for i in nearest]
+            else:
+                corridor_enum = corridor
+            max_enum = min(len(corridor_enum), 3)
             for size in range(2, max_enum + 1):
-                for subset in combinations(range(len(corridor)), size):
-                    blocks_in_subset = [corridor[s] for s in subset]
+                for subset in combinations(range(len(corridor_enum)), size):
+                    blocks_in_subset = [corridor_enum[s] for s in subset]
                     served = skipped_cps | frozenset(blocks_in_subset)
                     served_pos = [block_pos_km[b] for b in blocks_in_subset]
                     cost = _subpath_cost(ci_pos, cj_pos, served_pos)
@@ -1185,11 +1217,13 @@ def _price_subpaths(line, block_ids, block_pos_km, m, capacity,
             skipped_cps = [checkpoints[k] for k in range(i + 1, j)]
             skipped_set = frozenset(skipped_cps)
 
-            # Corridor blocks (off-checkpoint, within delta of segment)
+            # Corridor blocks (off-checkpoint, within delta of segment,
+            # restricted to blocks reachable by this line)
             corridor: List[str] = []
             if delta > 0:
+                reachable = line.reachable_locations
                 for b in block_ids:
-                    if b in cp_set:
+                    if b in cp_set or b not in reachable:
                         continue
                     d = _point_to_segment_dist(block_pos_km[b], ci_pos, cj_pos)
                     if d <= delta + 1e-9:
@@ -1667,16 +1701,22 @@ class FRDetour(BaselineMethod):
         U_base = shared_inputs["crn_uniforms"]
 
         # ---- Step 3: Build master MIP ----
-        def _build_master(hard_coverage):
-            """Build master MIP. If hard_coverage fails, caller rebuilds with soft."""
+        def _build_master():
+            """Build master MIP.
+
+            Paper-faithful z semantics: z[b,ℓ,t] is a compatibility
+            indicator — "trip (ℓ,t) may serve demand at stop b".  A stop
+            can be compatible with multiple trips (no partition constraint).
+            The second-stage subpath LP decides which stops are actually
+            visited per scenario.
+            """
             master = gp.Model("MiND_Benders_Master")
             master.setParam('OutputFlag', 0)
 
             x_v = {}      # x[ℓ, t] binary: trip operates
-            z_v = {}      # z[n, ℓ, t] binary: stop-location assignment
+            z_v = {}      # z[b, ℓ, t] binary: trip (ℓ,t) may serve stop b
             theta_v = {}  # θ[s, ℓ, t] continuous: scenario recourse cost
             slack_low_v = {}
-            uncov_v = {}
 
             for line in lines:
                 for ti, T_t in enumerate(T_vals):
@@ -1696,15 +1736,18 @@ class FRDetour(BaselineMethod):
 
             master.update()
 
-            # Coverage: hard or soft
             penalty_low = 0.1
+
+            # Soft coverage: each block should be claimed by at least one
+            # trip.  Unlike the old partition constraint (Σ z == 1), this
+            # allows a block to be claimed by multiple trips (Σ z >= 1)
+            # and only penalizes uncovered blocks.
+            uncov_v = {}
             penalty_uncov = 100.0
-
-            if not hard_coverage:
-                for b in block_ids:
-                    uncov_v[b] = master.addVar(lb=0.0, ub=1.0, name=f"uncov_{b}")
-                master.update()
-
+            for b in block_ids:
+                uncov_v[b] = master.addVar(lb=0.0, ub=1.0,
+                                           name=f"uncov_{b}")
+            master.update()
             for b in block_ids:
                 expr = gp.LinExpr()
                 for line in lines:
@@ -1712,10 +1755,8 @@ class FRDetour(BaselineMethod):
                         for ti in range(n_T):
                             if (b, line.idx, ti) in z_v:
                                 expr += z_v[(b, line.idx, ti)]
-                if hard_coverage:
-                    master.addConstr(expr == 1.0, name=f"cov_{b}")
-                else:
-                    master.addConstr(expr + uncov_v[b] == 1.0, name=f"cov_{b}")
+                master.addConstr(expr + uncov_v[b] >= 1.0,
+                                 name=f"cov_{b}")
 
             # Assignment requires operation
             for line in lines:
@@ -1750,6 +1791,14 @@ class FRDetour(BaselineMethod):
                                / (speed * T_vals[ti])) * x_v[k]
             master.addConstr(fleet_expr <= fleet_budget,
                              name="fleet_budget")
+
+            # Route count: at most K lines can operate.
+            # This prevents the optimizer from selecting many small
+            # routes just to collect the coverage reward.
+            master.addConstr(
+                gp.quicksum(x_v[k] for k in x_v)
+                <= int(fleet_budget) + 1,
+                name="max_routes")
 
             # Load bounds: expected-demand based
             # The paper's load factor bounds constrain expected demand per trip.
@@ -1796,52 +1845,43 @@ class FRDetour(BaselineMethod):
                             theta_v[(s, line.idx, ti)] >= sp_km * cm * x_v[(line.idx, ti)],
                             name=f"theta_ws_{s}_{line.idx}_{ti}")
 
-            # Objective (FR-consistent: no linehaul, no ODD)
+            # Objective: recourse cost + slack penalty + coverage reward.
             #
-            # Wait cost is demand-weighted via z variables:
-            #   wr * T_t/2 * Σ_b prob[b] * z[b,ℓ,t]
-            # This makes the master properly internalize that a line serving
-            # more demand incurs more total wait cost.
+            # Following the paper, the objective includes a large reward for
+            # covering passenger demand.  Each z[b,ℓ,t]=1 earns a demand-
+            # weighted reward, incentivizing trips to claim reachable stops.
+            # Without this, removing the partition constraint leaves z free
+            # to be 0 everywhere, producing degenerate designs.
             #
-            # Pre-index z_v keys by (line_idx, ti) for efficient objective build
-            z_by_trip: Dict[Tuple[int, int], List[Tuple[str, object]]] = {}
-            for (b, li, ti), var in z_v.items():
-                z_by_trip.setdefault((li, ti), []).append((b, var))
+            # The reward per (b,ℓ,t) is scaled by prob[b] so high-demand
+            # stops are prioritized.  The coefficient is set large enough
+            # to dominate the recourse cost for reasonable instances.
+            coverage_reward = wr * 10.0
 
             obj_expr = gp.LinExpr()
             for li, ti in x_v:
-                T_t = T_vals[ti]
-                # Recourse proxy + slack penalty
                 obj_expr += penalty_low * slack_low_v[(li, ti)]
                 obj_expr += (1.0 / S) * gp.quicksum(
                     theta_v[(s, li, ti)] for s in range(S))
-                # Demand-weighted wait: wr * T/2 * Σ prob[b] * z[b,ℓ,t]
-                for b, zvar in z_by_trip.get((li, ti), []):
-                    coeff = wr * T_t / 2.0 * prob_dict.get(b, 0.0)
-                    if coeff > 1e-15:
-                        obj_expr += coeff * zvar
-            if not hard_coverage:
-                obj_expr += penalty_uncov * gp.quicksum(
-                    uncov_v[b] for b in block_ids)
+
+            # Coverage reward: -reward * prob[b] * z[b,ℓ,t]
+            for (b, li, ti), var in z_v.items():
+                coeff = coverage_reward * prob_dict.get(b, 0.0)
+                if coeff > 1e-15:
+                    obj_expr -= coeff * var
+
+            # Uncovered-block penalty
+            obj_expr += penalty_uncov * gp.quicksum(
+                uncov_v[b] for b in block_ids)
+
             master.setObjective(obj_expr, GRB.MINIMIZE)
 
-            return master, x_v, z_v, theta_v, uncov_v
+            return master, x_v, z_v, theta_v
 
-        # Try hard coverage first; fall back to soft if infeasible
-        master, x, z, theta, uncov = _build_master(hard_coverage=True)
+        master, x, z, theta = _build_master()
         master.optimize()
         if master.status != GRB.OPTIMAL:
-            print(f"  [MiND] Hard coverage infeasible with K={K}, "
-                  f"falling back to soft coverage")
-            master, x, z, theta, uncov = _build_master(hard_coverage=False)
-            master.optimize()
-            if master.status == GRB.OPTIMAL and uncov:
-                uncov_blocks = [b for b in block_ids
-                                if b in uncov and uncov[b].X > 0.5]
-                if uncov_blocks:
-                    print(f"  [MiND] Uncovered blocks in fallback: {uncov_blocks}")
-        # Reset for Benders — will re-optimize in the loop
-        # (The initial solve was just to check feasibility)
+            print(f"  [MiND] Master infeasible at initial solve")
 
         # ---- Step 4: Benders loop ----
         pending_cuts: List[dict] = []
@@ -2277,45 +2317,71 @@ class FRDetour(BaselineMethod):
             "assigned_locations_by_root",
             fr_meta.get("assigned_blocks_by_root", {}),
         )
+        reachable_blocks_meta = fr_meta.get(
+            "reachable_locations_by_root",
+            fr_meta.get("reachable_blocks_by_root", {}),
+        )
         checkpoint_sequence_meta = fr_meta.get("checkpoint_sequence_by_root", {})
 
         roots_iter = design.district_roots or [
             block_ids[i] for i in range(N) if round(assignment[i, i]) == 1
         ]
 
+        # Assign each demand block to its nearest checkpoint's route so
+        # that stopping locations (which may not be geometrically reachable
+        # at delta=0) still contribute demand.  Passengers at these stops
+        # walk to the nearest checkpoint.
+        demand_blocks = [b for b in block_ids if prob_dict.get(b, 0.0) > 0]
+        all_cp_positions = {}  # checkpoint_id → (pos_km, root)
         for root in roots_iter:
-            assigned_blocks = list(assigned_blocks_meta.get(root, []))
-            if not assigned_blocks:
-                i = block_ids.index(root)
-                assigned = [j for j in range(N) if round(assignment[j, i]) == 1]
-                if not assigned:
-                    continue
-                assigned_blocks = [block_ids[j] for j in assigned]
+            for gi in (design.district_routes.get(root, [])):
+                bid = block_ids[gi]
+                all_cp_positions[bid] = (block_pos_km[bid], root)
+        demand_by_root: Dict[str, List[str]] = {r: [] for r in roots_iter}
+        if all_cp_positions:
+            cp_list = list(all_cp_positions.keys())
+            cp_pos_arr = np.array([block_pos_km[c] for c in cp_list])
+            for b in demand_blocks:
+                dists = np.linalg.norm(cp_pos_arr - block_pos_km[b], axis=1)
+                nearest_cp = cp_list[int(np.argmin(dists))]
+                nearest_root = all_cp_positions[nearest_cp][1]
+                demand_by_root[nearest_root].append(b)
+
+        for root in roots_iter:
+            # Reachable blocks: geometric corridor, for LP domain
+            reachable_blocks = list(reachable_blocks_meta.get(root, []))
+            if not reachable_blocks:
+                reachable_blocks = list(assigned_blocks_meta.get(root, []))
+
             T_i = design.dispatch_intervals.get(root, 1.0)
-            district_prob = sum(prob_dict.get(b, 0.0) for b in assigned_blocks)
+
+            # Merge: corridor-reachable + nearest-checkpoint demand blocks
+            demand_stops = demand_by_root.get(root, [])
+            all_blocks_list = sorted(set(reachable_blocks) | set(demand_stops))
+            district_prob = sum(prob_dict.get(b, 0.0) for b in all_blocks_list)
 
             # Build checkpoint list from district_routes
             route_global = design.district_routes.get(root, [])
             checkpoints = []
             for gi in route_global:
-                bid = block_ids[gi]
-                if bid in assigned_blocks:
-                    checkpoints.append(bid)
+                checkpoints.append(block_ids[gi])
             if not checkpoints and root in checkpoint_sequence_meta:
                 checkpoints = list(checkpoint_sequence_meta[root])
             if not checkpoints:
-                # All assigned blocks as checkpoints (NN order)
-                pts = np.array([block_pos_km[b] for b in assigned_blocks])
+                # All reachable blocks as checkpoints (NN order fallback)
+                pts = np.array([block_pos_km[b] for b in all_blocks_list])
                 order = _greedy_nn_route(pts, depot_pos_km)
                 order = _two_opt_improve(order, pts, depot_pos_km)
-                checkpoints = [assigned_blocks[o] for o in order]
+                checkpoints = [all_blocks_list[o] for o in order]
 
             m = len(checkpoints)
             cp_set = set(checkpoints)
-            all_blocks_set = set(assigned_blocks)
+            all_blocks_set = set(all_blocks_list)
 
-            # Build subpath arcs for this district's checkpoint route
-            # (Wrap as a ReferenceLine-like object for _build_initial_arcs)
+            # Build subpath arcs for this trip's checkpoint route.
+            # Uses reachable_blocks (not assigned_blocks) so the LP can
+            # detour to any stop within the corridor, matching the paper's
+            # global network semantics.
             line_obj = ReferenceLine(
                 idx=0, checkpoints=checkpoints,
                 reachable_locations=all_blocks_set,
@@ -2342,12 +2408,12 @@ class FRDetour(BaselineMethod):
             for s in range(n_eval):
                 demand_s = {block_ids[j]: int(demand_matrix[s, j])
                             for j in range(N)}
-                n_total = sum(demand_s.get(b, 0) for b in assigned_blocks)
+                n_total = sum(demand_s.get(b, 0) for b in all_blocks_set)
                 if n_total == 0:
                     acc_route_km += base_route_km
                     continue
 
-                # z_star = 1 for all assigned blocks (evaluation)
+                # z_star = 1 for all reachable blocks (paper-faithful evaluation)
                 z_star = {b: 1.0 for b in all_blocks_set}
 
                 # Same cost_mult as optimization so the detour trade-off
@@ -2381,7 +2447,7 @@ class FRDetour(BaselineMethod):
                     if detour_km is not None:
                         acc_route_km += access_km + detour_km
                         district_walk_km, service_counts, district_riders_s = _sample_passenger_assignments(
-                            demand_s, assigned_blocks, block_pos_km,
+                            demand_s, list(all_blocks_set), block_pos_km,
                             cp_set, u_vals, areas_km2, walk_rng)
                         district_walk_riders += district_walk_km
                         district_riders += district_riders_s
@@ -2392,10 +2458,10 @@ class FRDetour(BaselineMethod):
                     else:
                         # Fallback: checkpoint-only route, no detours
                         acc_route_km += base_route_km
-                        u_none = {b: 1.0 for b in assigned_blocks
+                        u_none = {b: 1.0 for b in all_blocks_set
                                   if b not in cp_set}
                         district_walk_km, service_counts, district_riders_s = _sample_passenger_assignments(
-                            demand_s, assigned_blocks, block_pos_km,
+                            demand_s, list(all_blocks_set), block_pos_km,
                             cp_set, u_none, areas_km2, walk_rng)
                         district_walk_riders += district_walk_km
                         district_riders += district_riders_s
@@ -2406,10 +2472,10 @@ class FRDetour(BaselineMethod):
                 else:
                     # Singleton or no arcs: just checkpoint tour, no detours
                     acc_route_km += base_route_km
-                    u_none = {b: 1.0 for b in assigned_blocks
+                    u_none = {b: 1.0 for b in all_blocks_set
                               if b not in cp_set}
                     district_walk_km, service_counts, district_riders_s = _sample_passenger_assignments(
-                        demand_s, assigned_blocks, block_pos_km,
+                        demand_s, list(all_blocks_set), block_pos_km,
                         cp_set, u_none, areas_km2, walk_rng)
                     district_walk_riders += district_walk_km
                     district_riders += district_riders_s
