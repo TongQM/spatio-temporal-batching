@@ -171,7 +171,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--Lambda", type=float, default=300.0)
     parser.add_argument("--wr", type=float, default=1.0)
     parser.add_argument("--wv", type=float, default=10.0)
-    parser.add_argument("--epsilon", type=float, default=1e-3)
+    parser.add_argument("--epsilon", type=float, default=1e-2)
     parser.add_argument("--use_odd", action="store_true")
     parser.add_argument("--rs_iters", type=int, default=100)
     parser.add_argument("--tp_candidates", type=int, default=25)
@@ -203,6 +203,9 @@ def _build_data_context(args: argparse.Namespace, use_odd: bool) -> Dict[str, An
 
 
 def _build_service_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
+    max_joint_k = min(10, args.grid_size * args.grid_size) if args.mode == "synthetic" else 10
+    joint_k_values = list(range(1, max_joint_k + 1))
+
     specs: Dict[str, Dict[str, Any]] = {
         "sp_lit": {
             "display_name": "SP-Lit (Carlsson)",
@@ -237,11 +240,10 @@ def _build_service_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "base_lambda": args.Lambda,
             "base_wr": args.wr,
             "settings": _primary_settings(
-                "synthetic_refine_factor", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+                "num_districts", joint_k_values
             ),
             "make_method": lambda s: JointNom(
                 max_iters=args.rs_iters,
-                synthetic_refine_factor=int(s["synthetic_refine_factor"]),
             ),
         },
         "joint_dro": {
@@ -250,11 +252,10 @@ def _build_service_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "base_lambda": args.Lambda,
             "base_wr": args.wr,
             "settings": _primary_settings(
-                "epsilon",
-                [1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1],
+                "num_districts", joint_k_values
             ),
             "make_method": lambda s: JointDRO(
-                epsilon=float(s["epsilon"]),
+                epsilon=args.epsilon,
                 max_iters=args.rs_iters,
             ),
         },
@@ -331,7 +332,7 @@ def _plot_cloud(df: pd.DataFrame, out_path: Path, meta: Dict[str, Any]) -> None:
     ax.set_ylabel("User time (hours per rider)")
     ax.set_title(
         "Baseline Performance Clouds\n"
-        f"K={meta['districts']}, Λ={meta['Lambda']}, wr={meta['wr']}, wv={meta['wv']}",
+        f"base K={meta['districts']}, Λ={meta['Lambda']}, wr={meta['wr']}, wv={meta['wv']}",
         fontsize=12,
         fontweight="bold",
     )
@@ -395,6 +396,7 @@ def main() -> None:
 
             print(f"  [{setting_index:02d}] {setting['setting_label']}")
             method = spec["make_method"](setting)
+            num_districts = int(setting.get("num_districts", args.districts))
             result = run_baseline(
                 method=method,
                 name=spec["display_name"],
@@ -402,7 +404,7 @@ def main() -> None:
                 prob_dict=prob_dict,
                 Omega_dict=omega_dict,
                 J_function=J_function,
-                num_districts=args.districts,
+                num_districts=num_districts,
                 Lambda=lambda_value,
                 wr=wr_value,
                 wv=args.wv,

@@ -212,6 +212,8 @@ def solve_design_scenario(
             "root": root,
             "checkpoints": checkpoints,
             "assigned_blocks": assigned_blocks,
+            "reachable_blocks": reachable_blocks,
+            "considered_blocks": list(all_blocks),
             "served_stops": served_stops,
             "skip_arcs": skip_arcs,
             "demand_s": demand_s,
@@ -298,30 +300,61 @@ def plot_fixed_route_panel(
         route_cp_sets[d] = set(route_global)
 
     block_route = np.full(len(block_ids), -1, dtype=int)
-    block_is_cp = np.ones(len(block_ids), dtype=bool)  # per-block: CP on its coloring route?
+    block_kind = np.full(len(block_ids), "none", dtype=object)  # checkpoint / corridor / served
+    demand_route = np.full(len(block_ids), -1, dtype=int)
+    demand_status = np.full(len(block_ids), "", dtype=object)  # fulfilled / unfulfilled
+    demand_count = np.zeros(len(block_ids), dtype=int)
     if services is not None:
         # With shared stops, a block may be a checkpoint on one route and
         # a corridor stop on another.  Assign each block to its "primary"
         # route: prefer showing it as a corridor stop (more informative
-        # for the detour visualization) over a checkpoint.
+        # for the detour visualization) over a checkpoint, and prefer
+        # actually served detour stops over merely corridor-reachable stops.
         route_order = [root_id for root_id, _ in active]
-        # First pass: corridor stops (served_stops) — these are the
-        # interesting detour-served blocks.
+        # First pass: realized served stops.
         for d, root_id in enumerate(route_order):
             info = services.get(root_id, {})
             for b in info.get("served_stops", set()):
                 ji = block_ids.index(b)
                 if block_route[ji] < 0:
                     block_route[ji] = d
-                    block_is_cp[ji] = False
-        # Second pass: checkpoints (fill in remaining unclaimed blocks)
+                    block_kind[ji] = "served"
+        # Second pass: corridor-reachable stops that were not served.
+        for d, root_id in enumerate(route_order):
+            info = services.get(root_id, {})
+            cp_set = set(info.get("checkpoints", []))
+            for b in info.get("reachable_blocks", []):
+                if b in cp_set or b in info.get("served_stops", set()):
+                    continue
+                ji = block_ids.index(b)
+                if block_route[ji] < 0:
+                    block_route[ji] = d
+                    block_kind[ji] = "corridor"
+        # Third pass: checkpoints (fill in remaining unclaimed blocks)
         for d, root_id in enumerate(route_order):
             info = services.get(root_id, {})
             for cp in info.get("checkpoints", []):
                 ji = block_ids.index(cp)
                 if block_route[ji] < 0:
                     block_route[ji] = d
-                    block_is_cp[ji] = True
+                    block_kind[ji] = "checkpoint"
+
+        # Classify realized positive-demand locations for this scenario.
+        status_rank = {"": -1, "unfulfilled": 0, "fulfilled": 1}
+        for d, root_id in enumerate(route_order):
+            info = services.get(root_id, {})
+            cp_set = set(info.get("checkpoints", []))
+            considered = set(info.get("considered_blocks", []))
+            served = set(info.get("served_stops", []))
+            for b, n_b in info.get("demand_s", {}).items():
+                if n_b <= 0 or (considered and b not in considered):
+                    continue
+                ji = block_ids.index(b)
+                status = "fulfilled" if (b in cp_set or b in served) else "unfulfilled"
+                if status_rank[status] > status_rank[demand_status[ji]]:
+                    demand_status[ji] = status
+                    demand_route[ji] = d
+                    demand_count[ji] = int(n_b)
     else:
         assignment = design.assignment
         for d, (root_id, route_global) in enumerate(active):
@@ -331,10 +364,10 @@ def plot_fixed_route_panel(
                     continue
                 if j in all_cps:
                     block_route[j] = d
-                    block_is_cp[j] = True
+                    block_kind[j] = "checkpoint"
                 elif delta > 0 and _in_corridor(j, route_global, block_pos_km, delta):
                     block_route[j] = d
-                    block_is_cp[j] = False
+                    block_kind[j] = "corridor"
 
     for j, bid in enumerate(block_ids):
         x, y = block_pos_km[j]
@@ -344,14 +377,37 @@ def plot_fixed_route_panel(
         if block_route[j] >= 0:
             root_id = active[block_route[j]][0]
             color = route_colors[root_id]
-            is_cp = block_is_cp[j]
-            marker = "s" if is_cp else "o"
-            size = 10 if is_cp else 7
-            edge = "black" if is_cp else "white"
-            alpha = 0.9 if is_cp else 0.7
-            ax.plot(x, y, marker, color=color, markersize=size,
-                    markeredgecolor=edge, markeredgewidth=0.7,
-                    alpha=alpha, zorder=4)
+            kind = block_kind[j]
+            if kind == "checkpoint":
+                ax.plot(x, y, "s", color=color, markersize=10,
+                        markeredgecolor="black", markeredgewidth=0.7,
+                        alpha=0.9, zorder=4)
+            elif kind == "served":
+                ax.plot(x, y, "o", color=color, markersize=7,
+                        markeredgecolor="white", markeredgewidth=0.7,
+                        alpha=0.85, zorder=4)
+            elif kind == "corridor":
+                ax.plot(x, y, "o", markerfacecolor="none", markersize=7,
+                        markeredgecolor=color, markeredgewidth=1.2,
+                        alpha=0.9, zorder=3.8)
+        if demand_count[j] > 0:
+            status = demand_status[j]
+            if status == "fulfilled":
+                label = f"F{demand_count[j]}"
+                text_color = "#166534"
+                bbox_fc = "#dcfce7"
+                bbox_ec = "#16a34a"
+            else:
+                label = f"U{demand_count[j]}"
+                text_color = "#991b1b"
+                bbox_fc = "#fee2e2"
+                bbox_ec = "#dc2626"
+            ax.text(
+                x - 0.10, y - 0.16, label, fontsize=5.5, color=text_color,
+                zorder=8,
+                bbox=dict(boxstyle="round,pad=0.12", facecolor=bbox_fc,
+                          edgecolor=bbox_ec, linewidth=0.5, alpha=0.95),
+            )
         ax.text(x + 0.12, y + 0.12, block_ids[j][-3:], fontsize=5,
                 color="black", alpha=0.6, zorder=7)
 
@@ -391,16 +447,24 @@ def plot_fixed_route_panel(
             markeredgecolor="black", markeredgewidth=0.8, zorder=6)
 
     n_lines = len(active)
-    n_cp = sum(1 for j in range(len(block_ids)) if block_route[j] >= 0 and block_is_cp[j])
-    n_corr = sum(1 for j in range(len(block_ids)) if block_route[j] >= 0 and not block_is_cp[j])
+    n_cp = sum(1 for j in range(len(block_ids)) if block_kind[j] == "checkpoint")
+    n_corr = sum(1 for j in range(len(block_ids)) if block_kind[j] == "corridor")
+    n_served = sum(1 for j in range(len(block_ids)) if block_kind[j] == "served")
     n_uncov = sum(1 for j in range(len(block_ids)) if block_route[j] < 0)
+    n_dem_f = int(sum(demand_count[j] for j in range(len(block_ids)) if demand_status[j] == "fulfilled"))
+    n_dem_u = int(sum(demand_count[j] for j in range(len(block_ids)) if demand_status[j] == "unfulfilled"))
 
     T_info = design.dispatch_intervals
     T_vals = list(T_info.values()) if T_info else []
     t_str = (f"T={T_vals[0]:.2f}h"
              if T_vals and len(set(f"{t:.2f}" for t in T_vals)) == 1
              else f"T={min(T_vals):.2f}-{max(T_vals):.2f}h" if T_vals else "")
-    ax.set_title(f"{title}\n{n_lines} routes, {t_str}\n{n_cp} CPs  {n_corr} corridor  {n_uncov} uncov",
+    title_line = f"{n_cp} CPs  {n_corr} corridor"
+    if services is not None:
+        title_line += f"  {n_served} served"
+        title_line += f"\nDemands: {n_dem_f} fulfilled  {n_dem_u} unfulfilled"
+    title_line += f"  {n_uncov} uncov"
+    ax.set_title(f"{title}\n{n_lines} routes, {t_str}\n{title_line}",
                  fontsize=9)
 
     if eval_result is not None:
@@ -453,18 +517,27 @@ def run_uniform_comparison():
         Lambda, wr, wv, crn_uniforms=shared_inputs["crn_uniforms"],
     )
 
+    scenario_to_plot, services_det = find_first_served_stop_scenario(
+        shared_design, fr_det, geodata, block_ids, block_pos_km, prob_dict,
+        shared_inputs["crn_uniforms"], Lambda, wr,
+    )
+    services_fr = solve_design_scenario(
+        shared_design, fr0, geodata, block_ids, block_pos_km, prob_dict,
+        shared_inputs["crn_uniforms"], Lambda, wr, scenario_to_plot,
+    )
+
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
     plot_fixed_route_panel(
         axes[0], shared_design, eval_fr, "Multi-FR (delta=0)", 0.0,
-        geodata, block_ids, block_pos_km,
+        geodata, block_ids, block_pos_km, services=services_fr,
     )
     plot_fixed_route_panel(
         axes[1], shared_design, eval_det, f"Multi-FR-Detour (delta={delta_detour})", delta_detour,
-        geodata, block_ids, block_pos_km,
+        geodata, block_ids, block_pos_km, services=services_det,
     )
     fig.suptitle(
         f"FR vs FR-Detour — uniform stopping locations, budget={budget}, Λ={Lambda}\n"
-        "same selected reference design + shared CRN samples",
+        f"same selected reference design + shared CRN samples, scenario={scenario_to_plot}",
         fontsize=14, fontweight="bold", y=1.01,
     )
     fig.tight_layout()

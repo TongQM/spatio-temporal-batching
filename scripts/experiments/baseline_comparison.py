@@ -255,7 +255,7 @@ def parse_args():
                    help='Rider time cost weight')
     p.add_argument('--wv', type=float, default=10.0,
                    help='Vehicle operating cost weight (per km)')
-    p.add_argument('--epsilon', type=float, default=1e-3,
+    p.add_argument('--epsilon', type=float, default=1e-2,
                    help='Wasserstein radius for Joint-DRO')
     p.add_argument('--use_odd', action='store_true',
                    help='Enable nonzero ODD costs (default: disabled, ODD cost = 0)')

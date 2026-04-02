@@ -44,6 +44,7 @@ names = [r["name"] for r in results]
 user_time = np.array([r["user"]["total_user_time_h"] for r in results])
 provider_cost = np.array([r["provider"]["provider_cost"] for r in results])
 total_cost = np.array([r["total_cost"] for r in results])
+provider_cost_component = np.array([r["provider"]["provider_cost"] for r in results])
 
 def _short(n):
     if "Multi-FR-Detour" in n: return "FR-Detour"
@@ -53,6 +54,10 @@ def _short(n):
     return n.split("(")[0].strip()
 
 short_names = [_short(n) for n in names]
+
+
+def _fmt_sig(value, sig=3):
+    return f"{value:.{sig}g}"
 
 # ── Style ─────────────────────────────────────────────────────────────────
 style_map = {
@@ -126,7 +131,7 @@ for i in range(len(names)):
     dx, dy = offsets.get(sn, (8, 8))
     ha = "left" if dx >= 0 else "right"
     va = "bottom" if dy >= 0 else "top"
-    label = f"{sn} (TC={total_cost[i]:.1f})"
+    label = f"{sn} (P={_fmt_sig(provider_cost_component[i])}, T={_fmt_sig(user_time[i])}h)"
     ax.annotate(
         label, (provider_cost[i], user_time[i]),
         xytext=(dx, dy), textcoords="offset points",
