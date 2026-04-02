@@ -1863,6 +1863,16 @@ class FRDetour(BaselineMethod):
                 obj_expr += penalty_low * slack_low_v[(li, ti)]
                 obj_expr += (1.0 / S) * gp.quicksum(
                     theta_v[(s, li, ti)] for s in range(S))
+                # First-stage passenger waiting cost is known once a trip
+                # interval and compatibility set are chosen, so it should
+                # live directly in the master objective rather than only in
+                # the ex-post upper-bound computation.
+                T_t = T_vals[ti]
+                for b in block_ids:
+                    if (b, li, ti) in z_v:
+                        obj_expr += (
+                            wr * T_t / 2.0 * prob_dict.get(b, 0.0) * z_v[(b, li, ti)]
+                        )
 
             # Coverage reward: -reward * prob[b] * z[b,ℓ,t]
             for (b, li, ti), var in z_v.items():
@@ -2355,10 +2365,14 @@ class FRDetour(BaselineMethod):
 
             T_i = design.dispatch_intervals.get(root, 1.0)
 
-            # Merge: corridor-reachable + nearest-checkpoint demand blocks
+            # Merge: corridor-reachable + nearest-checkpoint demand blocks.
+            # Demand generation must remain non-overlapping across routes:
+            # `demand_stops` is the unique set of locations whose riders are
+            # assigned to this route, while `reachable_blocks` only enlarges
+            # the set of candidate service points for detours.
             demand_stops = demand_by_root.get(root, [])
             all_blocks_list = sorted(set(reachable_blocks) | set(demand_stops))
-            district_prob = sum(prob_dict.get(b, 0.0) for b in all_blocks_list)
+            demand_prob = sum(prob_dict.get(b, 0.0) for b in demand_stops)
 
             # Build checkpoint list from district_routes
             route_global = design.district_routes.get(root, [])
@@ -2408,7 +2422,7 @@ class FRDetour(BaselineMethod):
             for s in range(n_eval):
                 demand_s = {block_ids[j]: int(demand_matrix[s, j])
                             for j in range(N)}
-                n_total = sum(demand_s.get(b, 0) for b in all_blocks_set)
+                n_total = sum(demand_s.get(b, 0) for b in demand_stops)
                 if n_total == 0:
                     acc_route_km += base_route_km
                     continue
@@ -2447,8 +2461,9 @@ class FRDetour(BaselineMethod):
                     if detour_km is not None:
                         acc_route_km += access_km + detour_km
                         district_walk_km, service_counts, district_riders_s = _sample_passenger_assignments(
-                            demand_s, list(all_blocks_set), block_pos_km,
-                            cp_set, u_vals, areas_km2, walk_rng)
+                            demand_s, demand_stops, block_pos_km,
+                            cp_set, u_vals, areas_km2, walk_rng,
+                            service_blocks=list(all_blocks_set))
                         district_walk_riders += district_walk_km
                         district_riders += district_riders_s
                         arrival_h = _build_service_arrival_times(
@@ -2461,8 +2476,9 @@ class FRDetour(BaselineMethod):
                         u_none = {b: 1.0 for b in all_blocks_set
                                   if b not in cp_set}
                         district_walk_km, service_counts, district_riders_s = _sample_passenger_assignments(
-                            demand_s, list(all_blocks_set), block_pos_km,
-                            cp_set, u_none, areas_km2, walk_rng)
+                            demand_s, demand_stops, block_pos_km,
+                            cp_set, u_none, areas_km2, walk_rng,
+                            service_blocks=list(all_blocks_set))
                         district_walk_riders += district_walk_km
                         district_riders += district_riders_s
                         arrival_h = _build_service_arrival_times(
@@ -2475,8 +2491,9 @@ class FRDetour(BaselineMethod):
                     u_none = {b: 1.0 for b in all_blocks_set
                               if b not in cp_set}
                     district_walk_km, service_counts, district_riders_s = _sample_passenger_assignments(
-                        demand_s, list(all_blocks_set), block_pos_km,
-                        cp_set, u_none, areas_km2, walk_rng)
+                        demand_s, demand_stops, block_pos_km,
+                        cp_set, u_none, areas_km2, walk_rng,
+                        service_blocks=list(all_blocks_set))
                     district_walk_riders += district_walk_km
                     district_riders += district_riders_s
                     arrival_h = _build_service_arrival_times(
@@ -2493,13 +2510,13 @@ class FRDetour(BaselineMethod):
             avg_tour_km = acc_route_km / n_eval
 
             # Accumulate into overall metrics
-            provider_d = (avg_tour_km / discount / T_i) * district_prob
+            provider_d = (avg_tour_km / discount / T_i) * demand_prob
             acc_in_district += provider_d
             acc_fleet += avg_tour_km / (speed * T_i)
             acc_walk_riders += district_walk_riders
             acc_riders += district_riders
-            acc_T_weighted += T_i * district_prob
-            acc_prob += district_prob
+            acc_T_weighted += T_i * demand_prob
+            acc_prob += demand_prob
 
         acc_prob = max(acc_prob, 1e-12)
 
