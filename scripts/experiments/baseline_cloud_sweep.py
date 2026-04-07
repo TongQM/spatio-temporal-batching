@@ -24,14 +24,16 @@ parameters, and the reported EvaluationResult for that induced baseline.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import sys
 import textwrap
+import traceback
 from datetime import datetime
 from itertools import product
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -71,6 +73,12 @@ SERVICE_STYLES = {
     "VCC": dict(color="#e377c2", marker="*"),
     "OD": dict(color="#7f7f7f", marker="X"),
 }
+
+
+_WORKER_ARGS: argparse.Namespace | None = None
+_WORKER_DATA_CTX: Dict[str, Any] | None = None
+_WORKER_SERVICE_SPECS: Dict[str, Dict[str, Any]] | None = None
+_WORKER_J_FUNCTION = None
 
 
 def _slugify(name: str) -> str:
@@ -228,6 +236,103 @@ def _save_json(path: Path, payload: Dict[str, Any]) -> None:
         json.dump(payload, f, indent=2)
 
 
+def _worker_init(args_dict: Dict[str, Any]) -> None:
+    global _WORKER_ARGS, _WORKER_DATA_CTX, _WORKER_SERVICE_SPECS, _WORKER_J_FUNCTION
+    _WORKER_ARGS = argparse.Namespace(**args_dict)
+    _WORKER_J_FUNCTION = identity_J if _WORKER_ARGS.use_odd else zero_J
+    _WORKER_DATA_CTX = _build_data_context(_WORKER_ARGS, use_odd=_WORKER_ARGS.use_odd)
+    _WORKER_SERVICE_SPECS = _build_service_specs(_WORKER_ARGS)
+
+
+def _worker_state(
+    args_dict: Dict[str, Any],
+) -> Tuple[argparse.Namespace, Dict[str, Any], Dict[str, Dict[str, Any]], Any]:
+    global _WORKER_ARGS, _WORKER_DATA_CTX, _WORKER_SERVICE_SPECS, _WORKER_J_FUNCTION
+    if _WORKER_ARGS is None:
+        _worker_init(args_dict)
+    assert _WORKER_ARGS is not None
+    assert _WORKER_DATA_CTX is not None
+    assert _WORKER_SERVICE_SPECS is not None
+    assert _WORKER_J_FUNCTION is not None
+    return _WORKER_ARGS, _WORKER_DATA_CTX, _WORKER_SERVICE_SPECS, _WORKER_J_FUNCTION
+
+
+def _run_setting_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    args, data_ctx, service_specs, J_function = _worker_state(task["args"])
+
+    service_key = task["service_key"]
+    setting_index = int(task["setting_index"])
+    spec = service_specs[service_key]
+    setting = spec["settings"][setting_index - 1]
+    baseline_dir = Path(task["baseline_dir"])
+    setting_path = baseline_dir / f"setting_{setting_index:02d}.json"
+
+    if task["resume"] and setting_path.exists():
+        with setting_path.open() as f:
+            payload = json.load(f)
+        return {
+            "status": "resumed",
+            "service_key": service_key,
+            "baseline_name": spec["display_name"],
+            "setting_index": setting_index,
+            "setting_label": setting["setting_label"],
+            "row": payload["row"],
+        }
+
+    geodata, prob_dict, omega_dict = data_ctx[spec["data_group"]]
+    method = spec["make_method"](setting)
+    result = run_baseline(
+        method=method,
+        name=spec["display_name"],
+        geodata=geodata,
+        prob_dict=prob_dict,
+        Omega_dict=omega_dict,
+        J_function=J_function,
+        num_districts=int(setting.get("num_districts", args.districts)),
+        Lambda=float(spec["base_lambda"]),
+        wr=spec["base_wr"],
+        wv=args.wv,
+        road_network=data_ctx["road_network"],
+        fleet_cost_rate=args.fleet_cost_rate,
+    )
+    if result is None:
+        return {
+            "status": "skipped",
+            "service_key": service_key,
+            "baseline_name": spec["display_name"],
+            "setting_index": setting_index,
+            "setting_label": setting["setting_label"],
+            "row": None,
+        }
+
+    row = _result_row(
+        baseline_name=spec["display_name"],
+        setting_index=setting_index,
+        lambda_value=float(spec["base_lambda"]),
+        wr_value=spec["base_wr"],
+        setting=setting,
+        result=result,
+    )
+    payload = {
+        "experiment": task["experiment_meta"],
+        "baseline": spec["display_name"],
+        "service_key": service_key,
+        "setting_index": setting_index,
+        "setting": setting,
+        "row": row,
+        "result": result.to_dict(),
+    }
+    _save_json(setting_path, payload)
+    return {
+        "status": "completed",
+        "service_key": service_key,
+        "baseline_name": spec["display_name"],
+        "setting_index": setting_index,
+        "setting_label": setting["setting_label"],
+        "row": row,
+    }
+
+
 def _build_output_dir(args: argparse.Namespace) -> Path:
     if args.out_dir is not None:
         out_dir = Path(args.out_dir)
@@ -273,6 +378,7 @@ def _parse_args() -> argparse.Namespace:
                             "sp_lit", "tp_lit", "joint_nom", "joint_dro", "vcc", "od",
                         ])
     parser.add_argument("--settings_per_baseline", type=int, default=20)
+    parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--out_dir", type=str, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--fr_delta", type=float, default=1.0)
@@ -538,8 +644,6 @@ def _plot_cloud(df: pd.DataFrame, out_path: Path, meta: Dict[str, Any]) -> None:
 def main() -> None:
     args = _parse_args()
     out_dir = _build_output_dir(args)
-    J_function = identity_J if args.use_odd else zero_J
-    data_ctx = _build_data_context(args, use_odd=args.use_odd)
     service_specs = _build_service_specs(args)
 
     aggregate_rows: List[Dict[str, Any]] = []
@@ -561,6 +665,7 @@ def main() -> None:
             for spec in service_specs.values()
         },
         "settings_per_baseline": args.settings_per_baseline,
+        "jobs": args.jobs,
         "fixed_lambda": True,
         "tp_candidates": args.tp_candidates,
         "tp_region_km": args.tp_region_km,
@@ -570,71 +675,107 @@ def main() -> None:
 
     _save_json(out_dir / "experiment.json", experiment_meta)
 
+    baseline_rows_map: Dict[str, List[Dict[str, Any]]] = {
+        service_key: [] for service_key in service_specs
+    }
+    tasks: List[Dict[str, Any]] = []
+    args_dict = vars(args).copy()
+
     for service_key, spec in service_specs.items():
         baseline_dir = out_dir / _slugify(spec["display_name"])
         baseline_dir.mkdir(parents=True, exist_ok=True)
         _save_json(baseline_dir / "settings.json", {"settings": spec["settings"]})
 
-        data_group = spec["data_group"]
-        geodata, prob_dict, omega_dict = data_ctx[data_group]
-        baseline_rows: List[Dict[str, Any]] = []
-
         print(f"\n=== {spec['display_name']} — {len(spec['settings'])} settings ===")
         for setting_index, setting in enumerate(spec["settings"], start=1):
-            lambda_value = float(spec["base_lambda"])
-            wr_value = spec["base_wr"]
             setting_path = baseline_dir / f"setting_{setting_index:02d}.json"
 
             if args.resume and setting_path.exists():
                 with setting_path.open() as f:
                     payload = json.load(f)
-                baseline_rows.append(payload["row"])
+                baseline_rows_map[service_key].append(payload["row"])
                 aggregate_rows.append(payload["row"])
                 print(f"  [{setting_index:02d}] resumed {setting['setting_label']}")
                 continue
 
-            print(f"  [{setting_index:02d}] {setting['setting_label']}")
-            method = spec["make_method"](setting)
-            num_districts = int(setting.get("num_districts", args.districts))
-            result = run_baseline(
-                method=method,
-                name=spec["display_name"],
-                geodata=geodata,
-                prob_dict=prob_dict,
-                Omega_dict=omega_dict,
-                J_function=J_function,
-                num_districts=num_districts,
-                Lambda=lambda_value,
-                wr=wr_value,
-                wv=args.wv,
-                road_network=data_ctx["road_network"],
-                fleet_cost_rate=args.fleet_cost_rate,
+            print(f"  [{setting_index:02d}] queued {setting['setting_label']}")
+            tasks.append(
+                {
+                    "args": args_dict,
+                    "experiment_meta": experiment_meta,
+                    "service_key": service_key,
+                    "setting_index": setting_index,
+                    "baseline_dir": str(baseline_dir),
+                    "resume": args.resume,
+                }
             )
-            if result is None:
-                continue
 
-            row = _result_row(
-                baseline_name=spec["display_name"],
-                setting_index=setting_index,
-                lambda_value=lambda_value,
-                wr_value=wr_value,
-                setting=setting,
-                result=result,
-            )
-            payload = {
-                "experiment": experiment_meta,
-                "baseline": spec["display_name"],
-                "service_key": service_key,
-                "setting_index": setting_index,
-                "setting": setting,
-                "row": row,
-                "result": result.to_dict(),
-            }
-            _save_json(setting_path, payload)
-            baseline_rows.append(row)
-            aggregate_rows.append(row)
+    if args.jobs == 1:
+        for task in tasks:
+            setting_index = task["setting_index"]
+            service_key = task["service_key"]
+            spec = service_specs[service_key]
+            setting = spec["settings"][setting_index - 1]
+            print(f"  [{spec['display_name']} #{setting_index:02d}] {setting['setting_label']}")
+            task_result = _run_setting_task(task)
+            if task_result["status"] == "completed":
+                baseline_rows_map[service_key].append(task_result["row"])
+                aggregate_rows.append(task_result["row"])
+            elif task_result["status"] == "resumed":
+                baseline_rows_map[service_key].append(task_result["row"])
+                aggregate_rows.append(task_result["row"])
+    else:
+        print(f"\nRunning {len(tasks)} sweep settings with {args.jobs} worker processes.")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=args.jobs,
+            initializer=_worker_init,
+            initargs=(args_dict,),
+        ) as executor:
+            future_map = {executor.submit(_run_setting_task, task): task for task in tasks}
+            for future in concurrent.futures.as_completed(future_map):
+                task = future_map[future]
+                service_key = task["service_key"]
+                spec = service_specs[service_key]
+                setting_index = task["setting_index"]
+                setting = spec["settings"][setting_index - 1]
+                try:
+                    task_result = future.result()
+                except Exception as exc:
+                    print(
+                        f"  [{spec['display_name']} #{setting_index:02d}] "
+                        f"ERROR — {setting['setting_label']} — {exc}"
+                    )
+                    traceback.print_exc()
+                    continue
 
+                status = task_result["status"]
+                if status == "completed":
+                    baseline_rows_map[service_key].append(task_result["row"])
+                    aggregate_rows.append(task_result["row"])
+                    print(
+                        f"  [{spec['display_name']} #{setting_index:02d}] "
+                        f"done {setting['setting_label']}"
+                    )
+                elif status == "resumed":
+                    baseline_rows_map[service_key].append(task_result["row"])
+                    aggregate_rows.append(task_result["row"])
+                    print(
+                        f"  [{spec['display_name']} #{setting_index:02d}] "
+                        f"resumed {setting['setting_label']}"
+                    )
+                else:
+                    print(
+                        f"  [{spec['display_name']} #{setting_index:02d}] "
+                        f"skipped {setting['setting_label']}"
+                    )
+
+    for service_key, spec in service_specs.items():
+        baseline_rows = sorted(
+            baseline_rows_map[service_key],
+            key=lambda row: int(row["setting_index"]),
+        )
         if baseline_rows:
+            baseline_dir = out_dir / _slugify(spec["display_name"])
             pd.DataFrame(baseline_rows).to_csv(baseline_dir / "summary.csv", index=False)
 
     if not aggregate_rows:
