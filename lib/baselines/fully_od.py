@@ -12,6 +12,7 @@ from lib.baselines.base import (
     BETA, BaselineMethod, EvaluationResult, ServiceDesign,
     VEHICLE_SPEED_KMH, _get_pos,
 )
+from lib.constants import DEFAULT_FLEET_COST_RATE
 
 
 class FullyOD(BaselineMethod):
@@ -74,6 +75,7 @@ class FullyOD(BaselineMethod):
         Lambda: float,
         wr: float,
         wv: float,
+        fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE,
         n_scenarios: int = 500,
     ) -> EvaluationResult:
         """Simulate depot-origin fully on-demand service.
@@ -150,7 +152,7 @@ class FullyOD(BaselineMethod):
         avg_route_km_per_cycle = total_route_km / max(n_scenarios, 1)
         in_district_cost = avg_route_km_per_cycle / max(T, 1e-9)
         fleet_size = avg_route_km_per_cycle / (VEHICLE_SPEED_KMH * max(T, 1e-9))
-        provider_cost = in_district_cost
+        provider_cost = in_district_cost + fleet_cost_rate * fleet_size
         user_cost = wr * total_user_time
         total_cost = provider_cost + user_cost
 
@@ -181,6 +183,7 @@ class FullyOD(BaselineMethod):
         Lambda: float,
         wr: float,
         wv: float,
+        fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE,
         beta: float = BETA,
         road_network=None,
     ) -> EvaluationResult:
@@ -193,4 +196,5 @@ class FullyOD(BaselineMethod):
             Lambda,
             wr,
             wv,
+            fleet_cost_rate,
         )

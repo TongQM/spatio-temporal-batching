@@ -26,6 +26,7 @@ from lib.baselines.base import (
     BETA, BaselineMethod, EvaluationResult, ServiceDesign,
     VEHICLE_SPEED_KMH, _get_pos,
 )
+from lib.constants import DEFAULT_FLEET_COST_RATE
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +399,7 @@ def _simulate_carlsson_design(
     Lambda: float,
     wr: float,
     resolution: int,
+    fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE,
     n_scenarios: int = 500,
 ) -> EvaluationResult:
     """Passenger-level simulation for depot-origin last-mile service.
@@ -539,9 +541,9 @@ def _simulate_carlsson_design(
         fleet_size=fleet_size,
         avg_dispatch_interval=avg_dispatch_interval,
         odd_cost=0.0,
-        provider_cost=provider_travel_rate,
+        provider_cost=provider_travel_rate + fleet_cost_rate * fleet_size,
         user_cost=user_cost,
-        total_cost=provider_travel_rate + user_cost,
+        total_cost=provider_travel_rate + fleet_cost_rate * fleet_size + user_cost,
     )
 
 
@@ -663,6 +665,7 @@ class CarlssonPartition(BaselineMethod):
         Lambda: float,
         wr: float,
         wv: float,
+        fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE,
     ) -> EvaluationResult:
         return _simulate_carlsson_design(
             design=design,
@@ -670,6 +673,7 @@ class CarlssonPartition(BaselineMethod):
             prob_dict=prob_dict,
             Lambda=Lambda,
             wr=wr,
+            fleet_cost_rate=fleet_cost_rate,
             resolution=int(design.service_metadata.get("resolution", self.resolution)),
         )
 
@@ -683,12 +687,13 @@ class CarlssonPartition(BaselineMethod):
         Lambda: float,
         wr: float,
         wv: float,
+        fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE,
         beta: float = BETA,
         road_network=None,
     ) -> EvaluationResult:
         result = self.custom_simulate(
             design, geodata, prob_dict, Omega_dict, J_function,
-            Lambda, wr, wv,
+            Lambda, wr, wv, fleet_cost_rate,
         )
         return EvaluationResult(
             name=self._name,

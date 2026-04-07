@@ -27,7 +27,9 @@ import argparse
 import json
 import os
 import sys
+import textwrap
 from datetime import datetime
+from itertools import product
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -51,6 +53,7 @@ from scripts.experiments.baseline_comparison import (
 from lib.baselines import (
     CarlssonPartition,
     FullyOD,
+    FRDetour,
     JointDRO,
     JointNom,
     TemporalOnly,
@@ -59,6 +62,8 @@ from lib.baselines import (
 
 
 SERVICE_STYLES = {
+    "Multi-FR (Jacquillat)": dict(color="#1f77b4", marker="s"),
+    "Multi-FR-Detour (Jacquillat)": dict(color="#2ca02c", marker="D"),
     "SP-Lit (Carlsson)": dict(color="#ff7f0e", marker="^"),
     "TP-Lit (Liu)": dict(color="#d62728", marker="v"),
     "Joint-Nom": dict(color="#9467bd", marker="o"),
@@ -96,6 +101,90 @@ def _primary_settings(primary_name: str, primary_values: List[Any]) -> List[Dict
         }
         for primary_value in primary_values
     ]
+
+
+def _cartesian_settings(param_grid: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
+    keys = list(param_grid.keys())
+    settings: List[Dict[str, Any]] = []
+    for combo in product(*(param_grid[key] for key in keys)):
+        setting = {key: value for key, value in zip(keys, combo)}
+        setting["setting_label"] = ", ".join(
+            f"{key}={_label_value(value)}" for key, value in zip(keys, combo)
+        )
+        settings.append(setting)
+    return settings
+
+
+def _spread_int_values(max_value: int, count: int) -> List[int]:
+    if max_value <= 0:
+        return [1]
+    if max_value <= count:
+        return list(range(1, max_value + 1))
+    return sorted(set(int(round(v)) for v in np.linspace(1, max_value, count)))
+
+
+def _convex_hull(points: np.ndarray) -> np.ndarray:
+    """Monotone chain convex hull for 2D points."""
+    if len(points) <= 1:
+        return points
+    pts = np.unique(points, axis=0)
+    if len(pts) <= 2:
+        return pts
+
+    pts = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+
+    upper = []
+    for p in pts[::-1]:
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+
+    hull = np.array(lower[:-1] + upper[:-1], dtype=float)
+    return hull
+
+
+def _filter_cloud_outliers(group: pd.DataFrame) -> pd.DataFrame:
+    """Drop extreme cloud outliers per baseline for plotting only."""
+    if len(group) < 5:
+        return group
+
+    x = np.log10(group["Provider cost"].to_numpy(dtype=float))
+    y = group["User Total (h)"].to_numpy(dtype=float)
+
+    def mod_z(arr: np.ndarray) -> np.ndarray:
+        med = np.median(arr)
+        mad = np.median(np.abs(arr - med))
+        if mad < 1e-12:
+            return np.zeros_like(arr)
+        return 0.6745 * (arr - med) / mad
+
+    zx = np.abs(mod_z(x))
+    zy = np.abs(mod_z(y))
+    keep = (zx <= 2.5) & (zy <= 2.5)
+    if keep.sum() >= max(3, len(group) - 2):
+        return group.loc[group.index[keep]]
+
+    # Fallback: trim the most extreme high-user-time point if it is clearly
+    # separated from the rest. This keeps a single runaway point from
+    # dominating the cloud hull.
+    y_vals = group["User Total (h)"].to_numpy(dtype=float)
+    order = np.argsort(y_vals)
+    if len(order) >= 4:
+        y_sorted = y_vals[order]
+        top_gap = y_sorted[-1] - y_sorted[-2]
+        baseline_gap = y_sorted[-2] - y_sorted[-3]
+        if top_gap > max(0.15, 2.0 * baseline_gap):
+            return group.drop(group.index[order[-1]])
+    return group
 
 
 def _result_row(
@@ -171,6 +260,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--Lambda", type=float, default=300.0)
     parser.add_argument("--wr", type=float, default=1.0)
     parser.add_argument("--wv", type=float, default=10.0)
+    parser.add_argument("--fleet_cost_rate", type=float, default=0.0)
     parser.add_argument("--epsilon", type=float, default=1e-2)
     parser.add_argument("--use_odd", action="store_true")
     parser.add_argument("--rs_iters", type=int, default=100)
@@ -179,11 +269,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--tp_region_low", type=float, default=-0.5)
     parser.add_argument("--services", nargs="*", default=None,
                         choices=[
+                            "multi_fr", "multi_fr_detour",
                             "sp_lit", "tp_lit", "joint_nom", "joint_dro", "vcc", "od",
                         ])
-    parser.add_argument("--settings_per_baseline", type=int, default=10)
+    parser.add_argument("--settings_per_baseline", type=int, default=20)
     parser.add_argument("--out_dir", type=str, default=None)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--fr_delta", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -196,6 +288,7 @@ def _build_data_context(args: argparse.Namespace, use_odd: bool) -> Dict[str, An
 
     return {
         "road_network": road_network,
+        "fr": (grid_geodata, grid_prob, grid_omega),
         "grid": (grid_geodata, grid_prob, grid_omega),
         "tp": (grid_geodata, grid_prob, grid_omega),
         "od": (grid_geodata, grid_prob, grid_omega),
@@ -203,18 +296,66 @@ def _build_data_context(args: argparse.Namespace, use_odd: bool) -> Dict[str, An
 
 
 def _build_service_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
-    max_joint_k = min(10, args.grid_size * args.grid_size) if args.mode == "synthetic" else 10
+    max_joint_k = min(20, args.grid_size * args.grid_size) if args.mode == "synthetic" else 20
     joint_k_values = list(range(1, max_joint_k + 1))
+    paired_k_values = _spread_int_values(max_joint_k, 4)
+    fr_fleet_values = list(range(1, 21))
+    fr_detour_fleet_values = _spread_int_values(20, 5)
+    sp_t_values = [0.10, 0.20, 0.30, 0.50, 0.80]
+    tp_t_values = [0.05, 0.10, 0.15, 0.25, 0.40]
+    tp_max_fleet_values = [20, 40, 80, 120]
+    vcc_fleet_values = [5, 10, 20, 35, 50]
+    vcc_walk_values = [0.10, 0.20, 0.30, 0.50]
+    dro_eps_values = [1e-3, 3e-3, 1e-2, 3e-2]
+    fr_delta_values = [0.25, 0.50, 1.00, 1.50]
+    od_tmin_values = list(np.geomspace(1.0 / 300.0, 1.0 / 30.0, 20))
 
     specs: Dict[str, Dict[str, Any]] = {
+        "multi_fr": {
+            "display_name": "Multi-FR (Jacquillat)",
+            "data_group": "fr",
+            "base_lambda": args.Lambda,
+            "base_wr": args.wr,
+            "varying_note": "vary route/fleet budget (delta=0)",
+            "settings": _primary_settings(
+                "max_fleet", fr_fleet_values
+            ),
+            "make_method": lambda s: FRDetour(
+                delta=0.0,
+                max_iters=args.rs_iters,
+                max_fleet=float(s["max_fleet"]),
+                name="Multi-FR (Jacquillat)",
+            ),
+        },
+        "multi_fr_detour": {
+            "display_name": "Multi-FR-Detour (Jacquillat)",
+            "data_group": "fr",
+            "base_lambda": args.Lambda,
+            "base_wr": args.wr,
+            "varying_note": "vary route/fleet budget and detour allowance",
+            "settings": _cartesian_settings(
+                {
+                    "max_fleet": fr_detour_fleet_values,
+                    "delta": fr_delta_values,
+                }
+            ),
+            "make_method": lambda s: FRDetour(
+                delta=float(s["delta"]),
+                max_iters=args.rs_iters,
+                max_fleet=float(s["max_fleet"]),
+            ),
+        },
         "sp_lit": {
             "display_name": "SP-Lit (Carlsson)",
             "data_group": "grid",
             "base_lambda": args.Lambda,
             "base_wr": args.wr,
-            "settings": _primary_settings(
-                "T_fixed",
-                [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.65, 0.80, 1.00],
+            "varying_note": "vary T_fixed and num_districts",
+            "settings": _cartesian_settings(
+                {
+                    "num_districts": paired_k_values,
+                    "T_fixed": sp_t_values,
+                }
             ),
             "make_method": lambda s: CarlssonPartition(T_fixed=float(s["T_fixed"])),
         },
@@ -223,12 +364,16 @@ def _build_service_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "data_group": "tp",
             "base_lambda": args.Lambda,
             "base_wr": args.wr,
-            "settings": _primary_settings(
-                "T_fixed",
-                [0.05, 0.075, 0.10, 0.125, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50],
+            "varying_note": "vary T_fixed and max_fleet",
+            "settings": _cartesian_settings(
+                {
+                    "T_fixed": tp_t_values,
+                    "max_fleet": tp_max_fleet_values,
+                }
             ),
             "make_method": lambda s: TemporalOnly(
                 T_fixed=float(s["T_fixed"]),
+                max_fleet=int(s["max_fleet"]),
                 n_candidates=args.tp_candidates,
                 region_km=args.tp_region_km,
                 region_low=args.tp_region_low,
@@ -239,6 +384,7 @@ def _build_service_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "data_group": "grid",
             "base_lambda": args.Lambda,
             "base_wr": args.wr,
+            "varying_note": "vary num_districts",
             "settings": _primary_settings(
                 "num_districts", joint_k_values
             ),
@@ -251,11 +397,15 @@ def _build_service_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "data_group": "grid",
             "base_lambda": args.Lambda,
             "base_wr": args.wr,
-            "settings": _primary_settings(
-                "num_districts", joint_k_values
+            "varying_note": "vary num_districts and epsilon",
+            "settings": _cartesian_settings(
+                {
+                    "num_districts": [v for v in _spread_int_values(max_joint_k, 5) if v >= 1],
+                    "epsilon": dro_eps_values,
+                }
             ),
             "make_method": lambda s: JointDRO(
-                epsilon=args.epsilon,
+                epsilon=float(s["epsilon"]),
                 max_iters=args.rs_iters,
             ),
         },
@@ -264,56 +414,82 @@ def _build_service_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "data_group": "od",
             "base_lambda": args.Lambda,
             "base_wr": args.wr,
-            "settings": _primary_settings(
-                "fleet_size", [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
+            "varying_note": "vary fleet_size and max_walk_km",
+            "settings": _cartesian_settings(
+                {
+                    "fleet_size": vcc_fleet_values,
+                    "max_walk_km": vcc_walk_values,
+                }
             ),
-            "make_method": lambda s: VCC(fleet_size=int(s["fleet_size"])),
+            "make_method": lambda s: VCC(
+                fleet_size=int(s["fleet_size"]),
+                max_walk_km=float(s["max_walk_km"]),
+            ),
         },
         "od": {
             "display_name": "OD",
             "data_group": "od",
             "base_lambda": args.Lambda,
             "base_wr": args.wr,
+            "varying_note": "vary T_min",
             "settings": _primary_settings(
-                "T_min",
-                [
-                    1.0 / 300.0,
-                    1.0 / 240.0,
-                    1.0 / 180.0,
-                    1.0 / 150.0,
-                    1.0 / 120.0,
-                    1.0 / 90.0,
-                    1.0 / 75.0,
-                    1.0 / 60.0,
-                    1.0 / 45.0,
-                    1.0 / 30.0,
-                ],
+                "T_min", od_tmin_values
             ),
             "make_method": lambda s: FullyOD(T_min=float(s["T_min"])),
         },
     }
 
-    selected = args.services or ["sp_lit", "tp_lit", "joint_nom", "joint_dro", "vcc", "od"]
+    selected = args.services or [
+        "multi_fr", "multi_fr_detour",
+        "sp_lit", "tp_lit", "joint_nom", "joint_dro", "vcc", "od"
+    ]
     for key in selected:
         specs[key]["settings"] = specs[key]["settings"][:args.settings_per_baseline]
     return {key: specs[key] for key in selected}
 
 
 def _plot_cloud(df: pd.DataFrame, out_path: Path, meta: Dict[str, Any]) -> None:
-    fig, ax = plt.subplots(figsize=(10, 7))
+    fig = plt.figure(figsize=(10.5, 8.8))
+    gs = fig.add_gridspec(nrows=2, ncols=1, height_ratios=[12, 1.8], hspace=0.18)
+    ax = fig.add_subplot(gs[0, 0])
+    notes_ax = fig.add_subplot(gs[1, 0])
+    notes_ax.axis("off")
 
     for baseline_name, group in df.groupby("baseline", sort=False):
+        group = _filter_cloud_outliers(group)
         style = SERVICE_STYLES.get(baseline_name, {"color": "#333333", "marker": "o"})
+        x = group["Provider cost"].to_numpy(dtype=float)
+        y = group["User Total (h)"].to_numpy(dtype=float)
+        valid = x > 0
+        x = x[valid]
+        y = y[valid]
+        if len(x) >= 3:
+            hull_xy = np.column_stack([np.log10(x), y])
+            hull = _convex_hull(hull_xy)
+            if len(hull) >= 3:
+                ax.fill(
+                    10 ** hull[:, 0],
+                    hull[:, 1],
+                    facecolor=style["color"],
+                    edgecolor=style["color"],
+                    alpha=0.08,
+                    linewidth=1.0,
+                    zorder=1,
+                )
+        elif len(x) == 2:
+            ax.plot(x, y, "-", color=style["color"], alpha=0.20, linewidth=2.0, zorder=1)
+
         ax.scatter(
             group["Provider cost"],
             group["User Total (h)"],
-            s=70,
-            alpha=0.55,
+            s=52,
+            alpha=0.78,
             color=style["color"],
             marker=style["marker"],
             edgecolors="white",
-            linewidths=0.5,
+            linewidths=0.6,
             label=baseline_name,
+            zorder=3,
         )
         cx = float(group["Provider cost"].median())
         cy = float(group["User Total (h)"].median())
@@ -338,7 +514,23 @@ def _plot_cloud(df: pd.DataFrame, out_path: Path, meta: Dict[str, Any]) -> None:
     )
     ax.grid(True, alpha=0.2, linestyle="--", which="both")
     ax.legend(loc="best", framealpha=0.92, fontsize=8)
-    fig.tight_layout()
+
+    notes = [
+        f"{name}: {meta['varying_notes'].get(name, 'vary setting')}"
+        for name in meta["display_services"]
+    ]
+    footer = textwrap.fill(
+        "Clouds use light convex hulls in log-provider-cost space. "
+        + "Varying by baseline: " + " | ".join(notes),
+        width=115,
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+    notes_ax.text(
+        0.0, 0.95, footer,
+        ha="left", va="top", fontsize=8.2, color="#444444",
+        transform=notes_ax.transAxes,
+    )
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
@@ -359,14 +551,21 @@ def main() -> None:
         "Lambda": args.Lambda,
         "wr": args.wr,
         "wv": args.wv,
+        "fleet_cost_rate": args.fleet_cost_rate,
         "epsilon": args.epsilon,
         "use_odd": args.use_odd,
         "services": list(service_specs.keys()),
+        "display_services": [spec["display_name"] for spec in service_specs.values()],
+        "varying_notes": {
+            spec["display_name"]: spec.get("varying_note", "vary setting")
+            for spec in service_specs.values()
+        },
         "settings_per_baseline": args.settings_per_baseline,
         "fixed_lambda": True,
         "tp_candidates": args.tp_candidates,
         "tp_region_km": args.tp_region_km,
         "tp_region_low": args.tp_region_low,
+        "fr_delta": args.fr_delta,
     }
 
     _save_json(out_dir / "experiment.json", experiment_meta)
@@ -409,6 +608,7 @@ def main() -> None:
                 wr=wr_value,
                 wv=args.wv,
                 road_network=data_ctx["road_network"],
+                fleet_cost_rate=args.fleet_cost_rate,
             )
             if result is None:
                 continue

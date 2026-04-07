@@ -29,7 +29,7 @@ from lib.baselines.base import (
     BETA, VEHICLE_SPEED_KMH, BaselineMethod, EvaluationResult, ServiceDesign,
     _get_pos, _nn_tsp_length,
 )
-from lib.constants import TSP_TRAVEL_DISCOUNT
+from lib.constants import DEFAULT_FLEET_COST_RATE, TSP_TRAVEL_DISCOUNT
 
 
 # ---------------------------------------------------------------------------
@@ -971,6 +971,7 @@ class TemporalOnly(BaselineMethod):
         Lambda: float,
         wr: float,
         wv: float,
+        fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE,
     ) -> EvaluationResult:
         """
         Scenario-based VRP evaluation with realized delivery times.
@@ -1087,7 +1088,7 @@ class TemporalOnly(BaselineMethod):
         fleet_size = avg_travel_km / (VEHICLE_SPEED_KMH * T)
         avg_dispatch_interval = T
 
-        provider_cost = total_travel_cost
+        provider_cost = total_travel_cost + fleet_cost_rate * fleet_size
         user_cost = wr * total_user_time
         total_cost = provider_cost + user_cost
 
@@ -1118,10 +1119,11 @@ class TemporalOnly(BaselineMethod):
         Lambda: float,
         wr: float,
         wv: float,
+        fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE,
         beta: float = BETA,
         road_network=None,
     ) -> EvaluationResult:
         return self.custom_simulate(
             design, geodata, prob_dict, Omega_dict, J_function,
-            Lambda, wr, wv,
+            Lambda, wr, wv, fleet_cost_rate,
         )

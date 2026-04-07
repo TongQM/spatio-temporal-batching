@@ -31,6 +31,7 @@ from lib.baselines.base import (
     _centroid_block,
     _get_pos,
 )
+from lib.constants import DEFAULT_FLEET_COST_RATE
 
 
 @dataclass(frozen=True)
@@ -637,6 +638,7 @@ class VCC(BaselineMethod):
         Lambda: float,
         wr: float,
         wv: float,
+        fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE,
     ) -> EvaluationResult:
         """Scenario-by-scenario offline DAR-VCC simulation."""
         if design.service_mode != "vcc":
@@ -665,7 +667,7 @@ class VCC(BaselineMethod):
         )
         avg_dispatch_interval = horizon_h
 
-        provider_cost = total_travel_cost
+        provider_cost = total_travel_cost + fleet_cost_rate * fleet_size
         user_cost = wr * total_user_time
         total_cost = provider_cost + user_cost
 
@@ -696,6 +698,7 @@ class VCC(BaselineMethod):
         Lambda: float,
         wr: float,
         wv: float,
+        fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE,
         beta: float = BETA,
         road_network=None,
     ) -> EvaluationResult:
@@ -709,6 +712,7 @@ class VCC(BaselineMethod):
             Lambda,
             wr,
             wv,
+            fleet_cost_rate,
         )
 
 

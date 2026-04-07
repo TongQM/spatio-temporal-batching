@@ -17,6 +17,7 @@ import numpy as np
 from lib.baselines.base import (
     BETA, BaselineMethod, EvaluationResult, ServiceDesign, evaluate_design, simulate_design,
 )
+from lib.constants import DEFAULT_FLEET_COST_RATE
 
 
 class _RefinedToyGeoData:
@@ -181,23 +182,25 @@ class JointNom(BaselineMethod):
         )
 
     def custom_simulate(self, design, geodata, prob_dict, Omega_dict, J_function,
-                        Lambda, wr, wv):
+                        Lambda, wr, wv, fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE):
         sim_geodata = design.service_metadata.get("refined_geodata", geodata)
         sim_prob = design.service_metadata.get("refined_prob_dict", prob_dict)
         sim_omega = design.service_metadata.get("refined_Omega_dict", Omega_dict)
         result = simulate_design(
-            design, sim_geodata, sim_prob, sim_omega, J_function, Lambda, wr, wv
+            design, sim_geodata, sim_prob, sim_omega, J_function, Lambda, wr, wv,
+            fleet_cost_rate=fleet_cost_rate,
         )
         return EvaluationResult(name="Joint-Nom",
                                 **{k: v for k, v in result.__dict__.items() if k != 'name'})
 
     def evaluate(self, design, geodata, prob_dict, Omega_dict, J_function,
-                 Lambda, wr, wv, beta=BETA, road_network=None) -> EvaluationResult:
+                 Lambda, wr, wv, fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE,
+                 beta=BETA, road_network=None) -> EvaluationResult:
         sim_geodata = design.service_metadata.get("refined_geodata", geodata)
         sim_prob = design.service_metadata.get("refined_prob_dict", prob_dict)
         sim_omega = design.service_metadata.get("refined_Omega_dict", Omega_dict)
         result = evaluate_design(design, sim_geodata, sim_prob, sim_omega, J_function,
-                                 Lambda, wr, wv, beta, road_network)
+                                 Lambda, wr, wv, fleet_cost_rate, beta, road_network)
         return EvaluationResult(name="Joint-Nom",
                                 **{k: v for k, v in result.__dict__.items() if k != 'name'})
 
@@ -226,23 +229,25 @@ class JointDRO(BaselineMethod):
         )
 
     def custom_simulate(self, design, geodata, prob_dict, Omega_dict, J_function,
-                        Lambda, wr, wv):
+                        Lambda, wr, wv, fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE):
         sim_geodata = design.service_metadata.get("refined_geodata", geodata)
         sim_prob = design.service_metadata.get("refined_prob_dict", prob_dict)
         sim_omega = design.service_metadata.get("refined_Omega_dict", Omega_dict)
         result = simulate_design(
-            design, sim_geodata, sim_prob, sim_omega, J_function, Lambda, wr, wv
+            design, sim_geodata, sim_prob, sim_omega, J_function, Lambda, wr, wv,
+            fleet_cost_rate=fleet_cost_rate,
         )
         return EvaluationResult(name="Joint-DRO",
                                 **{k: v for k, v in result.__dict__.items() if k != 'name'})
 
     def evaluate(self, design, geodata, prob_dict, Omega_dict, J_function,
-                 Lambda, wr, wv, beta=BETA, road_network=None) -> EvaluationResult:
+                 Lambda, wr, wv, fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE,
+                 beta=BETA, road_network=None) -> EvaluationResult:
         sim_geodata = design.service_metadata.get("refined_geodata", geodata)
         sim_prob = design.service_metadata.get("refined_prob_dict", prob_dict)
         sim_omega = design.service_metadata.get("refined_Omega_dict", Omega_dict)
         result = evaluate_design(design, sim_geodata, sim_prob, sim_omega, J_function,
-                                 Lambda, wr, wv, beta, road_network)
+                                 Lambda, wr, wv, fleet_cost_rate, beta, road_network)
         return EvaluationResult(name="Joint-DRO",
                                 **{k: v for k, v in result.__dict__.items() if k != 'name'})
 

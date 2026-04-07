@@ -187,7 +187,8 @@ def build_road_network(args):
 # ---------------------------------------------------------------------------
 
 def run_baseline(method, name, geodata, prob_dict, Omega_dict, J_function,
-                 num_districts, Lambda, wr, wv, road_network):
+                 num_districts, Lambda, wr, wv, road_network,
+                 fleet_cost_rate: float = 0.0):
     from lib.baselines.base import simulate_design, EvaluationResult
     try:
         print(f"  [{name}] designing …", end=" ", flush=True)
@@ -201,7 +202,7 @@ def run_baseline(method, name, geodata, prob_dict, Omega_dict, J_function,
         if hasattr(method, 'custom_simulate'):
             result = method.custom_simulate(
                 design, geodata, prob_dict, Omega_dict, J_function,
-                Lambda, wr, wv,
+                Lambda, wr, wv, fleet_cost_rate,
             )
         else:
             # Methods with custom route costs (FR, VCC) provide overrides
@@ -215,6 +216,7 @@ def run_baseline(method, name, geodata, prob_dict, Omega_dict, J_function,
             result = simulate_design(
                 design, geodata, prob_dict, Omega_dict, J_function,
                 Lambda, wr, wv,
+                fleet_cost_rate=fleet_cost_rate,
                 walk_time_override=walk_time_h,
                 tour_km_overrides=tour_km_overrides,
             )
@@ -255,6 +257,8 @@ def parse_args():
                    help='Rider time cost weight')
     p.add_argument('--wv', type=float, default=10.0,
                    help='Vehicle operating cost weight (per km)')
+    p.add_argument('--fleet_cost_rate', type=float, default=0.0,
+                   help='Provider cost per active vehicle-equivalent')
     p.add_argument('--epsilon', type=float, default=1e-2,
                    help='Wasserstein radius for Joint-DRO')
     p.add_argument('--use_odd', action='store_true',
@@ -389,6 +393,7 @@ def main():
             wr=bl_wr,
             wv=args.wv,
             road_network=road_network,
+            fleet_cost_rate=args.fleet_cost_rate,
         )
         if result is not None:
             results.append(result)
@@ -408,6 +413,7 @@ def main():
         "Lambda":       args.Lambda,
         "wr":           args.wr,
         "wv":           args.wv,
+        "fleet_cost_rate": args.fleet_cost_rate,
         "epsilon":      args.epsilon,
         "use_odd":      args.use_odd,
         "T_fixed":      args.T_fixed,

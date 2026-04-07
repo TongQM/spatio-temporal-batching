@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from lib.constants import TSP_TRAVEL_DISCOUNT
+from lib.constants import DEFAULT_FLEET_COST_RATE, TSP_TRAVEL_DISCOUNT
 
 BETA = 0.7120          # BHH constant
 VEHICLE_SPEED_KMH = 30.0   # assumed shuttle speed for fleet/transit-time estimates
@@ -137,6 +137,7 @@ class BaselineMethod(ABC):
         Lambda: float,
         wr: float,
         wv: float,
+        fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE,
         beta: float = BETA,
         road_network=None,
     ) -> EvaluationResult:
@@ -251,6 +252,7 @@ def simulate_design(
     Lambda: float,
     wr: float,
     wv: float,
+    fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE,
     beta: float = BETA,
     discount: float = TSP_TRAVEL_DISCOUNT,
     walk_time_override: float = 0.0,
@@ -425,7 +427,12 @@ def simulate_design(
     fleet_size        = acc_fleet
     avg_dispatch_interval = acc_T_w / total_prob
 
-    provider_cost = linehaul_cost + in_district_cost + odd_cost
+    provider_cost = (
+        linehaul_cost
+        + in_district_cost
+        + odd_cost
+        + fleet_cost_rate * fleet_size
+    )
     user_cost     = wr * total_user_time * total_prob
     total_cost    = provider_cost + user_cost
 
@@ -456,6 +463,7 @@ def evaluate_design(
     Lambda: float,
     wr: float,
     wv: float,
+    fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE,
     beta: float = BETA,
     road_network=None,
     discount: float = TSP_TRAVEL_DISCOUNT,
@@ -588,7 +596,12 @@ def evaluate_design(
     fleet_size         = acc_fleet
     avg_dispatch_interval = acc_T_weighted / acc_prob
 
-    provider_cost = linehaul_cost + in_district_cost + odd_cost
+    provider_cost = (
+        linehaul_cost
+        + in_district_cost
+        + odd_cost
+        + fleet_cost_rate * fleet_size
+    )
     user_cost     = wr * total_user_time * acc_prob   # aggregate over demand
     total_cost    = provider_cost + user_cost
 

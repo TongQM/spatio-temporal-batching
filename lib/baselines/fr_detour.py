@@ -74,7 +74,7 @@ from lib.baselines.base import (
     BETA, VEHICLE_SPEED_KMH, BaselineMethod, EvaluationResult, ServiceDesign,
     _get_pos,
 )
-from lib.constants import TSP_TRAVEL_DISCOUNT
+from lib.constants import DEFAULT_FLEET_COST_RATE, TSP_TRAVEL_DISCOUNT
 
 
 # ---------------------------------------------------------------------------
@@ -2246,11 +2246,12 @@ class FRDetour(BaselineMethod):
         prob_dict: Dict[str, float], Omega_dict,
         J_function: Callable, Lambda: float,
         wr: float, wv: float,
+        fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE,
     ) -> EvaluationResult:
         """Dispatch to evaluate() so run_baseline uses FR-specific costs."""
         return self.evaluate(
             design, geodata, prob_dict, Omega_dict, J_function,
-            Lambda, wr, wv)
+            Lambda, wr, wv, fleet_cost_rate=fleet_cost_rate)
 
     # ------------------------------------------------------------------
     # Evaluate — subpath routing (same model as optimization)
@@ -2261,6 +2262,7 @@ class FRDetour(BaselineMethod):
         prob_dict: Dict[str, float], Omega_dict,
         J_function: Callable, Lambda: float,
         wr: float, wv: float,
+        fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE,
         beta: float = BETA, road_network=None,
         crn_uniforms: Optional[np.ndarray] = None,
     ) -> EvaluationResult:
@@ -2530,7 +2532,7 @@ class FRDetour(BaselineMethod):
         fleet_size = float(acc_fleet)
         avg_dispatch_interval = acc_T_weighted / acc_prob
 
-        provider_cost = in_district_cost  # no linehaul, no ODD
+        provider_cost = in_district_cost + fleet_cost_rate * fleet_size
         user_cost = wr * total_user_time * acc_prob
         total_cost = provider_cost + user_cost
 
