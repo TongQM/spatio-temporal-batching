@@ -1,6 +1,7 @@
 # Data directories
 data/
 cache/
+papers/
 
 # Legacy paths (now inside data/)
 2020_target_block_population/
