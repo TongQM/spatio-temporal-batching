@@ -8,6 +8,18 @@ Adaptation of the double decomposition from:
 
 to a steady-state district-based service design setting.
 
+Repo interpretation:
+  - fixed common origin / depot
+  - stochastic destination demand
+  - last-mile delivery semantics
+
+Some earlier discussion in this repo used the reverse first-mile wording
+("stochastic origins to a common destination"). For the simplified Euclidean
+service model used here, those views are largely symmetric mathematically, but
+the intended semantic interpretation in code, plots, and docs is:
+  riders start from the common origin and are dropped off at realized
+  destination/service locations.
+
 Algorithm structure (from the paper):
   Double decomposition:
     - Outer: SAA multi-cut Benders with scenario-wise optimality cuts
@@ -30,7 +42,7 @@ Algorithm structure (from the paper):
 Adaptations from the paper (honest deviations):
 
   Structural:
-    - Stop-location demand aggregation (not individual passengers)
+    - Stop-location destination-demand aggregation (not individual passengers)
     - Steady-state timing surrogate: time_budget = (1+α)*direct_dist/speed,
       not the paper's scheduled checkpoint arrival times
     - Line library via angular partition + NN-TSP (not pre-existing network)
@@ -587,6 +599,7 @@ def _sample_global_service_assignments(
     areas_km2: Dict[str, float],
     service_point_info: Dict[str, Dict[str, object]],
     rng: np.random.Generator,
+    return_assignments: bool = False,
 ):
     """Assign sampled passengers to the nearest realized service point globally.
 
@@ -614,8 +627,18 @@ def _sample_global_service_assignments(
         - checkpoint_served
         - detour_stop_served
         - checkpoint_fallback
+        - served_here_checkpoint
+        - served_here_detour_stop
+        - walk_to_service
+        - walk_to_checkpoint
+        - walk_to_detour_stop
+    return_assignments : bool, optional
+        When true, also return a list of rider-level assignment records for
+        one-scenario visualization.
     """
     if not service_point_info:
+        if return_assignments:
+            return 0.0, 0.0, 0.0, {}, 0, {}, []
         return 0.0, 0.0, 0.0, {}, 0, {}
 
     service_locs = list(service_point_info.keys())
@@ -627,6 +650,7 @@ def _sample_global_service_assignments(
     total_riders = 0
     service_counts: Dict[str, int] = {}
     demand_outcomes: Dict[str, Dict[str, int]] = {}
+    assignment_records = [] if return_assignments else None
 
     selected_checkpoint_set = {
         loc for loc, info in service_point_info.items()
@@ -642,6 +666,11 @@ def _sample_global_service_assignments(
             "checkpoint_served": 0,
             "detour_stop_served": 0,
             "checkpoint_fallback": 0,
+            "served_here_checkpoint": 0,
+            "served_here_detour_stop": 0,
+            "walk_to_service": 0,
+            "walk_to_checkpoint": 0,
+            "walk_to_detour_stop": 0,
         }
 
         center = block_pos_km[b]
@@ -671,14 +700,40 @@ def _sample_global_service_assignments(
                 total_wait_h += headway_h - float(rng.uniform(0.0, headway_h))
             service_counts[service_loc] = service_counts.get(service_loc, 0) + 1
 
+            served_here = (service_loc == b)
+            if not served_here:
+                demand_outcomes[b]["walk_to_service"] += 1
+
             if info.get("kind") == "detour_stop":
                 demand_outcomes[b]["detour_stop_served"] += 1
+                if served_here:
+                    demand_outcomes[b]["served_here_detour_stop"] += 1
+                else:
+                    demand_outcomes[b]["walk_to_detour_stop"] += 1
             elif b in selected_checkpoint_set:
                 demand_outcomes[b]["checkpoint_served"] += 1
+                if served_here:
+                    demand_outcomes[b]["served_here_checkpoint"] += 1
+                else:
+                    demand_outcomes[b]["walk_to_checkpoint"] += 1
             else:
                 demand_outcomes[b]["checkpoint_fallback"] += 1
+                demand_outcomes[b]["walk_to_checkpoint"] += 1
 
-    return (
+            if return_assignments:
+                assignment_records.append(
+                    {
+                        "origin_block": b,
+                        "origin_pos": np.array(positions[p], dtype=float),
+                        "service_loc": service_loc,
+                        "service_pos": np.array(block_pos_km[service_loc], dtype=float),
+                        "service_kind": str(info.get("kind", "")),
+                        "walk_km": float(min_service_dist[p]),
+                        "walked_elsewhere": not served_here,
+                    }
+                )
+
+    result = (
         total_walk_riders,
         total_wait_h,
         total_invehicle_h,
@@ -686,6 +741,9 @@ def _sample_global_service_assignments(
         total_riders,
         demand_outcomes,
     )
+    if return_assignments:
+        return result + (assignment_records,)
+    return result
 
 
 def _ordered_subpath_locations(

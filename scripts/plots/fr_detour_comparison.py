@@ -6,6 +6,13 @@ This module provides:
 
 The helper functions are also imported by `visualize_designs.py` so the
 fixed-route panels use the same second-stage service semantics.
+
+Interpretation note:
+- these FR / FR-Detour plots use the repo's fixed-common-origin,
+  stochastic-destination last-mile semantics
+- earlier discussion sometimes used the reverse first-mile wording because the
+  simplified geometry is nearly symmetric, but captions and labels here should
+  be read as destination-demand service from the depot to realized destinations
 """
 from __future__ import annotations
 
@@ -294,6 +301,7 @@ def solve_design_scenario(
         service_counts,
         _total_riders,
         demand_outcomes,
+        assignment_records,
     ) = _sample_global_service_assignments(
         demand_s,
         demand_support_locations,
@@ -301,12 +309,14 @@ def solve_design_scenario(
         areas_km2,
         service_point_info,
         np.random.default_rng(42 + scenario_idx),
+        return_assignments=True,
     )
     services["_global"] = {
         "demand_s": demand_s,
         "demand_outcomes": demand_outcomes,
         "service_counts": service_counts,
         "service_point_info": service_point_info,
+        "assignment_records": assignment_records,
     }
     return services
 
@@ -392,11 +402,10 @@ def plot_fixed_route_panel(
 
     block_route = np.full(len(block_ids), -1, dtype=int)
     block_kind = np.full(len(block_ids), "none", dtype=object)  # checkpoint / corridor / served
-    demand_route = np.full(len(block_ids), -1, dtype=int)
     demand_count = np.zeros(len(block_ids), dtype=int)
-    demand_cp_served = np.zeros(len(block_ids), dtype=int)
-    demand_detour_served = np.zeros(len(block_ids), dtype=int)
-    demand_cp_fallback = np.zeros(len(block_ids), dtype=int)
+    walk_origin_count = np.zeros(len(block_ids), dtype=int)
+    service_load_cp = np.zeros(len(block_ids), dtype=int)
+    service_load_stop = np.zeros(len(block_ids), dtype=int)
     if services is not None:
         # With shared stops, a block may be a checkpoint on one route and
         # a corridor stop on another.  Assign each block to its "primary"
@@ -435,30 +444,22 @@ def plot_fixed_route_panel(
         global_info = services.get("_global", {})
         global_demand = global_info.get("demand_s", {})
         global_outcomes = global_info.get("demand_outcomes", {})
-        selected_cp_to_route = {}
-        for d, root_id in enumerate(route_order):
-            for cp in services.get(root_id, {}).get("checkpoints", []):
-                selected_cp_to_route[cp] = d
         service_point_info = global_info.get("service_point_info", {})
+        service_counts = global_info.get("service_counts", {})
+        for loc, count in service_counts.items():
+            ji = block_ids.index(loc)
+            info = service_point_info.get(loc, {})
+            if info.get("kind") == "detour_stop":
+                service_load_stop[ji] = int(count)
+            elif info.get("kind") == "checkpoint":
+                service_load_cp[ji] = int(count)
         for b, n_b in global_demand.items():
             if n_b <= 0:
                 continue
             ji = block_ids.index(b)
             outcome = global_outcomes.get(b, {})
             demand_count[ji] = int(n_b)
-            demand_cp_served[ji] = int(outcome.get("checkpoint_served", 0))
-            demand_detour_served[ji] = int(outcome.get("detour_stop_served", 0))
-            demand_cp_fallback[ji] = int(outcome.get("checkpoint_fallback", 0))
-            if b in selected_cp_to_route:
-                demand_route[ji] = selected_cp_to_route[b]
-            else:
-                chosen_route = None
-                for loc, info in service_point_info.items():
-                    if info.get("kind") == "detour_stop" and demand_detour_served[ji] > 0:
-                        chosen_route = route_order.index(info.get("root"))
-                        break
-                if chosen_route is not None:
-                    demand_route[ji] = chosen_route
+            walk_origin_count[ji] = int(outcome.get("walk_to_service", 0))
     else:
         assignment = design.assignment
         for d, (root_id, route_global) in enumerate(active):
@@ -472,6 +473,31 @@ def plot_fixed_route_panel(
                 elif delta > 0 and _in_corridor(j, route_global, block_pos_km, delta):
                     block_route[j] = d
                     block_kind[j] = "corridor"
+
+    if services is not None:
+        assignment_records = services.get("_global", {}).get("assignment_records", [])
+        for rec in assignment_records:
+            origin = np.array(rec["origin_pos"], dtype=float)
+            target = np.array(rec["service_pos"], dtype=float)
+            ax.plot(
+                [origin[0], target[0]],
+                [origin[1], target[1]],
+                linestyle="--",
+                color="#9ca3af",
+                linewidth=0.55,
+                alpha=0.45,
+                zorder=1.2,
+            )
+            ax.plot(
+                origin[0],
+                origin[1],
+                "o",
+                color="#6b7280",
+                markersize=2.0,
+                alpha=0.65,
+                markeredgewidth=0.0,
+                zorder=1.6,
+            )
 
     for j, bid in enumerate(block_ids):
         x, y = block_pos_km[j]
@@ -494,33 +520,6 @@ def plot_fixed_route_panel(
                 ax.plot(x, y, "o", markerfacecolor="none", markersize=7,
                         markeredgecolor=color, markeredgewidth=1.2,
                         alpha=0.9, zorder=3.8)
-        if demand_count[j] > 0:
-            parts = []
-            if demand_cp_served[j] > 0:
-                parts.append(f"C{demand_cp_served[j]}")
-            if demand_detour_served[j] > 0:
-                parts.append(f"D{demand_detour_served[j]}")
-            if demand_cp_fallback[j] > 0:
-                parts.append(f"W{demand_cp_fallback[j]}")
-            label = "/".join(parts) if parts else f"N{demand_count[j]}"
-            if demand_detour_served[j] > 0 and demand_cp_served[j] == 0 and demand_cp_fallback[j] == 0:
-                text_color = "#166534"
-                bbox_fc = "#dcfce7"
-                bbox_ec = "#16a34a"
-            elif demand_cp_fallback[j] > 0 and demand_detour_served[j] == 0 and demand_cp_served[j] == 0:
-                text_color = "#92400e"
-                bbox_fc = "#fef3c7"
-                bbox_ec = "#d97706"
-            else:
-                text_color = "#1d4ed8"
-                bbox_fc = "#dbeafe"
-                bbox_ec = "#2563eb"
-            ax.text(
-                x - 0.10, y - 0.16, label, fontsize=5.5, color=text_color,
-                zorder=8,
-                bbox=dict(boxstyle="round,pad=0.12", facecolor=bbox_fc,
-                          edgecolor=bbox_ec, linewidth=0.5, alpha=0.95),
-            )
         ax.text(x + 0.12, y + 0.12, block_ids[j][-3:], fontsize=5,
                 color="black", alpha=0.6, zorder=7)
 
@@ -564,9 +563,9 @@ def plot_fixed_route_panel(
     n_corr = sum(1 for j in range(len(block_ids)) if block_kind[j] == "corridor")
     n_served = sum(1 for j in range(len(block_ids)) if block_kind[j] == "served")
     n_uncov = sum(1 for j in range(len(block_ids)) if block_route[j] < 0)
-    n_dem_cp = int(demand_cp_served.sum())
-    n_dem_det = int(demand_detour_served.sum())
-    n_dem_fb = int(demand_cp_fallback.sum())
+    n_dem_cp = int(service_load_cp.sum())
+    n_dem_det = int(service_load_stop.sum())
+    n_dem_walk = int(walk_origin_count.sum())
 
     T_info = design.dispatch_intervals
     T_vals = list(T_info.values()) if T_info else []
@@ -576,7 +575,7 @@ def plot_fixed_route_panel(
     title_line = f"{n_cp} CPs  {n_corr} corridor"
     if services is not None:
         title_line += f"  {n_served} detour-served"
-        title_line += f"\nDemand units: {n_dem_cp} checkpoint  {n_dem_det} stop  {n_dem_fb} fallback"
+        title_line += f"\nDemand units: C={n_dem_cp}  D={n_dem_det}  W={n_dem_walk}"
     title_line += f"  {n_uncov} uncov"
     ax.set_title(f"{title}\n{n_lines} routes, {t_str}\n{title_line}",
                  fontsize=9)
