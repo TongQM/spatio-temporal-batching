@@ -95,7 +95,11 @@ def positions_array(geodata, block_ids):
     return np.array([np.array(geodata.pos[b], dtype=float) / 1000.0 for b in block_ids])
 
 
-def build_synthetic_instance(positions_km, checkpoint_ids=None):
+def build_synthetic_instance(
+    positions_km,
+    checkpoint_ids=None,
+    demand_support="stops_only",
+):
     """Build a complete synthetic instance from a positions dict.
 
     Parameters
@@ -105,18 +109,31 @@ def build_synthetic_instance(positions_km, checkpoint_ids=None):
     checkpoint_ids : list, optional
         Subset of IDs that serve as route checkpoints.  If None, all
         locations are checkpoints (backward compatible).
+    demand_support : {"stops_only", "all_locations"}, optional
+        Support of the synthetic demand distribution. ``"stops_only"``
+        preserves the historical behavior of placing demand only on
+        non-checkpoint locations. ``"all_locations"`` places demand on
+        every candidate service location, including checkpoint candidates.
 
     Returns (geodata, block_ids, block_pos_km, prob_dict, Omega_dict).
     """
     geodata = SyntheticGeoData(positions_km, checkpoint_ids=checkpoint_ids)
     block_ids = geodata.short_geoid_list
     block_pos_km = positions_array(geodata, block_ids)
-    # Demand probability is uniform over stopping locations (non-checkpoint)
-    # or all locations if no checkpoint distinction.
-    stop_ids = [b for b in block_ids if b not in set(geodata.checkpoint_ids)]
-    if not stop_ids:
-        stop_ids = block_ids  # fallback: all are stops
-    prob_dict = {b: 1.0 / len(stop_ids) if b in set(stop_ids) else 0.0
+
+    checkpoint_set = set(geodata.checkpoint_ids)
+    if demand_support == "stops_only":
+        support_ids = [b for b in block_ids if b not in checkpoint_set]
+        if not support_ids:
+            support_ids = block_ids  # fallback: all are stops
+    elif demand_support == "all_locations":
+        support_ids = list(block_ids)
+    else:
+        raise ValueError(
+            "demand_support must be one of {'stops_only', 'all_locations'}"
+        )
+
+    prob_dict = {b: 1.0 / len(support_ids) if b in set(support_ids) else 0.0
                  for b in block_ids}
     Omega_dict = {b: np.array([1.0]) for b in block_ids}
     return geodata, block_ids, block_pos_km, prob_dict, Omega_dict

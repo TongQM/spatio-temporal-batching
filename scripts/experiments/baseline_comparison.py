@@ -323,7 +323,10 @@ def main():
             low=args.fr_region_low, high=args.fr_region_high,
         )
         fr_geodata, _, _, fr_prob, _ = build_synthetic_instance(
-            fr_positions, fr_checkpoint_ids)
+            fr_positions,
+            fr_checkpoint_ids,
+            demand_support="all_locations",
+        )
         fr_omega = build_omega_dict(fr_geodata, use_odd=args.use_odd)
 
     fr_lambda = args.fr_lambda if args.fr_lambda is not None else args.Lambda

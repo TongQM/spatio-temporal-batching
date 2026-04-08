@@ -64,7 +64,11 @@ block_pos_km = np.array([
 # ── Uniform synthetic geodata for FR / FR-Detour ─────────────────────────
 _fr_positions_km, _fr_checkpoint_ids = make_uniform_positions()
 fr_geodata, fr_block_ids, fr_block_pos_km, fr_prob_dict, fr_Omega_dict = (
-    build_synthetic_instance(_fr_positions_km, _fr_checkpoint_ids)
+    build_synthetic_instance(
+        _fr_positions_km,
+        _fr_checkpoint_ids,
+        demand_support="all_locations",
+    )
 )
 
 DELTA_DETOUR = 0.8

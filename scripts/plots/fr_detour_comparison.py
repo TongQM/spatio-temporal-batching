@@ -26,8 +26,10 @@ from lib.baselines import FRDetour
 from lib.baselines.base import EvaluationResult, VEHICLE_SPEED_KMH
 from lib.baselines.fr_detour import (
     ReferenceLine,
+    _build_service_arrival_times,
     _build_initial_arcs,
     _crn_demand,
+    _sample_global_service_assignments,
     _solve_routing_lp_with_cg,
     _tour_distance,
 )
@@ -120,6 +122,32 @@ def reachable_locations_by_root(design, block_ids):
     return result
 
 
+def assigned_stop_points_by_root(design, block_ids):
+    meta = design.service_metadata.get("fr_detour", {})
+    assigned_stop_meta = meta.get("assigned_stop_points_by_root", {})
+    if assigned_stop_meta:
+        return {root: list(assigned_stop_meta.get(root, [])) for root in design.district_roots}
+    assigned = assigned_locations_by_root(design, block_ids)
+    checkpoints = selected_checkpoints_by_root(design, block_ids)
+    return {
+        root: [b for b in assigned.get(root, []) if b not in set(checkpoints.get(root, []))]
+        for root in design.district_roots
+    }
+
+
+def selected_checkpoints_by_root(design, block_ids):
+    meta = design.service_metadata.get("fr_detour", {})
+    selected = meta.get(
+        "selected_checkpoints_by_root",
+        meta.get("checkpoint_sequence_by_root", {}),
+    )
+    result = {root: list(selected.get(root, [])) for root in design.district_roots}
+    for root in design.district_roots:
+        if not result[root]:
+            result[root] = [block_ids[gi] for gi in design.district_routes.get(root, [])]
+    return result
+
+
 def solve_design_scenario(
     design,
     method,
@@ -130,25 +158,40 @@ def solve_design_scenario(
     crn_uniforms,
     Lambda,
     wr,
+    wv,
     scenario_idx,
 ):
-    """Solve one scenario and recover second-stage served stopping locations."""
+    """Solve one scenario and recover realized service points plus global access."""
     depot_pos = np.array(geodata.pos[design.depot_id], dtype=float) / 1000.0
     walk_saved_km = _walk_geometry(geodata, block_ids, method.delta)
     assigned_by_root = assigned_locations_by_root(design, block_ids)
-    reachable_by_root = reachable_locations_by_root(design, block_ids)
+    assigned_stops_by_root = assigned_stop_points_by_root(design, block_ids)
+    selected_cps_by_root = selected_checkpoints_by_root(design, block_ids)
     block_pos_map = {b: block_pos_km[i] for i, b in enumerate(block_ids)}
+    demand_support_locations = list(
+        design.service_metadata.get("fr_detour", {}).get(
+            "demand_support_locations",
+            [b for b in block_ids if prob_dict.get(b, 0.0) > 0.0],
+        )
+    )
+    areas_km2 = {b: float(geodata.get_area(b)) for b in block_ids}
     services = {}
+    route_T = []
+    for root in design.district_roots:
+        route_T.append(float(design.dispatch_intervals.get(root, 1.0)))
+    T_global = float(np.mean(route_T)) if route_T else 1.0
+    demand_matrix = _crn_demand(crn_uniforms, Lambda, T_global, prob_dict, block_ids)
+    demand_s = {block_ids[j]: int(demand_matrix[scenario_idx, j]) for j in range(len(block_ids))}
+    service_point_info = {}
 
     for root in design.district_roots:
+        checkpoints = list(selected_cps_by_root.get(root, []))
         assigned_blocks = list(assigned_by_root.get(root, []))
-        reachable_blocks = list(reachable_by_root.get(root, assigned_blocks))
+        assigned_stop_points = list(assigned_stops_by_root.get(root, []))
         route_global = design.district_routes.get(root, [])
-        checkpoints = [block_ids[gi] for gi in route_global]
         T_i = design.dispatch_intervals[root]
 
-        # Use reachable blocks (paper-faithful: shared global network)
-        all_blocks = set(reachable_blocks)
+        all_blocks = set(checkpoints) | set(assigned_stop_points)
         line_obj = ReferenceLine(
             idx=0,
             checkpoints=checkpoints,
@@ -160,15 +203,14 @@ def solve_design_scenario(
             method.delta, method.K_skip, VEHICLE_SPEED_KMH, method.alpha_time,
         )
 
-        demand_matrix = _crn_demand(crn_uniforms, Lambda, T_i, prob_dict, block_ids)
-        demand_s = {block_ids[j]: int(demand_matrix[scenario_idx, j]) for j in range(len(block_ids))}
         z_star = {b: 1.0 for b in all_blocks}
         cp_set = set(checkpoints)
-        cost_mult = 1.0 / (TSP_TRAVEL_DISCOUNT * T_i) + wr / (2.0 * VEHICLE_SPEED_KMH)
+        cost_mult = 1.0 / (TSP_TRAVEL_DISCOUNT * T_i) + wv / (2.0 * VEHICLE_SPEED_KMH)
         walk_penalties = {
             b: (
                 method.coverage_penalty_factor
-                * wr
+                * method.walk_time_weight
+                * wv
                 * walk_saved_km.get(b, 0.0)
                 * demand_s.get(b, 0)
                 / method.walk_speed_kmh
@@ -176,9 +218,9 @@ def solve_design_scenario(
             for b in all_blocks
         }
 
-        u_vals = {b: 1.0 for b in all_blocks if b not in cp_set}
+        u_vals = {b: (0.0 if b in cp_set else 1.0) for b in all_blocks}
         active_arcs = []
-        if len(checkpoints) > 1 and arcs and sum(demand_s.get(b, 0) for b in assigned_blocks) > 0:
+        if len(checkpoints) > 1 and arcs:
             result = _solve_routing_lp_with_cg(
                 arcs,
                 line_obj,
@@ -204,21 +246,68 @@ def solve_design_scenario(
                 _, _, _, u_vals, active_arcs = result
 
         served_stops = {
-            b for b in all_blocks
-            if b not in cp_set and demand_s.get(b, 0) > 0 and u_vals.get(b, 1.0) < 0.5
+            b for b in assigned_stop_points
+            if u_vals.get(b, 1.0) < 0.5
         }
+        arrival_h = _build_service_arrival_times(
+            depot_pos, checkpoints, block_pos_map, active_arcs, VEHICLE_SPEED_KMH
+        )
+        for cp in checkpoints:
+            cp_info = {
+                "kind": "checkpoint",
+                "arrival_h": float(arrival_h.get(cp, 0.0)),
+                "headway_h": float(T_i),
+                "root": root,
+            }
+            prev = service_point_info.get(cp)
+            if prev is None or cp_info["arrival_h"] < prev.get("arrival_h", 1e18):
+                service_point_info[cp] = cp_info
+        for stop in served_stops:
+            stop_info = {
+                "kind": "detour_stop",
+                "arrival_h": float(arrival_h.get(stop, 0.0)),
+                "headway_h": float(T_i),
+                "root": root,
+            }
+            prev = service_point_info.get(stop)
+            if prev is None or stop_info["arrival_h"] < prev.get("arrival_h", 1e18):
+                service_point_info[stop] = stop_info
+
         skip_arcs = [(arc, flow) for arc, flow in active_arcs if arc.cp_to > arc.cp_from + 1]
         services[root] = {
             "root": root,
             "checkpoints": checkpoints,
             "assigned_blocks": assigned_blocks,
-            "reachable_blocks": reachable_blocks,
+            "assigned_stop_points": assigned_stop_points,
+            "reachable_blocks": assigned_stop_points,
             "considered_blocks": list(all_blocks),
             "served_stops": served_stops,
             "skip_arcs": skip_arcs,
             "demand_s": demand_s,
             "route_global": route_global,
         }
+
+    (
+        _walk_km,
+        _wait_h,
+        _inveh_h,
+        service_counts,
+        _total_riders,
+        demand_outcomes,
+    ) = _sample_global_service_assignments(
+        demand_s,
+        demand_support_locations,
+        block_pos_map,
+        areas_km2,
+        service_point_info,
+        np.random.default_rng(42 + scenario_idx),
+    )
+    services["_global"] = {
+        "demand_s": demand_s,
+        "demand_outcomes": demand_outcomes,
+        "service_counts": service_counts,
+        "service_point_info": service_point_info,
+    }
     return services
 
 
@@ -232,10 +321,11 @@ def find_first_skip_scenario(
     crn_uniforms,
     Lambda,
     wr,
+    wv,
 ):
     for s in range(int(crn_uniforms.shape[0])):
         services = solve_design_scenario(
-            design, method, geodata, block_ids, block_pos_km, prob_dict, crn_uniforms, Lambda, wr, s
+            design, method, geodata, block_ids, block_pos_km, prob_dict, crn_uniforms, Lambda, wr, wv, s
         )
         for root in design.district_roots:
             info = services.get(root)
@@ -254,16 +344,17 @@ def find_first_served_stop_scenario(
     crn_uniforms,
     Lambda,
     wr,
+    wv,
 ):
     for s in range(int(crn_uniforms.shape[0])):
         services = solve_design_scenario(
-            design, method, geodata, block_ids, block_pos_km, prob_dict, crn_uniforms, Lambda, wr, s
+            design, method, geodata, block_ids, block_pos_km, prob_dict, crn_uniforms, Lambda, wr, wv, s
         )
         for info in services.values():
             if info.get("served_stops"):
                 return s, services
     return 0, solve_design_scenario(
-        design, method, geodata, block_ids, block_pos_km, prob_dict, crn_uniforms, Lambda, wr, 0
+        design, method, geodata, block_ids, block_pos_km, prob_dict, crn_uniforms, Lambda, wr, wv, 0
     )
 
 
@@ -302,8 +393,10 @@ def plot_fixed_route_panel(
     block_route = np.full(len(block_ids), -1, dtype=int)
     block_kind = np.full(len(block_ids), "none", dtype=object)  # checkpoint / corridor / served
     demand_route = np.full(len(block_ids), -1, dtype=int)
-    demand_status = np.full(len(block_ids), "", dtype=object)  # fulfilled / unfulfilled
     demand_count = np.zeros(len(block_ids), dtype=int)
+    demand_cp_served = np.zeros(len(block_ids), dtype=int)
+    demand_detour_served = np.zeros(len(block_ids), dtype=int)
+    demand_cp_fallback = np.zeros(len(block_ids), dtype=int)
     if services is not None:
         # With shared stops, a block may be a checkpoint on one route and
         # a corridor stop on another.  Assign each block to its "primary"
@@ -323,7 +416,7 @@ def plot_fixed_route_panel(
         for d, root_id in enumerate(route_order):
             info = services.get(root_id, {})
             cp_set = set(info.get("checkpoints", []))
-            for b in info.get("reachable_blocks", []):
+            for b in info.get("assigned_stop_points", info.get("reachable_blocks", [])):
                 if b in cp_set or b in info.get("served_stops", set()):
                     continue
                 ji = block_ids.index(b)
@@ -339,22 +432,33 @@ def plot_fixed_route_panel(
                     block_route[ji] = d
                     block_kind[ji] = "checkpoint"
 
-        # Classify realized positive-demand locations for this scenario.
-        status_rank = {"": -1, "unfulfilled": 0, "fulfilled": 1}
+        global_info = services.get("_global", {})
+        global_demand = global_info.get("demand_s", {})
+        global_outcomes = global_info.get("demand_outcomes", {})
+        selected_cp_to_route = {}
         for d, root_id in enumerate(route_order):
-            info = services.get(root_id, {})
-            cp_set = set(info.get("checkpoints", []))
-            considered = set(info.get("considered_blocks", []))
-            served = set(info.get("served_stops", []))
-            for b, n_b in info.get("demand_s", {}).items():
-                if n_b <= 0 or (considered and b not in considered):
-                    continue
-                ji = block_ids.index(b)
-                status = "fulfilled" if (b in cp_set or b in served) else "unfulfilled"
-                if status_rank[status] > status_rank[demand_status[ji]]:
-                    demand_status[ji] = status
-                    demand_route[ji] = d
-                    demand_count[ji] = int(n_b)
+            for cp in services.get(root_id, {}).get("checkpoints", []):
+                selected_cp_to_route[cp] = d
+        service_point_info = global_info.get("service_point_info", {})
+        for b, n_b in global_demand.items():
+            if n_b <= 0:
+                continue
+            ji = block_ids.index(b)
+            outcome = global_outcomes.get(b, {})
+            demand_count[ji] = int(n_b)
+            demand_cp_served[ji] = int(outcome.get("checkpoint_served", 0))
+            demand_detour_served[ji] = int(outcome.get("detour_stop_served", 0))
+            demand_cp_fallback[ji] = int(outcome.get("checkpoint_fallback", 0))
+            if b in selected_cp_to_route:
+                demand_route[ji] = selected_cp_to_route[b]
+            else:
+                chosen_route = None
+                for loc, info in service_point_info.items():
+                    if info.get("kind") == "detour_stop" and demand_detour_served[ji] > 0:
+                        chosen_route = route_order.index(info.get("root"))
+                        break
+                if chosen_route is not None:
+                    demand_route[ji] = chosen_route
     else:
         assignment = design.assignment
         for d, (root_id, route_global) in enumerate(active):
@@ -391,17 +495,26 @@ def plot_fixed_route_panel(
                         markeredgecolor=color, markeredgewidth=1.2,
                         alpha=0.9, zorder=3.8)
         if demand_count[j] > 0:
-            status = demand_status[j]
-            if status == "fulfilled":
-                label = f"F{demand_count[j]}"
+            parts = []
+            if demand_cp_served[j] > 0:
+                parts.append(f"C{demand_cp_served[j]}")
+            if demand_detour_served[j] > 0:
+                parts.append(f"D{demand_detour_served[j]}")
+            if demand_cp_fallback[j] > 0:
+                parts.append(f"W{demand_cp_fallback[j]}")
+            label = "/".join(parts) if parts else f"N{demand_count[j]}"
+            if demand_detour_served[j] > 0 and demand_cp_served[j] == 0 and demand_cp_fallback[j] == 0:
                 text_color = "#166534"
                 bbox_fc = "#dcfce7"
                 bbox_ec = "#16a34a"
+            elif demand_cp_fallback[j] > 0 and demand_detour_served[j] == 0 and demand_cp_served[j] == 0:
+                text_color = "#92400e"
+                bbox_fc = "#fef3c7"
+                bbox_ec = "#d97706"
             else:
-                label = f"U{demand_count[j]}"
-                text_color = "#991b1b"
-                bbox_fc = "#fee2e2"
-                bbox_ec = "#dc2626"
+                text_color = "#1d4ed8"
+                bbox_fc = "#dbeafe"
+                bbox_ec = "#2563eb"
             ax.text(
                 x - 0.10, y - 0.16, label, fontsize=5.5, color=text_color,
                 zorder=8,
@@ -451,8 +564,9 @@ def plot_fixed_route_panel(
     n_corr = sum(1 for j in range(len(block_ids)) if block_kind[j] == "corridor")
     n_served = sum(1 for j in range(len(block_ids)) if block_kind[j] == "served")
     n_uncov = sum(1 for j in range(len(block_ids)) if block_route[j] < 0)
-    n_dem_f = int(sum(demand_count[j] for j in range(len(block_ids)) if demand_status[j] == "fulfilled"))
-    n_dem_u = int(sum(demand_count[j] for j in range(len(block_ids)) if demand_status[j] == "unfulfilled"))
+    n_dem_cp = int(demand_cp_served.sum())
+    n_dem_det = int(demand_detour_served.sum())
+    n_dem_fb = int(demand_cp_fallback.sum())
 
     T_info = design.dispatch_intervals
     T_vals = list(T_info.values()) if T_info else []
@@ -461,8 +575,8 @@ def plot_fixed_route_panel(
              else f"T={min(T_vals):.2f}-{max(T_vals):.2f}h" if T_vals else "")
     title_line = f"{n_cp} CPs  {n_corr} corridor"
     if services is not None:
-        title_line += f"  {n_served} served"
-        title_line += f"\nDemands: {n_dem_f} fulfilled  {n_dem_u} unfulfilled"
+        title_line += f"  {n_served} detour-served"
+        title_line += f"\nDemand units: {n_dem_cp} checkpoint  {n_dem_det} stop  {n_dem_fb} fallback"
     title_line += f"  {n_uncov} uncov"
     ax.set_title(f"{title}\n{n_lines} routes, {t_str}\n{title_line}",
                  fontsize=9)
@@ -488,56 +602,97 @@ def plot_fixed_route_panel(
 
 def run_uniform_comparison():
     positions_km, checkpoint_ids = make_uniform_positions()
-    geodata, block_ids, block_pos_km, prob_dict, Omega_dict = build_synthetic_instance(positions_km, checkpoint_ids)
+    geodata, block_ids, block_pos_km, prob_dict, Omega_dict = build_synthetic_instance(
+        positions_km,
+        checkpoint_ids,
+        demand_support="all_locations",
+    )
 
-    budget = 2
-    Lambda = 8.0
-    wr, wv = 1.0, 10.0
+    budget = 3
+    Lambda = 20.0
+    wr, wv = 2.0, 1.0
     rs_iters = 100
     delta_detour = 0.8
 
     shared_builder = FRDetour(delta=delta_detour, max_iters=rs_iters)
     shared_inputs = shared_builder._prepare_shared_inputs(geodata, budget)
-
-    print(f"  Designing shared reference network (budget={budget}, delta={delta_detour}) ...", flush=True)
-    fr_det = FRDetour(delta=delta_detour, max_iters=rs_iters)
-    shared_design = fr_det.design(
-        geodata, prob_dict, Omega_dict, identity_J, budget,
-        Lambda=Lambda, wr=wr, wv=wv, **shared_inputs,
+    common_kwargs = dict(
+        candidate_lines=shared_inputs["candidate_lines"],
+        block_pos_km=shared_inputs["block_pos_km"],
+        depot_id=shared_inputs["depot_id"],
+        crn_uniforms=shared_inputs["crn_uniforms"],
     )
+
     fr0 = FRDetour(delta=0.0, max_iters=rs_iters, name="Multi-FR")
+    fr_det = FRDetour(delta=delta_detour, max_iters=rs_iters)
+
+    print(f"  Designing FR (budget={budget}, delta=0.0) ...", flush=True)
+    fr_design = fr0.design(
+        geodata, prob_dict, Omega_dict, identity_J, budget,
+        Lambda=Lambda, wr=wr, wv=wv, **common_kwargs,
+    )
+    print(f"  Designing FR-Detour (budget={budget}, delta={delta_detour}) ...", flush=True)
+    det_design = fr_det.design(
+        geodata, prob_dict, Omega_dict, identity_J, budget,
+        Lambda=Lambda, wr=wr, wv=wv, **common_kwargs,
+    )
 
     print("  Evaluating ...", flush=True)
-    eval_fr = fr0.evaluate(
-        shared_design, geodata, prob_dict, Omega_dict, identity_J,
+    eval_fr_opt = fr0.evaluate(
+        fr_design, geodata, prob_dict, Omega_dict, identity_J,
         Lambda, wr, wv, crn_uniforms=shared_inputs["crn_uniforms"],
     )
-    eval_det = fr_det.evaluate(
-        shared_design, geodata, prob_dict, Omega_dict, identity_J,
+    eval_det_opt = fr_det.evaluate(
+        det_design, geodata, prob_dict, Omega_dict, identity_J,
+        Lambda, wr, wv, crn_uniforms=shared_inputs["crn_uniforms"],
+    )
+    eval_fr_shared = fr0.evaluate(
+        det_design, geodata, prob_dict, Omega_dict, identity_J,
+        Lambda, wr, wv, crn_uniforms=shared_inputs["crn_uniforms"],
+    )
+    eval_det_shared = fr_det.evaluate(
+        det_design, geodata, prob_dict, Omega_dict, identity_J,
         Lambda, wr, wv, crn_uniforms=shared_inputs["crn_uniforms"],
     )
 
-    scenario_to_plot, services_det = find_first_served_stop_scenario(
-        shared_design, fr_det, geodata, block_ids, block_pos_km, prob_dict,
-        shared_inputs["crn_uniforms"], Lambda, wr,
+    scenario_fr_opt, services_fr_opt = find_first_served_stop_scenario(
+        fr_design, fr0, geodata, block_ids, block_pos_km, prob_dict,
+        shared_inputs["crn_uniforms"], Lambda, wr, wv,
     )
-    services_fr = solve_design_scenario(
-        shared_design, fr0, geodata, block_ids, block_pos_km, prob_dict,
-        shared_inputs["crn_uniforms"], Lambda, wr, scenario_to_plot,
+    scenario_det_opt, services_det_opt = find_first_served_stop_scenario(
+        det_design, fr_det, geodata, block_ids, block_pos_km, prob_dict,
+        shared_inputs["crn_uniforms"], Lambda, wr, wv,
+    )
+    scenario_shared, services_det_shared = find_first_served_stop_scenario(
+        det_design, fr_det, geodata, block_ids, block_pos_km, prob_dict,
+        shared_inputs["crn_uniforms"], Lambda, wr, wv,
+    )
+    services_fr_shared = solve_design_scenario(
+        det_design, fr0, geodata, block_ids, block_pos_km, prob_dict,
+        shared_inputs["crn_uniforms"], Lambda, wr, wv, scenario_shared,
     )
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    fig, axes = plt.subplots(2, 2, figsize=(13, 11))
     plot_fixed_route_panel(
-        axes[0], shared_design, eval_fr, "Multi-FR (delta=0)", 0.0,
-        geodata, block_ids, block_pos_km, services=services_fr,
+        axes[0, 0], fr_design, eval_fr_opt, "Optimized FR", 0.0,
+        geodata, block_ids, block_pos_km, services=services_fr_opt,
     )
     plot_fixed_route_panel(
-        axes[1], shared_design, eval_det, f"Multi-FR-Detour (delta={delta_detour})", delta_detour,
-        geodata, block_ids, block_pos_km, services=services_det,
+        axes[0, 1], det_design, eval_det_opt, f"Optimized FR-Detour (delta={delta_detour})", delta_detour,
+        geodata, block_ids, block_pos_km, services=services_det_opt,
+    )
+    plot_fixed_route_panel(
+        axes[1, 0], det_design, eval_fr_shared, "Same design diagnostic: FR evaluation", 0.0,
+        geodata, block_ids, block_pos_km, services=services_fr_shared,
+    )
+    plot_fixed_route_panel(
+        axes[1, 1], det_design, eval_det_shared, f"Same design diagnostic: FR-Detour evaluation (delta={delta_detour})", delta_detour,
+        geodata, block_ids, block_pos_km, services=services_det_shared,
     )
     fig.suptitle(
-        f"FR vs FR-Detour — uniform stopping locations, budget={budget}, Λ={Lambda}\n"
-        f"same selected reference design + shared CRN samples, scenario={scenario_to_plot}",
+        "FR vs FR-Detour comparison\n"
+        f"Top row: optimized separately. Bottom row: same-design diagnostic on FR-Detour design.\n"
+        f"budget={budget}, Λ={Lambda}, shared CRN, scenarios=FR:{scenario_fr_opt} DET:{scenario_det_opt} shared:{scenario_shared}",
         fontsize=14, fontweight="bold", y=1.01,
     )
     fig.tight_layout()
@@ -550,15 +705,19 @@ def run_uniform_comparison():
 
 
 def run_uniform_diagnostic(wr=500.0):
-    budget = 2
-    Lambda = 8.0
-    wv = 10.0
+    budget = 5
+    Lambda = 300.0
+    wv = 1.0
     delta = 0.8
     n_saa = 20
     rs_iters = 30
 
     positions_km, checkpoint_ids = make_uniform_positions()
-    geodata, block_ids, block_pos_km, prob_dict, Omega_dict = build_synthetic_instance(positions_km, checkpoint_ids)
+    geodata, block_ids, block_pos_km, prob_dict, Omega_dict = build_synthetic_instance(
+        positions_km,
+        checkpoint_ids,
+        demand_support="all_locations",
+    )
     n_blocks = len(block_ids)
 
     shared_crn = np.random.default_rng(123).uniform(0.0, 1.0, size=(n_saa, n_blocks))
@@ -580,17 +739,17 @@ def run_uniform_diagnostic(wr=500.0):
     )
 
     scenario_fr, skip_fr = find_first_skip_scenario(
-        shared_design, fr0, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, wr
+        shared_design, fr0, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, wr, wv
     )
     scenario_det, skip_det = find_first_skip_scenario(
-        shared_design, fr_det, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, wr
+        shared_design, fr_det, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, wr, wv
     )
     scenario_to_plot = min(scenario_fr, scenario_det)
     services_fr = solve_design_scenario(
-        shared_design, fr0, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, wr, scenario_to_plot
+        shared_design, fr0, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, wr, wv, scenario_to_plot
     )
     services_det = solve_design_scenario(
-        shared_design, fr_det, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, wr, scenario_to_plot
+        shared_design, fr_det, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, wr, wv, scenario_to_plot
     )
 
     print("\n[FR] selected routes")
