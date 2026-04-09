@@ -24,7 +24,7 @@ import numpy as np
 
 from lib.baselines.base import (
     BETA, BaselineMethod, EvaluationResult, ServiceDesign,
-    VEHICLE_SPEED_KMH, _get_pos,
+    VEHICLE_SPEED_KMH, _effective_fleet_size, _get_pos, _nn_tsp_route,
 )
 from lib.constants import DEFAULT_FLEET_COST_RATE
 
@@ -356,42 +356,6 @@ def _recursive_partition(
 # Continuous-space last-mile simulation for SP-Lit
 # ---------------------------------------------------------------------------
 
-def _nn_route_from_depot(
-    depot_pos_km: np.ndarray,
-    points_km: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Nearest-neighbour route from depot through all points.
-
-    Returns
-    -------
-    order : permutation of point indices in visit order
-    cumulative_km : cumulative travel from depot to each visited point
-    total_route_km : depot -> points -> depot route length
-    """
-    n = len(points_km)
-    if n == 0:
-        return np.array([], dtype=int), np.array([], dtype=float), 0.0
-
-    remaining = list(range(n))
-    order: List[int] = []
-    cumulative: List[float] = []
-    cur = depot_pos_km.copy()
-    dist_so_far = 0.0
-
-    while remaining:
-        dists = [float(np.linalg.norm(points_km[j] - cur)) for j in remaining]
-        pos = int(np.argmin(dists))
-        nxt = remaining.pop(pos)
-        leg = float(np.linalg.norm(points_km[nxt] - cur))
-        dist_so_far += leg
-        order.append(nxt)
-        cumulative.append(dist_so_far)
-        cur = points_km[nxt]
-
-    dist_so_far += float(np.linalg.norm(cur - depot_pos_km))
-    return np.array(order, dtype=int), np.array(cumulative, dtype=float), dist_so_far
-
-
 def _simulate_carlsson_design(
     design: ServiceDesign,
     geodata,
@@ -501,7 +465,7 @@ def _simulate_carlsson_design(
             dest_points[:, 0] += rng.uniform(-0.5 * cell_dx, 0.5 * cell_dx, size=n_d)
             dest_points[:, 1] += rng.uniform(-0.5 * cell_dy, 0.5 * cell_dy, size=n_d)
 
-            _, cumulative_km, route_km = _nn_route_from_depot(depot_pos_km, dest_points)
+            _, cumulative_km, route_km = _nn_tsp_route(depot_pos_km, dest_points)
             invehicle_h = cumulative_km / VEHICLE_SPEED_KMH
 
             total_wait_h += float(waits.sum())
@@ -515,6 +479,10 @@ def _simulate_carlsson_design(
     ))
     fleet_size = float(sum(
         avg_route_km[d] / (VEHICLE_SPEED_KMH * max(T_dist[d], 1e-9))
+        for d in range(len(T_dist))
+    ))
+    raw_fleet_size = int(sum(
+        _effective_fleet_size(float(avg_route_km[d]), float(T_dist[d]))
         for d in range(len(T_dist))
     ))
 
@@ -539,11 +507,12 @@ def _simulate_carlsson_design(
         in_district_cost=provider_travel_rate,
         total_travel_cost=provider_travel_rate,
         fleet_size=fleet_size,
+        raw_fleet_size=raw_fleet_size,
         avg_dispatch_interval=avg_dispatch_interval,
         odd_cost=0.0,
-        provider_cost=provider_travel_rate + fleet_cost_rate * fleet_size,
+        provider_cost=provider_travel_rate + fleet_cost_rate * raw_fleet_size,
         user_cost=user_cost,
-        total_cost=provider_travel_rate + fleet_cost_rate * fleet_size + user_cost,
+        total_cost=provider_travel_rate + fleet_cost_rate * raw_fleet_size + user_cost,
     )
 
 

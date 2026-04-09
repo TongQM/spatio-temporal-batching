@@ -36,7 +36,7 @@ from lib.baselines.fr_detour import (
     _build_service_arrival_times,
     _build_initial_arcs,
     _crn_demand,
-    _sample_global_service_assignments,
+    _solve_projected_service_scenario,
     _solve_routing_lp_with_cg,
     _tour_distance,
 )
@@ -135,9 +135,16 @@ def assigned_stop_points_by_root(design, block_ids):
     if assigned_stop_meta:
         return {root: list(assigned_stop_meta.get(root, [])) for root in design.district_roots}
     assigned = assigned_locations_by_root(design, block_ids)
-    checkpoints = selected_checkpoints_by_root(design, block_ids)
+    checkpoint_candidates = set(
+        meta.get("checkpoint_candidate_locations", [])
+    )
+    if not checkpoint_candidates:
+        checkpoints = selected_checkpoints_by_root(design, block_ids)
+        checkpoint_candidates = {
+            cp for cps in checkpoints.values() for cp in cps
+        }
     return {
-        root: [b for b in assigned.get(root, []) if b not in set(checkpoints.get(root, []))]
+        root: [b for b in assigned.get(root, []) if b not in checkpoint_candidates]
         for root in design.district_roots
     }
 
@@ -169,11 +176,10 @@ def solve_design_scenario(
     scenario_idx,
 ):
     """Solve one scenario and recover realized service points plus global access."""
+    rider_time_weight = float(wr)
+    vehicle_cost_weight = float(wv)
     depot_pos = np.array(geodata.pos[design.depot_id], dtype=float) / 1000.0
     walk_saved_km = _walk_geometry(geodata, block_ids, method.delta)
-    assigned_by_root = assigned_locations_by_root(design, block_ids)
-    assigned_stops_by_root = assigned_stop_points_by_root(design, block_ids)
-    selected_cps_by_root = selected_checkpoints_by_root(design, block_ids)
     block_pos_map = {b: block_pos_km[i] for i, b in enumerate(block_ids)}
     demand_support_locations = list(
         design.service_metadata.get("fr_detour", {}).get(
@@ -189,134 +195,37 @@ def solve_design_scenario(
     T_global = float(np.mean(route_T)) if route_T else 1.0
     demand_matrix = _crn_demand(crn_uniforms, Lambda, T_global, prob_dict, block_ids)
     demand_s = {block_ids[j]: int(demand_matrix[scenario_idx, j]) for j in range(len(block_ids))}
-    service_point_info = {}
-
-    for root in design.district_roots:
-        checkpoints = list(selected_cps_by_root.get(root, []))
-        assigned_blocks = list(assigned_by_root.get(root, []))
-        assigned_stop_points = list(assigned_stops_by_root.get(root, []))
-        route_global = design.district_routes.get(root, [])
-        T_i = design.dispatch_intervals[root]
-
-        all_blocks = set(checkpoints) | set(assigned_stop_points)
-        line_obj = ReferenceLine(
-            idx=0,
-            checkpoints=checkpoints,
-            reachable_locations=all_blocks,
-            est_tour_km=_tour_distance(depot_pos, checkpoints, block_pos_map),
-        )
-        arcs = _build_initial_arcs(
-            line_obj, block_ids, block_pos_map,
-            method.delta, method.K_skip, VEHICLE_SPEED_KMH, method.alpha_time,
-        )
-
-        z_star = {b: 1.0 for b in all_blocks}
-        cp_set = set(checkpoints)
-        cost_mult = 1.0 / (TSP_TRAVEL_DISCOUNT * T_i) + wv / (2.0 * VEHICLE_SPEED_KMH)
-        walk_penalties = {
-            b: (
-                method.coverage_penalty_factor
-                * method.walk_time_weight
-                * wv
-                * walk_saved_km.get(b, 0.0)
-                * demand_s.get(b, 0)
-                / method.walk_speed_kmh
-            )
-            for b in all_blocks
-        }
-
-        u_vals = {b: (0.0 if b in cp_set else 1.0) for b in all_blocks}
-        active_arcs = []
-        if len(checkpoints) > 1 and arcs:
-            result = _solve_routing_lp_with_cg(
-                arcs,
-                line_obj,
-                block_ids,
-                block_pos_map,
-                len(checkpoints),
-                method.capacity,
-                z_star,
-                demand_s,
-                all_blocks,
-                cp_set,
-                cost_mult,
-                walk_penalties,
-                method.delta,
-                VEHICLE_SPEED_KMH,
-                method.alpha_time,
-                method.K_skip,
-                max_cg_iters=method.max_cg_iters,
-                return_solution=True,
-                return_active_arcs=True,
-            )
-            if result[0] is not None:
-                _, _, _, u_vals, active_arcs = result
-
-        served_stops = {
-            b for b in assigned_stop_points
-            if u_vals.get(b, 1.0) < 0.5
-        }
-        arrival_h = _build_service_arrival_times(
-            depot_pos, checkpoints, block_pos_map, active_arcs, VEHICLE_SPEED_KMH
-        )
-        for cp in checkpoints:
-            cp_info = {
-                "kind": "checkpoint",
-                "arrival_h": float(arrival_h.get(cp, 0.0)),
-                "headway_h": float(T_i),
-                "root": root,
-            }
-            prev = service_point_info.get(cp)
-            if prev is None or cp_info["arrival_h"] < prev.get("arrival_h", 1e18):
-                service_point_info[cp] = cp_info
-        for stop in served_stops:
-            stop_info = {
-                "kind": "detour_stop",
-                "arrival_h": float(arrival_h.get(stop, 0.0)),
-                "headway_h": float(T_i),
-                "root": root,
-            }
-            prev = service_point_info.get(stop)
-            if prev is None or stop_info["arrival_h"] < prev.get("arrival_h", 1e18):
-                service_point_info[stop] = stop_info
-
-        skip_arcs = [(arc, flow) for arc, flow in active_arcs if arc.cp_to > arc.cp_from + 1]
-        services[root] = {
-            "root": root,
-            "checkpoints": checkpoints,
-            "assigned_blocks": assigned_blocks,
-            "assigned_stop_points": assigned_stop_points,
-            "reachable_blocks": assigned_stop_points,
-            "considered_blocks": list(all_blocks),
-            "served_stops": served_stops,
-            "skip_arcs": skip_arcs,
-            "demand_s": demand_s,
-            "route_global": route_global,
-        }
-
-    (
-        _walk_km,
-        _wait_h,
-        _inveh_h,
-        service_counts,
-        _total_riders,
-        demand_outcomes,
-        assignment_records,
-    ) = _sample_global_service_assignments(
-        demand_s,
-        demand_support_locations,
+    scenario_result = _solve_projected_service_scenario(
+        design,
+        method,
+        geodata,
+        prob_dict,
+        block_ids,
         block_pos_map,
+        demand_s,
+        depot_pos,
         areas_km2,
-        service_point_info,
+        walk_saved_km,
+        rider_time_weight,
+        vehicle_cost_weight,
         np.random.default_rng(42 + scenario_idx),
         return_assignments=True,
     )
+    for root, info in scenario_result["route_services"].items():
+        services[root] = {
+            **info,
+            "assigned_blocks": list(info.get("assigned_locations", [])),
+            "reachable_blocks": list(info.get("assigned_stop_points", [])),
+            "considered_blocks": list(set(info.get("checkpoints", [])) | set(info.get("active_stop_points", []))),
+            "demand_s": demand_s,
+        }
     services["_global"] = {
         "demand_s": demand_s,
-        "demand_outcomes": demand_outcomes,
-        "service_counts": service_counts,
-        "service_point_info": service_point_info,
-        "assignment_records": assignment_records,
+        "demand_outcomes": scenario_result["demand_outcomes"],
+        "service_counts": scenario_result["service_counts"],
+        "service_point_info": scenario_result["service_point_info"],
+        "assignment_records": scenario_result["assignment_records"],
+        "projected_counts": scenario_result["projected_counts"],
     }
     return services
 
@@ -459,7 +368,7 @@ def plot_fixed_route_panel(
             ji = block_ids.index(b)
             outcome = global_outcomes.get(b, {})
             demand_count[ji] = int(n_b)
-            walk_origin_count[ji] = int(outcome.get("walk_to_service", 0))
+            walk_origin_count[ji] = int(outcome.get("reassigned_service", 0))
     else:
         assignment = design.assignment
         for d, (root_id, route_global) in enumerate(active):
@@ -608,12 +517,25 @@ def run_uniform_comparison():
     )
 
     budget = 3
-    Lambda = 20.0
-    wr, wv = 2.0, 1.0
-    rs_iters = 100
+    Lambda = 50.0
+    rider_time_weight = 10.0
+    vehicle_cost_weight = 1.0
+    rs_iters = 12
+    n_saa = 8
+    n_eval = 12
+    max_cg_iters = 10
+    t_values = [0.25, 0.5, 1.0]
     delta_detour = 0.8
 
-    shared_builder = FRDetour(delta=delta_detour, max_iters=rs_iters)
+    shared_builder = FRDetour(
+        delta=delta_detour,
+        max_iters=rs_iters,
+        n_saa=n_saa,
+        num_scenarios=n_eval,
+        max_cg_iters=max_cg_iters,
+        T_values=t_values,
+        show_progress=True,
+    )
     shared_inputs = shared_builder._prepare_shared_inputs(geodata, budget)
     common_kwargs = dict(
         candidate_lines=shared_inputs["candidate_lines"],
@@ -622,76 +544,69 @@ def run_uniform_comparison():
         crn_uniforms=shared_inputs["crn_uniforms"],
     )
 
-    fr0 = FRDetour(delta=0.0, max_iters=rs_iters, name="Multi-FR")
-    fr_det = FRDetour(delta=delta_detour, max_iters=rs_iters)
+    fr0 = FRDetour(
+        delta=0.0,
+        max_iters=rs_iters,
+        n_saa=n_saa,
+        num_scenarios=n_eval,
+        max_cg_iters=max_cg_iters,
+        T_values=t_values,
+        name="Multi-FR",
+        show_progress=True,
+    )
+    fr_det = FRDetour(
+        delta=delta_detour,
+        max_iters=rs_iters,
+        n_saa=n_saa,
+        num_scenarios=n_eval,
+        max_cg_iters=max_cg_iters,
+        T_values=t_values,
+        show_progress=True,
+    )
 
     print(f"  Designing FR (budget={budget}, delta=0.0) ...", flush=True)
     fr_design = fr0.design(
         geodata, prob_dict, Omega_dict, identity_J, budget,
-        Lambda=Lambda, wr=wr, wv=wv, **common_kwargs,
+        Lambda=Lambda, wr=rider_time_weight, wv=vehicle_cost_weight, **common_kwargs,
     )
     print(f"  Designing FR-Detour (budget={budget}, delta={delta_detour}) ...", flush=True)
     det_design = fr_det.design(
         geodata, prob_dict, Omega_dict, identity_J, budget,
-        Lambda=Lambda, wr=wr, wv=wv, **common_kwargs,
+        Lambda=Lambda, wr=rider_time_weight, wv=vehicle_cost_weight, **common_kwargs,
     )
 
     print("  Evaluating ...", flush=True)
     eval_fr_opt = fr0.evaluate(
         fr_design, geodata, prob_dict, Omega_dict, identity_J,
-        Lambda, wr, wv, crn_uniforms=shared_inputs["crn_uniforms"],
+        Lambda, rider_time_weight, vehicle_cost_weight, crn_uniforms=shared_inputs["crn_uniforms"],
     )
     eval_det_opt = fr_det.evaluate(
         det_design, geodata, prob_dict, Omega_dict, identity_J,
-        Lambda, wr, wv, crn_uniforms=shared_inputs["crn_uniforms"],
-    )
-    eval_fr_shared = fr0.evaluate(
-        det_design, geodata, prob_dict, Omega_dict, identity_J,
-        Lambda, wr, wv, crn_uniforms=shared_inputs["crn_uniforms"],
-    )
-    eval_det_shared = fr_det.evaluate(
-        det_design, geodata, prob_dict, Omega_dict, identity_J,
-        Lambda, wr, wv, crn_uniforms=shared_inputs["crn_uniforms"],
+        Lambda, rider_time_weight, vehicle_cost_weight, crn_uniforms=shared_inputs["crn_uniforms"],
     )
 
     scenario_fr_opt, services_fr_opt = find_first_served_stop_scenario(
         fr_design, fr0, geodata, block_ids, block_pos_km, prob_dict,
-        shared_inputs["crn_uniforms"], Lambda, wr, wv,
+        shared_inputs["crn_uniforms"], Lambda, rider_time_weight, vehicle_cost_weight,
     )
     scenario_det_opt, services_det_opt = find_first_served_stop_scenario(
         det_design, fr_det, geodata, block_ids, block_pos_km, prob_dict,
-        shared_inputs["crn_uniforms"], Lambda, wr, wv,
-    )
-    scenario_shared, services_det_shared = find_first_served_stop_scenario(
-        det_design, fr_det, geodata, block_ids, block_pos_km, prob_dict,
-        shared_inputs["crn_uniforms"], Lambda, wr, wv,
-    )
-    services_fr_shared = solve_design_scenario(
-        det_design, fr0, geodata, block_ids, block_pos_km, prob_dict,
-        shared_inputs["crn_uniforms"], Lambda, wr, wv, scenario_shared,
+        shared_inputs["crn_uniforms"], Lambda, rider_time_weight, vehicle_cost_weight,
     )
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 11))
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.8))
     plot_fixed_route_panel(
-        axes[0, 0], fr_design, eval_fr_opt, "Optimized FR", 0.0,
+        axes[0], fr_design, eval_fr_opt, "Optimized FR", 0.0,
         geodata, block_ids, block_pos_km, services=services_fr_opt,
     )
     plot_fixed_route_panel(
-        axes[0, 1], det_design, eval_det_opt, f"Optimized FR-Detour (delta={delta_detour})", delta_detour,
+        axes[1], det_design, eval_det_opt, f"Optimized FR-Detour (delta={delta_detour})", delta_detour,
         geodata, block_ids, block_pos_km, services=services_det_opt,
-    )
-    plot_fixed_route_panel(
-        axes[1, 0], det_design, eval_fr_shared, "Same design diagnostic: FR evaluation", 0.0,
-        geodata, block_ids, block_pos_km, services=services_fr_shared,
-    )
-    plot_fixed_route_panel(
-        axes[1, 1], det_design, eval_det_shared, f"Same design diagnostic: FR-Detour evaluation (delta={delta_detour})", delta_detour,
-        geodata, block_ids, block_pos_km, services=services_det_shared,
     )
     fig.suptitle(
         "FR vs FR-Detour comparison\n"
-        f"Top row: optimized separately. Bottom row: same-design diagnostic on FR-Detour design.\n"
-        f"budget={budget}, Λ={Lambda}, shared CRN, scenarios=FR:{scenario_fr_opt} DET:{scenario_det_opt} shared:{scenario_shared}",
+        f"Direct comparison on separately optimized designs.\n"
+        f"budget={budget}, Λ={Lambda}, shared CRN, scenarios=FR:{scenario_fr_opt} DET:{scenario_det_opt}",
         fontsize=14, fontweight="bold", y=1.01,
     )
     fig.tight_layout()
@@ -704,12 +619,16 @@ def run_uniform_comparison():
 
 
 def run_uniform_diagnostic(wr=500.0):
-    budget = 5
-    Lambda = 300.0
-    wv = 1.0
+    budget = 3
+    Lambda = 50.0
+    rider_time_weight = wr
+    vehicle_cost_weight = 1.0
     delta = 0.8
-    n_saa = 20
-    rs_iters = 30
+    n_saa = 8
+    n_eval = 12
+    rs_iters = 12
+    max_cg_iters = 10
+    t_values = [0.25, 0.5, 1.0]
 
     positions_km, checkpoint_ids = make_uniform_positions()
     geodata, block_ids, block_pos_km, prob_dict, Omega_dict = build_synthetic_instance(
@@ -721,34 +640,59 @@ def run_uniform_diagnostic(wr=500.0):
 
     shared_crn = np.random.default_rng(123).uniform(0.0, 1.0, size=(n_saa, n_blocks))
     shared_builder = FRDetour(
-        delta=delta, max_iters=rs_iters, n_saa=n_saa, K_skip=2, T_values=[0.25, 0.5, 0.75, 1.0]
+        delta=delta,
+        max_iters=rs_iters,
+        n_saa=n_saa,
+        num_scenarios=n_eval,
+        K_skip=2,
+        max_cg_iters=max_cg_iters,
+        T_values=t_values,
+        show_progress=True,
     )
     shared_inputs = shared_builder._prepare_shared_inputs(geodata, budget, crn_uniforms=shared_crn)
 
-    fr0 = FRDetour(delta=0.0, max_iters=rs_iters, n_saa=n_saa, K_skip=2,
-                   T_values=[0.25, 0.5, 0.75, 1.0], name="Multi-FR")
-    fr_det = FRDetour(delta=delta, max_iters=rs_iters, n_saa=n_saa, K_skip=2,
-                      T_values=[0.25, 0.5, 0.75, 1.0], name="Multi-FR-Detour")
+    fr0 = FRDetour(
+        delta=0.0,
+        max_iters=rs_iters,
+        n_saa=n_saa,
+        num_scenarios=n_eval,
+        K_skip=2,
+        max_cg_iters=max_cg_iters,
+        T_values=t_values,
+        name="Multi-FR",
+        show_progress=True,
+    )
+    fr_det = FRDetour(
+        delta=delta,
+        max_iters=rs_iters,
+        n_saa=n_saa,
+        num_scenarios=n_eval,
+        K_skip=2,
+        max_cg_iters=max_cg_iters,
+        T_values=t_values,
+        name="Multi-FR-Detour",
+        show_progress=True,
+    )
 
-    print(f"Designing shared reference network (budget={budget}, delta={delta}, Lambda={Lambda}, wr={wr}) ...",
+    print(f"Designing shared reference network (budget={budget}, delta={delta}, Lambda={Lambda}, wr={rider_time_weight}) ...",
           flush=True)
     shared_design = fr_det.design(
         geodata, prob_dict, Omega_dict, identity_J, budget,
-        Lambda=Lambda, wr=wr, wv=wv, **shared_inputs,
+        Lambda=Lambda, wr=rider_time_weight, wv=vehicle_cost_weight, **shared_inputs,
     )
 
     scenario_fr, skip_fr = find_first_skip_scenario(
-        shared_design, fr0, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, wr, wv
+        shared_design, fr0, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, rider_time_weight, vehicle_cost_weight
     )
     scenario_det, skip_det = find_first_skip_scenario(
-        shared_design, fr_det, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, wr, wv
+        shared_design, fr_det, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, rider_time_weight, vehicle_cost_weight
     )
     scenario_to_plot = min(scenario_fr, scenario_det)
     services_fr = solve_design_scenario(
-        shared_design, fr0, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, wr, wv, scenario_to_plot
+        shared_design, fr0, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, rider_time_weight, vehicle_cost_weight, scenario_to_plot
     )
     services_det = solve_design_scenario(
-        shared_design, fr_det, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, wr, wv, scenario_to_plot
+        shared_design, fr_det, geodata, block_ids, block_pos_km, prob_dict, shared_inputs["crn_uniforms"], Lambda, rider_time_weight, vehicle_cost_weight, scenario_to_plot
     )
 
     print("\n[FR] selected routes")
@@ -781,7 +725,7 @@ def run_uniform_diagnostic(wr=500.0):
         geodata, block_ids, block_pos_km, services=services_det, skip_info=skip_det,
     )
     fig.suptitle(
-        f"Uniform stopping locations, budget={budget}, Lambda={Lambda}, wr={wr}, scenario={scenario_to_plot}\n"
+        f"Uniform stopping locations, budget={budget}, Lambda={Lambda}, wr={rider_time_weight}, scenario={scenario_to_plot}\n"
         "Same selected reference design; colored circles = second-stage served stops",
         fontsize=13, fontweight="bold", y=1.02,
     )

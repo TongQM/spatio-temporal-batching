@@ -13,15 +13,17 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from lib.baselines.base import VEHICLE_SPEED_KMH
+from lib.baselines.base import ServiceDesign, VEHICLE_SPEED_KMH
 from lib.baselines.fr_detour import (
     FRDetour,
     ReferenceLine,
     SubpathArc,
     _build_initial_arcs,
+    _solve_projected_service_scenario,
     _line_access_km,
+    _project_riders_to_candidate_locations,
+    _finalize_projected_rider_assignments,
     _route_execution_km,
-    _sample_global_service_assignments,
     _solve_restricted_routing_lp,
 )
 
@@ -160,60 +162,131 @@ class FRDetourTests(unittest.TestCase):
         self.assertFalse(any(arc.cp_from == 0 and arc.cp_to == 2 for arc in arcs_k0))
         self.assertTrue(any(arc.cp_from == 0 and arc.cp_to == 2 for arc in arcs_k1))
 
-    def test_global_assignment_prefers_served_stop_over_checkpoint(self):
+    def test_projection_prefers_nearest_assigned_stop_point(self):
+        riders = [{"origin_block": "DEM", "origin_pos": np.array([1.1, 0.0], dtype=float)}]
+        candidate_info = {
+            "CP1": {"kind": "checkpoint", "root": "r1"},
+            "STOP": {"kind": "stop_point", "root": "r2"},
+        }
         block_pos = {
             "CP1": np.array([0.0, 0.0], dtype=float),
-            "CP2": np.array([10.0, 0.0], dtype=float),
             "STOP": np.array([1.0, 0.0], dtype=float),
-            "DEM": np.array([1.1, 0.0], dtype=float),
         }
-        areas = {b: 0.0 for b in block_pos}
+        projected_counts, projected_stop_by_root, projected_cp = _project_riders_to_candidate_locations(
+            riders, candidate_info, block_pos
+        )
+        self.assertEqual(projected_counts["STOP"], 1)
+        self.assertEqual(projected_stop_by_root["r2"]["STOP"], 1)
+        self.assertEqual(projected_cp, {})
+        self.assertEqual(riders[0]["projected_loc"], "STOP")
+
+    def test_final_assignment_reassigns_unserved_projected_stop_to_checkpoint(self):
+        riders = [
+            {
+                "origin_block": "DEM",
+                "origin_pos": np.array([1.1, 0.0], dtype=float),
+                "projected_loc": "STOP",
+                "projected_kind": "stop_point",
+                "projected_root": "r2",
+            }
+        ]
+        block_pos = {
+            "CP1": np.array([0.0, 0.0], dtype=float),
+            "STOP": np.array([1.0, 0.0], dtype=float),
+        }
         service_info = {
-            "CP1": {"kind": "checkpoint", "arrival_h": 0.2, "headway_h": 1.0, "root": "r1"},
-            "CP2": {"kind": "checkpoint", "arrival_h": 0.3, "headway_h": 1.0, "root": "r2"},
-            "STOP": {"kind": "detour_stop", "arrival_h": 0.25, "headway_h": 1.0, "root": "r2"},
+            "CP1": {"kind": "checkpoint", "arrival_h": 0.4, "headway_h": 1.0, "root": "r1"},
         }
-        walk_km, wait_h, inveh_h, service_counts, total_riders, outcomes = (
-            _sample_global_service_assignments(
-                demand_s={"DEM": 1},
-                demand_blocks=["DEM"],
-                block_pos_km=block_pos,
-                areas_km2=areas,
-                service_point_info=service_info,
-                rng=np.random.default_rng(7),
+        walk_km, _, inveh_h, service_counts, total_riders, outcomes, records = (
+            _finalize_projected_rider_assignments(
+                riders,
+                block_pos,
+                service_info,
+                np.random.default_rng(9),
+                return_assignments=True,
             )
         )
         self.assertEqual(total_riders, 1)
-        self.assertEqual(service_counts.get("STOP"), 1)
-        self.assertEqual(outcomes["DEM"]["detour_stop_served"], 1)
-        self.assertAlmostEqual(walk_km, 0.1, places=6)
-        self.assertGreater(wait_h, 0.0)
-        self.assertAlmostEqual(inveh_h, 0.25, places=6)
+        self.assertEqual(service_counts.get("CP1"), 1)
+        self.assertEqual(outcomes["DEM"]["checkpoint_served"], 1)
+        self.assertEqual(outcomes["DEM"]["reassigned_service"], 1)
+        self.assertAlmostEqual(walk_km, 1.1, places=6)
+        self.assertAlmostEqual(inveh_h, 0.4, places=6)
+        self.assertEqual(records[0]["service_loc"], "CP1")
+        self.assertTrue(records[0]["reassigned"])
 
-    def test_unselected_checkpoint_demand_falls_back_to_selected_checkpoint(self):
-        block_pos = {
-            "CP_SEL": np.array([0.0, 0.0], dtype=float),
-            "CP_UNSEL": np.array([2.0, 0.0], dtype=float),
-        }
-        areas = {b: 0.0 for b in block_pos}
+    def test_final_assignment_keeps_projected_checkpoint(self):
+        riders = [
+            {
+                "origin_block": "CP1",
+                "origin_pos": np.array([0.0, 0.0], dtype=float),
+                "projected_loc": "CP1",
+                "projected_kind": "checkpoint",
+                "projected_root": "r1",
+            }
+        ]
+        block_pos = {"CP1": np.array([0.0, 0.0], dtype=float)}
         service_info = {
-            "CP_SEL": {"kind": "checkpoint", "arrival_h": 0.4, "headway_h": 1.0, "root": "r1"},
+            "CP1": {"kind": "checkpoint", "arrival_h": 0.2, "headway_h": 1.0, "root": "r1"},
         }
-        walk_km, _, inveh_h, service_counts, total_riders, outcomes = (
-            _sample_global_service_assignments(
-                demand_s={"CP_UNSEL": 2},
-                demand_blocks=["CP_UNSEL"],
-                block_pos_km=block_pos,
-                areas_km2=areas,
-                service_point_info=service_info,
-                rng=np.random.default_rng(9),
-            )
+        walk_km, _, _, service_counts, total_riders, outcomes = _finalize_projected_rider_assignments(
+            riders,
+            block_pos,
+            service_info,
+            np.random.default_rng(3),
         )
-        self.assertEqual(total_riders, 2)
-        self.assertEqual(service_counts.get("CP_SEL"), 2)
-        self.assertEqual(outcomes["CP_UNSEL"]["checkpoint_fallback"], 2)
-        self.assertAlmostEqual(walk_km, 4.0, places=6)
-        self.assertAlmostEqual(inveh_h, 0.8, places=6)
+        self.assertEqual(total_riders, 1)
+        self.assertEqual(service_counts.get("CP1"), 1)
+        self.assertEqual(outcomes["CP1"]["checkpoint_served"], 1)
+        self.assertEqual(outcomes["CP1"]["reassigned_service"], 0)
+        self.assertAlmostEqual(walk_km, 0.0, places=6)
+
+    def test_zero_projected_stop_demand_is_not_served(self):
+        positions = {
+            "A": (0.0, 0.0),
+            "B": (1.0, 0.4),
+            "C": (2.0, 0.0),
+        }
+        geodata = TinyGeoData(positions, checkpoint_ids=["A", "C"])
+        design = ServiceDesign(
+            name="Multi-FR-Detour",
+            assignment=np.array([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=float),
+            depot_id="A",
+            district_roots=["A"],
+            dispatch_intervals={"A": 1.0},
+            district_routes={"A": [0, 2]},
+            service_metadata={
+                "fr_detour": {
+                    "checkpoint_sequence_by_root": {"A": ["A", "C"]},
+                    "selected_checkpoints_by_root": {"A": ["A", "C"]},
+                    "assigned_locations_by_root": {"A": ["A", "B", "C"]},
+                    "assigned_stop_points_by_root": {"A": ["B"]},
+                    "demand_support_locations": ["A", "C"],
+                }
+            },
+        )
+        method = FRDetour(delta=0.8, max_iters=1, num_scenarios=1, n_saa=1, n_angular=1, K_skip=0, T_values=[1.0])
+        block_ids = geodata.short_geoid_list
+        block_pos_map = {b: np.array(geodata.pos[b], dtype=float) / 1000.0 for b in block_ids}
+        areas_km2 = {b: float(geodata.get_area(b)) for b in block_ids}
+        walk_saved_km = {"A": 0.0, "B": 0.0, "C": 0.0}
+        scenario = _solve_projected_service_scenario(
+            design,
+            method,
+            geodata,
+            {"A": 1.0, "B": 0.0, "C": 0.0},
+            block_ids,
+            block_pos_map,
+            {"A": 1, "B": 0, "C": 0},
+            block_pos_map["A"],
+            areas_km2,
+            walk_saved_km,
+            1.0,
+            1.0,
+            np.random.default_rng(5),
+        )
+        self.assertEqual(scenario["projected_stop_counts_by_root"].get("A", {}), {})
+        self.assertEqual(scenario["route_services"]["A"]["served_stops"], set())
 
     @unittest.skipUnless(HAS_GUROBI, "requires gurobipy")
     def test_fixed_origin_lp_serves_corridor_stop_with_detour(self):
@@ -329,6 +402,7 @@ class FRDetourTests(unittest.TestCase):
         self.assertIn("assigned_stop_points_by_root", meta)
         self.assertIn("reachable_stop_points_by_root", meta)
         self.assertIn("demand_support_locations", meta)
+        checkpoint_candidates = set(meta["checkpoint_candidate_locations"])
         self.assertTrue(meta["checkpoint_sequence_by_root"])
         for root in design.district_roots:
             checkpoints = meta["checkpoint_sequence_by_root"][root]
@@ -337,6 +411,12 @@ class FRDetourTests(unittest.TestCase):
             self.assertEqual(len(checkpoints), len(schedule))
             self.assertTrue(all(schedule[i] <= schedule[i + 1] for i in range(len(schedule) - 1)))
             self.assertTrue(all(load <= (1.0 + method.load_factor_kappa) * method.capacity + 1e-6 for load in loads))
+            self.assertTrue(
+                checkpoint_candidates.isdisjoint(meta["assigned_stop_points_by_root"][root])
+            )
+            self.assertTrue(
+                checkpoint_candidates.isdisjoint(meta["reachable_stop_points_by_root"][root])
+            )
 
 
 if __name__ == "__main__":

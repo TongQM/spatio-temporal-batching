@@ -81,10 +81,14 @@ from itertools import combinations
 from typing import Callable, Dict, FrozenSet, List, Optional, Set, Tuple
 
 import numpy as np
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency fallback
+    tqdm = None
 
 from lib.baselines.base import (
     BETA, VEHICLE_SPEED_KMH, BaselineMethod, EvaluationResult, ServiceDesign,
-    _get_pos,
+    _effective_fleet_size, _get_pos,
 )
 from lib.constants import DEFAULT_FLEET_COST_RATE, TSP_TRAVEL_DISCOUNT
 
@@ -590,6 +594,424 @@ def _checkpoint_candidate_ids(geodata, block_ids: List[str]) -> Set[str]:
     fall back to treating every location as a candidate checkpoint.
     """
     return set(getattr(geodata, "checkpoint_ids", block_ids))
+
+
+def _stop_point_ids(geodata, block_ids: List[str]) -> Set[str]:
+    """Return the globally disjoint non-checkpoint service-location set."""
+    return set(block_ids) - _checkpoint_candidate_ids(geodata, block_ids)
+
+
+def _sample_rider_destinations(
+    demand_s: Dict[str, int],
+    demand_blocks: List[str],
+    block_pos_km: Dict[str, np.ndarray],
+    areas_km2: Dict[str, float],
+    rng: np.random.Generator,
+) -> List[Dict[str, object]]:
+    """Sample continuous rider destinations from block-level realized demand."""
+    riders: List[Dict[str, object]] = []
+    for b in demand_blocks:
+        d_b = int(demand_s.get(b, 0))
+        if d_b <= 0:
+            continue
+        center = block_pos_km[b]
+        area_b = areas_km2.get(b, 0.25)
+        r_b = math.sqrt(area_b / math.pi)
+        if r_b < 1e-9:
+            positions = np.tile(center, (d_b, 1))
+        else:
+            radii = r_b * np.sqrt(rng.uniform(0, 1, size=d_b))
+            angles = rng.uniform(0, 2 * math.pi, size=d_b)
+            offsets = np.column_stack([radii * np.cos(angles), radii * np.sin(angles)])
+            positions = center + offsets
+        for p in range(d_b):
+            riders.append(
+                {
+                    "origin_block": b,
+                    "origin_pos": np.array(positions[p], dtype=float),
+                }
+            )
+    return riders
+
+
+def _project_riders_to_candidate_locations(
+    riders: List[Dict[str, object]],
+    candidate_service_info: Dict[str, Dict[str, object]],
+    block_pos_km: Dict[str, np.ndarray],
+):
+    """Greedily project each rider to the nearest candidate service location."""
+    if not riders or not candidate_service_info:
+        return {}, {}, {}
+
+    candidate_locs = list(candidate_service_info.keys())
+    candidate_pos = np.array([block_pos_km[loc] for loc in candidate_locs], dtype=float)
+    positions = np.array([r["origin_pos"] for r in riders], dtype=float)
+    dist = np.linalg.norm(positions[:, None, :] - candidate_pos[None, :, :], axis=2)
+    nearest_idx = dist.argmin(axis=1)
+
+    projected_counts: Dict[str, int] = {}
+    projected_stop_counts_by_root: Dict[str, Dict[str, int]] = {}
+    projected_checkpoint_counts: Dict[str, int] = {}
+
+    for i, rider in enumerate(riders):
+        loc = candidate_locs[int(nearest_idx[i])]
+        info = candidate_service_info[loc]
+        rider["projected_loc"] = loc
+        rider["projected_kind"] = str(info.get("kind", ""))
+        rider["projected_root"] = info.get("root")
+        projected_counts[loc] = projected_counts.get(loc, 0) + 1
+        if info.get("kind") == "stop_point":
+            root = str(info.get("root", ""))
+            projected_stop_counts_by_root.setdefault(root, {})
+            projected_stop_counts_by_root[root][loc] = (
+                projected_stop_counts_by_root[root].get(loc, 0) + 1
+            )
+        elif info.get("kind") == "checkpoint":
+            projected_checkpoint_counts[loc] = projected_checkpoint_counts.get(loc, 0) + 1
+
+    return projected_counts, projected_stop_counts_by_root, projected_checkpoint_counts
+
+
+def _finalize_projected_rider_assignments(
+    riders: List[Dict[str, object]],
+    block_pos_km: Dict[str, np.ndarray],
+    service_point_info: Dict[str, Dict[str, object]],
+    rng: np.random.Generator,
+    return_assignments: bool = False,
+):
+    """Finalize rider service after second-stage detour decisions."""
+    if not riders or not service_point_info:
+        if return_assignments:
+            return 0.0, 0.0, 0.0, {}, 0, {}, []
+        return 0.0, 0.0, 0.0, {}, 0, {}
+
+    service_locs = list(service_point_info.keys())
+    service_pos = np.array([block_pos_km[b] for b in service_locs], dtype=float)
+
+    total_walk_riders = 0.0
+    total_wait_h = 0.0
+    total_invehicle_h = 0.0
+    total_riders = len(riders)
+    service_counts: Dict[str, int] = {}
+    demand_outcomes: Dict[str, Dict[str, int]] = {}
+    assignment_records = [] if return_assignments else None
+
+    for rider in riders:
+        origin_block = str(rider["origin_block"])
+        origin_pos = np.array(rider["origin_pos"], dtype=float)
+        projected_loc = str(rider["projected_loc"])
+
+        demand_outcomes.setdefault(
+            origin_block,
+            {
+                "checkpoint_served": 0,
+                "detour_stop_served": 0,
+                "reassigned_service": 0,
+            },
+        )
+
+        if projected_loc in service_point_info:
+            final_loc = projected_loc
+            reassigned = False
+            final_dist = float(np.linalg.norm(origin_pos - block_pos_km[final_loc]))
+        else:
+            dist_to_service = np.linalg.norm(origin_pos[None, :] - service_pos, axis=1)
+            nearest_service_idx = int(dist_to_service.argmin())
+            final_loc = service_locs[nearest_service_idx]
+            reassigned = True
+            final_dist = float(dist_to_service[nearest_service_idx])
+
+        info = service_point_info[final_loc]
+        total_walk_riders += final_dist
+        total_invehicle_h += float(info.get("arrival_h", 0.0))
+        headway_h = float(info.get("headway_h", 0.0))
+        if headway_h > 0:
+            total_wait_h += headway_h - float(rng.uniform(0.0, headway_h))
+
+        service_counts[final_loc] = service_counts.get(final_loc, 0) + 1
+        if info.get("kind") == "detour_stop":
+            demand_outcomes[origin_block]["detour_stop_served"] += 1
+        else:
+            demand_outcomes[origin_block]["checkpoint_served"] += 1
+        if reassigned:
+            demand_outcomes[origin_block]["reassigned_service"] += 1
+
+        if return_assignments:
+            assignment_records.append(
+                {
+                    "origin_block": origin_block,
+                    "origin_pos": origin_pos,
+                    "projected_loc": projected_loc,
+                    "service_loc": final_loc,
+                    "service_pos": np.array(block_pos_km[final_loc], dtype=float),
+                    "service_kind": str(info.get("kind", "")),
+                    "walk_km": final_dist,
+                    "reassigned": reassigned,
+                }
+            )
+
+    result = (
+        total_walk_riders,
+        total_wait_h,
+        total_invehicle_h,
+        service_counts,
+        total_riders,
+        demand_outcomes,
+    )
+    if return_assignments:
+        return result + (assignment_records,)
+    return result
+
+
+def _solve_projected_service_scenario(
+    design: ServiceDesign,
+    method,
+    geodata,
+    prob_dict: Dict[str, float],
+    block_ids: List[str],
+    block_pos_km: Dict[str, np.ndarray],
+    demand_s: Dict[str, int],
+    depot_pos_km: np.ndarray,
+    areas_km2: Dict[str, float],
+    walk_saved_km: Dict[str, float],
+    rider_time_weight: float,
+    vehicle_cost_weight: float,
+    walk_rng: np.random.Generator,
+    return_assignments: bool = False,
+):
+    """Scenario evaluation via demand projection -> detour solve -> reassignment."""
+    fr_meta = design.service_metadata.get("fr_detour", {})
+    assignment = design.assignment
+    checkpoint_sequence_meta = fr_meta.get("checkpoint_sequence_by_root", {})
+    selected_checkpoints_meta = fr_meta.get(
+        "selected_checkpoints_by_root",
+        checkpoint_sequence_meta,
+    )
+    assigned_locations_meta = fr_meta.get(
+        "assigned_locations_by_root",
+        fr_meta.get("assigned_blocks_by_root", {}),
+    )
+    assigned_stop_points_meta = fr_meta.get("assigned_stop_points_by_root", {})
+    demand_support_locations = list(fr_meta.get(
+        "demand_support_locations",
+        [b for b in block_ids if prob_dict.get(b, 0.0) > 0.0],
+    ))
+    stop_point_set = _stop_point_ids(geodata, block_ids)
+
+    roots_iter = design.district_roots or [
+        block_ids[i] for i in range(len(block_ids))
+        if assignment is not None and round(assignment[i, i]) == 1
+    ]
+
+    route_data = []
+    candidate_service_info: Dict[str, Dict[str, object]] = {}
+    for root in roots_iter:
+        T_i = float(design.dispatch_intervals.get(root, 1.0))
+        route_global = design.district_routes.get(root, [])
+        checkpoints = [block_ids[gi] for gi in route_global]
+        if not checkpoints and root in checkpoint_sequence_meta:
+            checkpoints = list(checkpoint_sequence_meta[root])
+        if not checkpoints and root in selected_checkpoints_meta:
+            checkpoints = list(selected_checkpoints_meta[root])
+        if not checkpoints:
+            continue
+
+        assigned_locations = list(assigned_locations_meta.get(root, []))
+        assigned_stop_points = [
+            b for b in assigned_stop_points_meta.get(root, [])
+            if b in stop_point_set
+        ]
+        if not assigned_stop_points:
+            assigned_stop_points = [
+                b for b in assigned_locations if b in stop_point_set
+            ]
+
+        line_obj = ReferenceLine(
+            idx=0,
+            checkpoints=checkpoints,
+            reachable_locations=set(checkpoints) | set(assigned_stop_points),
+            est_tour_km=_tour_distance(depot_pos_km, checkpoints, block_pos_km),
+        )
+        arcs = _build_initial_arcs(
+            line_obj, block_ids, block_pos_km, method.delta,
+            method.K_skip, VEHICLE_SPEED_KMH, method.alpha_time
+        )
+        route_data.append({
+            "root": root,
+            "T_i": T_i,
+            "route_global": route_global,
+            "checkpoints": checkpoints,
+            "checkpoint_set": set(checkpoints),
+            "assigned_locations": assigned_locations,
+            "assigned_stop_points": assigned_stop_points,
+            "line_obj": line_obj,
+            "arcs": arcs,
+            "access_km": _line_access_km(line_obj, depot_pos_km, block_pos_km),
+            "base_route_km": _route_execution_km(
+                line_obj, depot_pos_km, block_pos_km, method.K_skip
+            ),
+        })
+
+        for cp in checkpoints:
+            candidate_service_info[cp] = {
+                "kind": "checkpoint",
+                "root": root,
+            }
+        for stop in assigned_stop_points:
+            candidate_service_info[stop] = {
+                "kind": "stop_point",
+                "root": root,
+            }
+
+    riders = _sample_rider_destinations(
+        demand_s,
+        demand_support_locations,
+        block_pos_km,
+        areas_km2,
+        walk_rng,
+    )
+    (
+        projected_counts,
+        projected_stop_counts_by_root,
+        projected_checkpoint_counts,
+    ) = _project_riders_to_candidate_locations(
+        riders, candidate_service_info, block_pos_km
+    )
+
+    service_point_info: Dict[str, Dict[str, object]] = {}
+    route_services = {}
+    discount = TSP_TRAVEL_DISCOUNT
+    speed = VEHICLE_SPEED_KMH
+
+    for rd in route_data:
+        root = rd["root"]
+        checkpoints = rd["checkpoints"]
+        cp_set = rd["checkpoint_set"]
+        assigned_stop_points = rd["assigned_stop_points"]
+        T_i = rd["T_i"]
+        projected_stop_counts = {
+            stop: int(projected_stop_counts_by_root.get(root, {}).get(stop, 0))
+            for stop in assigned_stop_points
+            if projected_stop_counts_by_root.get(root, {}).get(stop, 0) > 0
+        }
+        active_stop_points = sorted(projected_stop_counts.keys())
+        all_blocks_set = set(checkpoints) | set(active_stop_points)
+
+        projected_demand_s = {cp: int(projected_checkpoint_counts.get(cp, 0)) for cp in checkpoints}
+        for stop, count in projected_stop_counts.items():
+            projected_demand_s[stop] = int(count)
+
+        eval_cost_mult = (
+            vehicle_cost_weight / (discount * T_i)
+            + rider_time_weight / (2.0 * speed)
+        )
+        walk_penalties = {
+            b: (
+                method.coverage_penalty_factor
+                * method.walk_time_weight
+                * rider_time_weight
+                * walk_saved_km.get(b, 0.0)
+                * projected_demand_s.get(b, 0)
+                / method.walk_speed_kmh
+            )
+            for b in active_stop_points
+        }
+
+        route_km_s = rd["base_route_km"]
+        active_arcs = []
+        served_stops: Set[str] = set()
+        if len(checkpoints) > 1 and rd["arcs"] and active_stop_points:
+            z_star = {b: 1.0 for b in all_blocks_set}
+            result = _solve_routing_lp_with_cg(
+                rd["arcs"], rd["line_obj"], block_ids, block_pos_km,
+                len(checkpoints), method.capacity, z_star, projected_demand_s,
+                all_blocks_set, cp_set, eval_cost_mult, walk_penalties,
+                method.delta, speed, method.alpha_time, method.K_skip,
+                max_cg_iters=method.max_cg_iters, return_solution=True,
+                return_active_arcs=True,
+            )
+            if result[0] is not None:
+                _, _, detour_km, route_u_vals, active_arcs = result
+                if detour_km is not None:
+                    route_km_s = rd["access_km"] + detour_km
+                served_stops = {
+                    stop for stop in active_stop_points
+                    if route_u_vals.get(stop, 1.0) < 0.5
+                }
+
+        arrival_h = _build_service_arrival_times(
+            depot_pos_km, checkpoints, block_pos_km, active_arcs, speed
+        )
+        for cp in checkpoints:
+            cp_info = {
+                "kind": "checkpoint",
+                "arrival_h": float(arrival_h.get(cp, 0.0)),
+                "headway_h": float(T_i),
+                "root": root,
+            }
+            prev = service_point_info.get(cp)
+            if prev is None or cp_info["arrival_h"] < float(prev.get("arrival_h", 1e18)):
+                service_point_info[cp] = cp_info
+        for stop in served_stops:
+            stop_info = {
+                "kind": "detour_stop",
+                "arrival_h": float(arrival_h.get(stop, 0.0)),
+                "headway_h": float(T_i),
+                "root": root,
+            }
+            prev = service_point_info.get(stop)
+            if prev is None or stop_info["arrival_h"] < float(prev.get("arrival_h", 1e18)):
+                service_point_info[stop] = stop_info
+
+        skip_arcs = [(arc, flow) for arc, flow in active_arcs if arc.cp_to > arc.cp_from + 1]
+        route_services[root] = {
+            "root": root,
+            "checkpoints": checkpoints,
+            "assigned_locations": rd["assigned_locations"],
+            "assigned_stop_points": assigned_stop_points,
+            "active_stop_points": active_stop_points,
+            "projected_stop_counts": projected_stop_counts,
+            "served_stops": served_stops,
+            "skip_arcs": skip_arcs,
+            "route_global": rd["route_global"],
+            "route_km_s": route_km_s,
+        }
+
+    final_result = _finalize_projected_rider_assignments(
+        riders,
+        block_pos_km,
+        service_point_info,
+        walk_rng,
+        return_assignments=return_assignments,
+    )
+    (
+        total_walk_km,
+        total_wait_h,
+        total_invehicle_h,
+        service_counts,
+        total_riders,
+        demand_outcomes,
+        *rest,
+    ) = final_result
+    assignment_records = rest[0] if rest else None
+
+    route_km_by_root = {root: float(info["route_km_s"]) for root, info in route_services.items()}
+    return {
+        "route_services": route_services,
+        "service_point_info": service_point_info,
+        "service_counts": service_counts,
+        "demand_outcomes": demand_outcomes,
+        "projected_counts": projected_counts,
+        "projected_checkpoint_counts": projected_checkpoint_counts,
+        "projected_stop_counts_by_root": projected_stop_counts_by_root,
+        "route_km_by_root": route_km_by_root,
+        "riders": riders,
+        "assignment_records": assignment_records,
+        "total_walk_km": float(total_walk_km),
+        "total_wait_h": float(total_wait_h),
+        "total_invehicle_h": float(total_invehicle_h),
+        "total_riders": int(total_riders),
+    }
 
 
 def _sample_global_service_assignments(
@@ -1799,6 +2221,7 @@ class FRDetour(BaselineMethod):
         walk_time_weight: float = 5.0,
         solve_mode: str = "dd_relaxed",
         coverage_penalty_factor: float = 1.0,
+        show_progress: bool = False,
         name: str | None = None,
     ):
         self.delta = delta
@@ -1817,7 +2240,13 @@ class FRDetour(BaselineMethod):
         self.walk_time_weight = float(walk_time_weight)
         self.solve_mode = str(solve_mode)
         self.coverage_penalty_factor = float(coverage_penalty_factor)
+        self.show_progress = bool(show_progress)
         self._name = name or ("Multi-FR-Detour" if delta > 0 else "Multi-FR")
+
+    def _progress(self, total: int, desc: str):
+        if self.show_progress and tqdm is not None:
+            return tqdm(total=total, desc=desc, leave=False)
+        return None
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1887,7 +2316,7 @@ class FRDetour(BaselineMethod):
         num_districts: int,
         Lambda: float = 1.0,
         wr: float = 1.0,
-        wv: float = 10.0,
+        wv: float = 1.0,
         **kwargs,
     ) -> ServiceDesign:
         """
@@ -1896,6 +2325,11 @@ class FRDetour(BaselineMethod):
         First stage: select reference trips from a fixed candidate library
         under a fleet budget, choose dispatch intervals, and assign stopping
         locations to trips.
+
+        Weight note:
+        - `wr` is the rider-time weight (wait and in-vehicle time)
+        - `walk_time_weight * wr` prices walk time
+        - `wv` is retained only as a deprecated vehicle-cost-weight alias
 
         Second stage: per selected trip, solve subpath routing LP on
         load-expanded checkpoint network with scenario-wise demand.
@@ -1911,6 +2345,8 @@ class FRDetour(BaselineMethod):
         K = num_districts  # library granularity + default fleet-budget proxy
         tol = 1e-2
         discount = TSP_TRAVEL_DISCOUNT
+        rider_time_weight = float(wr)
+        vehicle_cost_weight = float(wv)
         speed = VEHICLE_SPEED_KMH
         fleet_budget = (float(self.max_fleet)
                         if self.max_fleet is not None else float(num_districts))
@@ -2115,7 +2551,10 @@ class FRDetour(BaselineMethod):
                 for ti, T_t in enumerate(T_vals):
                     if (line.idx, ti) not in x_v:
                         continue
-                    cm = 1.0 / (discount * T_t) + wr / (2.0 * speed)
+                    cm = (
+                        vehicle_cost_weight / (discount * T_t)
+                        + rider_time_weight / (2.0 * speed)
+                    )
                     for s in range(S):
                         master.addConstr(
                             theta_v[(s, line.idx, ti)] >= sp_km * cm * x_v[(line.idx, ti)],
@@ -2123,7 +2562,7 @@ class FRDetour(BaselineMethod):
 
             # Objective: recourse cost + soft load penalties + expected wait
             # + paper-style coverage reward proxy on assigned scenario demand.
-            coverage_reward = wr * 10.0
+            coverage_reward = rider_time_weight * 10.0
 
             obj_expr = gp.LinExpr()
             for li, ti in x_v:
@@ -2141,7 +2580,7 @@ class FRDetour(BaselineMethod):
                         demand_coeff = float(demand_matrix_t[s, block_index[b]]) / S
                         if demand_coeff <= 1e-12:
                             continue
-                        obj_expr += wr * T_t / 2.0 * demand_coeff * z_v[key]
+                        obj_expr += rider_time_weight * T_t / 2.0 * demand_coeff * z_v[key]
                         obj_expr -= coverage_reward * demand_coeff * z_v[key]
 
             master.setObjective(obj_expr, GRB.MINIMIZE)
@@ -2162,6 +2601,7 @@ class FRDetour(BaselineMethod):
         # Build line-obj lookup
         line_by_idx = {ln.idx: ln for ln in lines}
 
+        pbar = self._progress(self.max_iters, f"{self._name} design")
         for benders_iter in range(self.max_iters):
             # Add pending cuts
             for cut in pending_cuts[cuts_added:]:
@@ -2181,6 +2621,9 @@ class FRDetour(BaselineMethod):
             master.optimize()
             if master.status != GRB.OPTIMAL:
                 print(f"  [MiND Benders] Master infeasible at iter {benders_iter}")
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.set_postfix_str("master infeasible")
                 break
             lb = master.ObjVal
 
@@ -2210,7 +2653,10 @@ class FRDetour(BaselineMethod):
                 mc = len(line_obj.checkpoints)
                 initial_arcs = line_arcs.get(li, [])
                 # Provider vehicle-km cost plus a lightweight in-vehicle delay proxy.
-                cost_mult = 1.0 / (discount * T_t) + wv / (2.0 * speed)
+                cost_mult = (
+                    vehicle_cost_weight / (discount * T_t)
+                    + rider_time_weight / (2.0 * speed)
+                )
                 access_cost = cost_mult * _line_access_km(
                     line_obj, depot_pos, block_pos_km)
                 base_route_cost = cost_mult * _route_execution_km(
@@ -2232,7 +2678,7 @@ class FRDetour(BaselineMethod):
                     }
                     demand_s = {block_ids[j]: int(demand_matrix[s, j])
                                 for j in range(N)}
-                    op_wait += (wr * T_t / 2.0 / S) * sum(
+                    op_wait += (rider_time_weight * T_t / 2.0 / S) * sum(
                         demand_s.get(b, 0) * z_dict.get(b, 0.0) for b in line_obj.reachable_blocks
                     )
 
@@ -2248,14 +2694,14 @@ class FRDetour(BaselineMethod):
                         s_walk_pen[b] = (
                             self.coverage_penalty_factor
                             * self.walk_time_weight
-                            * wv
+                            * rider_time_weight
                             * walk_saved_km.get(b, 0.0)
                             * d_b
                             / walk_speed
                         )
                         s_walk_det_cost[b] = (
                             self.walk_time_weight
-                            * wv
+                            * rider_time_weight
                             * walk_det_km.get(b, 0.0)
                             * d_b
                             / walk_speed
@@ -2274,7 +2720,7 @@ class FRDetour(BaselineMethod):
                                 walk_km += walk_saved_km.get(b, 0.0)
                             walk_coeff = (
                                 self.walk_time_weight
-                                * wv
+                                * rider_time_weight
                                 * walk_km
                                 * demand_s.get(b, 0)
                                 / walk_speed
@@ -2336,10 +2782,30 @@ class FRDetour(BaselineMethod):
             # Convergence
             gap = (best_ub - lb) / max(abs(best_ub), 1.0)
             n_new_cuts = len(pending_cuts) - cuts_added
+            if pbar is not None:
+                if math.isfinite(best_ub):
+                    pbar.set_postfix(
+                        lb=f"{lb:.2f}",
+                        ub=f"{best_ub:.2f}",
+                        gap=f"{100.0 * gap:.1f}%",
+                        trips=len(active_trips),
+                        cuts=len(pending_cuts),
+                    )
+                else:
+                    pbar.set_postfix(
+                        lb=f"{lb:.2f}",
+                        ub="inf",
+                        trips=len(active_trips),
+                        cuts=len(pending_cuts),
+                    )
+                pbar.update(1)
             if gap < tol:
                 break
             if n_new_cuts == 0 and benders_iter > 0:
                 break
+
+        if pbar is not None:
+            pbar.close()
 
         # ---- Step 5: Map to ServiceDesign ----
         if best_solution is None:
@@ -2400,6 +2866,7 @@ class FRDetour(BaselineMethod):
         selected_trip_indices_by_root: Dict[str, Dict[str, int]] = {}
         scenario_assigned_loads_by_root: Dict[str, List[float]] = {}
         checkpoint_candidate_set = _checkpoint_candidate_ids(geodata, block_ids)
+        stop_point_set = _stop_point_ids(geodata, block_ids)
         demand_support_locations = sorted(
             b for b in block_ids if prob_dict.get(b, 0.0) > 0.0
         )
@@ -2446,7 +2913,7 @@ class FRDetour(BaselineMethod):
             compatible_locations_by_root[root_id] = sorted(line_obj.reachable_locations)
             reachable_locations_by_root[root_id] = sorted(line_obj.reachable_locations)
             reachable_stop_points_by_root[root_id] = sorted(
-                b for b in line_obj.reachable_locations if b not in line_obj.checkpoints
+                b for b in line_obj.reachable_locations if b in stop_point_set
             )
             location_assignment_scores_by_root[root_id] = {
                 b: float(score) for b, score in sorted(z_scores.items())
@@ -2512,7 +2979,7 @@ class FRDetour(BaselineMethod):
             assigned_locations_by_root[root_id].sort()
             assigned_stop_points_by_root[root_id] = sorted(
                 b for b in assigned_locations_by_root[root_id]
-                if b not in line_obj.checkpoints
+                if b in stop_point_set
             )
             root_idx = block_ids.index(root_id)
             for b in assigned_locations_by_root[root_id]:
@@ -2584,7 +3051,12 @@ class FRDetour(BaselineMethod):
         beta: float = BETA, road_network=None,
         crn_uniforms: Optional[np.ndarray] = None,
     ) -> EvaluationResult:
-        """FR-specific evaluation using the same subpath-routing semantics."""
+        """FR-specific evaluation using the same subpath-routing semantics.
+
+        `wr` prices rider wait and in-vehicle time. `walk_time_weight * wr`
+        prices walk time. `wv` is retained only as a deprecated provider-side
+        vehicle-cost-weight alias.
+        """
         block_ids = geodata.short_geoid_list
         N = len(block_ids)
         assignment = design.assignment
@@ -2593,6 +3065,8 @@ class FRDetour(BaselineMethod):
         discount = TSP_TRAVEL_DISCOUNT
         speed = VEHICLE_SPEED_KMH
         walk_speed = self.walk_speed_kmh
+        rider_time_weight = float(wr)
+        vehicle_cost_weight = float(wv)
 
         # Build block positions in km
         block_pos_km = {}
@@ -2640,180 +3114,63 @@ class FRDetour(BaselineMethod):
         acc_walk_riders = 0.0  # walk_km * n_riders accumulated
         acc_riders = 0.0       # total riders accumulated
         acc_fleet = 0.0
+        acc_raw_fleet = 0
         acc_T_weighted = 0.0
         acc_prob = 0.0
-
-        assigned_blocks_meta = fr_meta.get(
-            "assigned_locations_by_root",
-            fr_meta.get("assigned_blocks_by_root", {}),
-        )
-        assigned_stop_points_meta = fr_meta.get("assigned_stop_points_by_root", {})
-        checkpoint_sequence_meta = fr_meta.get("checkpoint_sequence_by_root", {})
-        selected_checkpoints_meta = fr_meta.get(
-            "selected_checkpoints_by_root",
-            checkpoint_sequence_meta,
-        )
-        demand_support_locations = list(fr_meta.get(
-            "demand_support_locations",
-            [b for b in block_ids if prob_dict.get(b, 0.0) > 0.0],
-        ))
-
-        roots_iter = design.district_roots or [
-            block_ids[i] for i in range(N) if round(assignment[i, i]) == 1
-        ]
-        route_data = []
-        for root in roots_iter:
-            T_i = design.dispatch_intervals.get(root, 1.0)
-            route_global = design.district_routes.get(root, [])
-            checkpoints = [block_ids[gi] for gi in route_global]
-            if not checkpoints and root in checkpoint_sequence_meta:
-                checkpoints = list(checkpoint_sequence_meta[root])
-            if not checkpoints and root in selected_checkpoints_meta:
-                checkpoints = list(selected_checkpoints_meta[root])
-            if not checkpoints:
-                continue
-
-            assigned_stop_points = list(assigned_stop_points_meta.get(root, []))
-            if not assigned_stop_points:
-                assigned_stop_points = [
-                    b for b in assigned_blocks_meta.get(root, [])
-                    if b not in set(checkpoints)
-                ]
-            all_service_points = sorted(set(checkpoints) | set(assigned_stop_points))
-            line_obj = ReferenceLine(
-                idx=0,
-                checkpoints=checkpoints,
-                reachable_locations=set(all_service_points),
-                est_tour_km=_tour_distance(depot_pos_km, checkpoints, block_pos_km),
-            )
-            arcs = _build_initial_arcs(
-                line_obj, block_ids, block_pos_km, self.delta,
-                self.K_skip, speed, self.alpha_time
-            )
-            route_data.append({
-                "root": root,
-                "T_i": T_i,
-                "checkpoints": checkpoints,
-                "checkpoint_set": set(checkpoints),
-                "assigned_stop_points": assigned_stop_points,
-                "all_service_points": all_service_points,
-                "line_obj": line_obj,
-                "arcs": arcs,
-                "access_km": _line_access_km(line_obj, depot_pos_km, block_pos_km),
-                "base_route_km": _route_execution_km(
-                    line_obj, depot_pos_km, block_pos_km, self.K_skip
-                ),
-                "acc_route_km": 0.0,
-            })
+        route_km_sum_by_root = {root: 0.0 for root in design.dispatch_intervals}
 
         T_global = (
-            float(np.mean([rd["T_i"] for rd in route_data]))
-            if route_data else 1.0
+            float(np.mean(list(design.dispatch_intervals.values())))
+            if design.dispatch_intervals else 1.0
         )
         demand_matrix_global = _crn_demand(U_base, Lambda, T_global, prob_dict, block_ids)
 
+        pbar = self._progress(n_eval, f"{self._name} eval")
         for s in range(n_eval):
             demand_s = {block_ids[j]: int(demand_matrix_global[s, j]) for j in range(N)}
-            service_point_info: Dict[str, Dict[str, object]] = {}
-
-            for rd in route_data:
-                root = rd["root"]
-                checkpoints = rd["checkpoints"]
-                cp_set = rd["checkpoint_set"]
-                assigned_stop_points = rd["assigned_stop_points"]
-                all_blocks_set = set(rd["all_service_points"])
-                m = len(checkpoints)
-                T_i = float(rd["T_i"])
-                z_star = {b: 1.0 for b in all_blocks_set}
-                eval_cost_mult = 1.0 / (discount * T_i) + wv / (2.0 * speed)
-
-                wp = {}
-                for b in all_blocks_set:
-                    d_b = demand_s.get(b, 0)
-                    wp[b] = (
-                        self.coverage_penalty_factor
-                        * self.walk_time_weight
-                        * wv
-                        * walk_saved_km.get(b, 0.0)
-                        * d_b
-                        / walk_speed
-                    )
-
-                active_arc_flows = None
-                route_km_s = rd["base_route_km"]
-                u_vals = {b: (0.0 if b in cp_set else 1.0) for b in all_blocks_set}
-                if m > 1 and rd["arcs"]:
-                    result = _solve_routing_lp_with_cg(
-                        rd["arcs"], rd["line_obj"], block_ids, block_pos_km,
-                        m, self.capacity, z_star, demand_s,
-                        all_blocks_set, cp_set, eval_cost_mult, wp,
-                        self.delta, speed, self.alpha_time, self.K_skip,
-                        max_cg_iters=15, return_solution=True,
-                        return_active_arcs=True,
-                    )
-                    _, _, detour_km, route_u_vals, active_arc_flows = result
-                    if detour_km is not None:
-                        route_km_s = rd["access_km"] + detour_km
-                        u_vals = route_u_vals
-
-                rd["acc_route_km"] += route_km_s
-                arrival_h = _build_service_arrival_times(
-                    depot_pos_km, checkpoints, block_pos_km, active_arc_flows, speed
-                )
-
-                for cp in checkpoints:
-                    cp_info = {
-                        "kind": "checkpoint",
-                        "arrival_h": float(arrival_h.get(cp, 0.0)),
-                        "headway_h": T_i,
-                        "root": root,
-                    }
-                    prev = service_point_info.get(cp)
-                    if prev is None or float(cp_info["arrival_h"]) < float(prev.get("arrival_h", 1e18)):
-                        service_point_info[cp] = cp_info
-
-                for stop in assigned_stop_points:
-                    if u_vals.get(stop, 1.0) >= 0.5:
-                        continue
-                    stop_info = {
-                        "kind": "detour_stop",
-                        "arrival_h": float(arrival_h.get(stop, 0.0)),
-                        "headway_h": T_i,
-                        "root": root,
-                    }
-                    prev = service_point_info.get(stop)
-                    if prev is None or float(stop_info["arrival_h"]) < float(prev.get("arrival_h", 1e18)):
-                        service_point_info[stop] = stop_info
-
-            (
-                global_walk_km,
-                global_wait_h,
-                global_invehicle_h,
-                _service_counts,
-                global_riders,
-                _demand_outcomes,
-            ) = _sample_global_service_assignments(
-                demand_s,
-                demand_support_locations,
+            scenario_result = _solve_projected_service_scenario(
+                design,
+                self,
+                geodata,
+                prob_dict,
+                block_ids,
                 block_pos_km,
+                demand_s,
+                depot_pos_km,
                 areas_km2,
-                service_point_info,
+                walk_saved_km,
+                rider_time_weight,
+                vehicle_cost_weight,
                 walk_rng,
             )
+            acc_walk_riders += scenario_result["total_walk_km"]
+            acc_wait_h += scenario_result["total_wait_h"]
+            acc_invehicle_h += scenario_result["total_invehicle_h"]
+            acc_riders += scenario_result["total_riders"]
+            for root, route_km_s in scenario_result["route_km_by_root"].items():
+                route_km_sum_by_root[root] = route_km_sum_by_root.get(root, 0.0) + float(route_km_s)
+            if pbar is not None:
+                pbar.set_postfix(
+                    riders=f"{acc_riders:.0f}",
+                    routes=len(scenario_result["route_km_by_root"]),
+                )
+                pbar.update(1)
 
-            acc_walk_riders += global_walk_km
-            acc_wait_h += global_wait_h
-            acc_invehicle_h += global_invehicle_h
-            acc_riders += global_riders
+        if pbar is not None:
+            pbar.close()
 
-        for rd in route_data:
-            avg_tour_km = rd["acc_route_km"] / max(n_eval, 1)
-            T_i = float(rd["T_i"])
-            acc_in_district += avg_tour_km / max(discount, 1e-12) / max(T_i, 1e-12)
-            acc_fleet += avg_tour_km / (speed * max(T_i, 1e-12))
-
+        # Route-average fleet is computed from mean realized route-km per route.
         acc_prob = 1.0
-        acc_T_weighted = float(np.mean([rd["T_i"] for rd in route_data])) if route_data else 1.0
+        acc_T_weighted = float(np.mean(list(design.dispatch_intervals.values()))) if design.dispatch_intervals else 1.0
+
+        acc_in_district = 0.0
+        acc_fleet = 0.0
+        acc_raw_fleet = 0
+        for root, T_i in design.dispatch_intervals.items():
+            avg_tour_km = route_km_sum_by_root.get(root, 0.0) / max(n_eval, 1)
+            acc_in_district += avg_tour_km / max(discount, 1e-12) / max(float(T_i), 1e-12)
+            acc_fleet += avg_tour_km / (speed * max(float(T_i), 1e-12))
+            acc_raw_fleet += _effective_fleet_size(avg_tour_km, float(T_i), speed)
 
         avg_wait = acc_wait_h / max(acc_riders, 1.0)
         avg_invehicle = acc_invehicle_h / max(acc_riders, 1.0)
@@ -2823,13 +3180,14 @@ class FRDetour(BaselineMethod):
 
         in_district_cost = acc_in_district
         fleet_size = float(acc_fleet)
+        raw_fleet_size = int(acc_raw_fleet)
         avg_dispatch_interval = acc_T_weighted / acc_prob
 
-        provider_cost = in_district_cost + fleet_cost_rate * fleet_size
+        provider_cost = in_district_cost + fleet_cost_rate * raw_fleet_size
         user_cost = (
-            wr * avg_wait
-            + wv * avg_invehicle
-            + self.walk_time_weight * wv * avg_walk
+            rider_time_weight * avg_wait
+            + rider_time_weight * avg_invehicle
+            + self.walk_time_weight * rider_time_weight * avg_walk
         ) * acc_prob
         total_cost = provider_cost + user_cost
 
@@ -2843,6 +3201,7 @@ class FRDetour(BaselineMethod):
             in_district_cost=in_district_cost,
             total_travel_cost=in_district_cost,
             fleet_size=fleet_size,
+            raw_fleet_size=raw_fleet_size,
             avg_dispatch_interval=avg_dispatch_interval,
             odd_cost=0.0,
             provider_cost=provider_cost,

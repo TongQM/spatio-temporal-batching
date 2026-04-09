@@ -63,7 +63,7 @@ class VCCTests(unittest.TestCase):
         self.assertAlmostEqual(stats["invehicle_h"], 1.0 / 30.0, places=6)
         self.assertAlmostEqual(stats["travel_km"], 2.0, places=6)
 
-    def test_custom_simulate_amortizes_provider_cost_by_horizon(self):
+    def test_custom_simulate_uses_raw_fleet_for_cost_and_amortized_for_metric(self):
         design = ServiceDesign(
             name="VCC",
             depot_id="B0",
@@ -97,6 +97,7 @@ class VCCTests(unittest.TestCase):
                 Lambda=1.0,
                 wr=2.0,
                 wv=10.0,
+                fleet_cost_rate=4.0,
             )
 
         self.assertAlmostEqual(result.avg_wait_time, 0.6, places=6)
@@ -104,7 +105,8 @@ class VCCTests(unittest.TestCase):
         self.assertAlmostEqual(result.avg_invehicle_time, 0.3, places=6)
         self.assertAlmostEqual(result.in_district_cost, 5.0, places=6)
         self.assertAlmostEqual(result.total_travel_cost, 5.0, places=6)
-        self.assertAlmostEqual(result.provider_cost, 5.0, places=6)
+        self.assertEqual(result.raw_fleet_size, 3)
+        self.assertAlmostEqual(result.provider_cost, 17.0, places=6)
         self.assertAlmostEqual(result.fleet_size, 10.0 / 60.0, places=6)
         self.assertAlmostEqual(result.avg_dispatch_interval, 2.0, places=6)
 

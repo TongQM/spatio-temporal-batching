@@ -1,24 +1,72 @@
 #!/usr/bin/env python3
-"""Sweep baseline hyperparameters and plot service-mode performance clouds.
+"""Baseline comparison sweep — two views of the service-mode performance cloud.
 
-This script reuses the existing baseline-comparison evaluation pipeline so each
-service is still evaluated with its own intended design/simulation logic.
+This script reuses the baseline-comparison evaluation pipeline so each service
+is still evaluated with its own intended design/simulation logic. It supports
+two sweep views:
+
+Regime view (``--view regime``, the default, main comparison)
+--------------------------------------------------------------
+Sweep the shared system inputs ``(Λ, wr)`` on a small grid and let each
+baseline re-optimize at its library defaults. Every cloud point means
+"method M's best design at system regime ``(Λ, wr)``" — same axes, same
+interpretation, directly comparable across baselines.
+
+Hyperparameter view (``--view hyper``, diagnostic)
+--------------------------------------------------
+Sweep per-baseline hyperparameters (fleet for FR, T for SP-Lit, K for Joint,
+etc.). Useful to see each method's own Pareto shape, but NOT apples-to-apples
+across baselines: different knobs span different axes of the cost plane.
+
+Shared parameters (used by both views)
+--------------------------------------
+``Λ`` — total arrival rate [passengers / hour]
+    Poisson arrival rate summed over the whole service area. Spatial
+    distribution is fixed by ``prob_dict`` so the per-block rate is
+    ``Λ · p_b``. A system input, not a design choice. Every baseline
+    receives the same ``Λ`` and must design a service that handles it.
+
+``wr`` — rider time cost weight [cost / rider-hour]
+    Weight on total user time (``wait + in-vehicle + walk``) in the design
+    objective and in the reported ``EvaluationResult.user_cost =
+    wr · total_user_time_per_rider · expected demand``.
+
+``wv`` — vehicle operating cost weight [cost / vehicle-km]
+    Weight on provider travel distance (linehaul + in-district + detour).
+    **Pinned to 1.0 in regime view** because ``evaluate_design`` /
+    ``simulate_design`` build ``provider_cost`` in km/hour without multiplying
+    by ``wv``, while the optimization side (e.g. ``_newton_T_star``, the
+    FR-Detour master) uses ``wv`` explicitly. Fixing ``wv = 1`` keeps the two
+    sides on the same scale without touching the shared evaluation helpers.
+
+Regime-responsiveness of each baseline at design time
+-----------------------------------------------------
+Not every baseline re-optimizes its design when ``(Λ, wr)`` changes:
+
+  Multi-FR / Multi-FR-Detour   : Λ ✓   wr/wv ✓   (Benders master)
+  SP-Lit (Carlsson)            : Λ ✗   wr/wv ✗   (uses fixed T_fixed)
+  TP-Lit (Liu)                 : Λ ✓   wr/wv ~   (Λ·T drives fleet sizing)
+  Joint-Nom / Joint-DRO        : Λ ✓   wr/wv ✓   (Newton T* uses wr/wv)
+  VCC                          : Λ ✓   wr/wv ✗   (Λ drives planning horizon)
+  OD (FullyOD)                 : Λ ✗   wr/wv ✗   (fixed T_min)
+
+For regime-insensitive designs the cloud shows "how does a fixed design
+behave as the world around it changes" — a legitimate and informative data
+point, not a bug.
 
 Outputs
 -------
-results/baseline_clouds/<experiment_name>/
-  aggregate_results.json
-  aggregate_summary.csv
-  scatter_user_provider_cloud.png
-  <baseline_slug>/
-    settings.json
-    summary.csv
-    setting_01.json
-    ...
-    setting_10.json
+``results/baseline_clouds/<view>_<descriptor>/``
+    ``experiment.json``           — sweep metadata including view, grid, pinned wv
+    ``aggregate_results.json``    — all rows + metadata
+    ``aggregate_summary.csv``     — flat CSV with Lambda, wr columns populated
+    ``scatter_user_provider_cloud.png``
+    ``<baseline_slug>/``
+        ``settings.json``         — the sweep settings for this baseline
+        ``summary.csv``
+        ``setting_01.json`` … setting_NN.json   — per-setting cache (resumable)
 
-Each per-setting JSON stores the hyperparameter setting, the common experiment
-parameters, and the reported EvaluationResult for that induced baseline.
+See ``.claude/rules/baseline_sweep.md`` for the full methodology reference.
 """
 
 from __future__ import annotations
@@ -217,6 +265,7 @@ def _result_row(
         "In-district": result.in_district_cost,
         "Total travel": result.total_travel_cost,
         "Fleet": result.fleet_size,
+        "Raw fleet": result.raw_fleet_size,
         "Dispatch interval (h)": result.avg_dispatch_interval,
         "ODD cost": result.odd_cost,
         "Provider cost": result.provider_cost,
@@ -241,7 +290,14 @@ def _worker_init(args_dict: Dict[str, Any]) -> None:
     _WORKER_ARGS = argparse.Namespace(**args_dict)
     _WORKER_J_FUNCTION = identity_J if _WORKER_ARGS.use_odd else zero_J
     _WORKER_DATA_CTX = _build_data_context(_WORKER_ARGS, use_odd=_WORKER_ARGS.use_odd)
-    _WORKER_SERVICE_SPECS = _build_service_specs(_WORKER_ARGS)
+    _WORKER_SERVICE_SPECS = _build_specs_for_view(_WORKER_ARGS)
+
+
+def _build_specs_for_view(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
+    """Dispatch to the regime or hyper spec builder based on `args.view`."""
+    if getattr(args, "view", "regime") == "regime":
+        return _build_regime_specs(args)
+    return _build_service_specs(args)
 
 
 def _worker_state(
@@ -281,6 +337,10 @@ def _run_setting_task(task: Dict[str, Any]) -> Dict[str, Any]:
 
     geodata, prob_dict, omega_dict = data_ctx[spec["data_group"]]
     method = spec["make_method"](setting)
+    # Per-setting Lambda / wr overrides let regime view sweep the shared
+    # (Lambda, wr) grid through the same infrastructure as hyper view.
+    lambda_value = float(setting.get("Lambda", spec["base_lambda"]))
+    wr_value = float(setting.get("wr", spec["base_wr"]))
     result = run_baseline(
         method=method,
         name=spec["display_name"],
@@ -289,8 +349,8 @@ def _run_setting_task(task: Dict[str, Any]) -> Dict[str, Any]:
         Omega_dict=omega_dict,
         J_function=J_function,
         num_districts=int(setting.get("num_districts", args.districts)),
-        Lambda=float(spec["base_lambda"]),
-        wr=spec["base_wr"],
+        Lambda=lambda_value,
+        wr=wr_value,
         wv=args.wv,
         road_network=data_ctx["road_network"],
         fleet_cost_rate=args.fleet_cost_rate,
@@ -308,8 +368,8 @@ def _run_setting_task(task: Dict[str, Any]) -> Dict[str, Any]:
     row = _result_row(
         baseline_name=spec["display_name"],
         setting_index=setting_index,
-        lambda_value=float(spec["base_lambda"]),
-        wr_value=spec["base_wr"],
+        lambda_value=lambda_value,
+        wr_value=wr_value,
         setting=setting,
         result=result,
     )
@@ -342,7 +402,8 @@ def _build_output_dir(args: argparse.Namespace) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     descriptor = f"grid{args.grid_size}x{args.grid_size}" if args.mode == "synthetic" else "real"
     folder = (
-        f"{args.mode}_{descriptor}"
+        f"{args.view}"
+        f"_{args.mode}_{descriptor}"
         f"_K{args.districts}"
         f"_L{int(args.Lambda)}"
         f"_wr{args.wr}_wv{args.wv}"
@@ -382,6 +443,41 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--out_dir", type=str, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--fr_delta", type=float, default=1.0)
+    parser.add_argument(
+        "--view",
+        choices=["regime", "hyper"],
+        default="regime",
+        help=(
+            "regime: sweep shared (Lambda, wr) grid at method defaults "
+            "(main comparison view). "
+            "hyper: sweep per-baseline hyperparameters (diagnostic)."
+        ),
+    )
+    parser.add_argument(
+        "--regime_lambdas",
+        type=float,
+        nargs="+",
+        default=[50.0, 150.0, 300.0],
+        help="Arrival rates (passengers/hour) for regime view.",
+    )
+    parser.add_argument(
+        "--regime_wrs",
+        type=float,
+        nargs="+",
+        default=[0.3, 1.0, 3.0],
+        help="Rider-time weights for regime view. wv is pinned to 1.0.",
+    )
+    parser.add_argument(
+        "--regime_fr_max_fleet",
+        type=float,
+        default=None,
+        help=(
+            "Override max_fleet for Multi-FR / Multi-FR-Detour in regime view. "
+            "Default (None) lets FRDetour fall back to num_districts for "
+            "fleet-parity with partition baselines. Set explicitly (e.g. 30) "
+            "when comparing FR's routing flexibility under a larger fleet."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -503,15 +599,18 @@ def _build_service_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "data_group": "grid",
             "base_lambda": args.Lambda,
             "base_wr": args.wr,
-            "varying_note": "vary num_districts and epsilon",
-            "settings": _cartesian_settings(
-                {
-                    "num_districts": [v for v in _spread_int_values(max_joint_k, 5) if v >= 1],
-                    "epsilon": dro_eps_values,
-                }
+            # epsilon (Wasserstein radius) is a robustness knob, not a
+            # provider-vs-user Pareto knob — sweeping it mixes a different
+            # effect into the cloud. Keep Joint-DRO at the CLI --epsilon and
+            # only sweep num_districts here. Put epsilon in a dedicated
+            # robustness plot instead.
+            "varying_note": "vary num_districts (epsilon fixed at --epsilon; not a Pareto knob)",
+            "settings": _primary_settings(
+                "num_districts",
+                [v for v in _spread_int_values(max_joint_k, 5) if v >= 1],
             ),
             "make_method": lambda s: JointDRO(
-                epsilon=float(s["epsilon"]),
+                epsilon=float(args.epsilon),
                 max_iters=args.rs_iters,
             ),
         },
@@ -554,12 +653,175 @@ def _build_service_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
     return {key: specs[key] for key in selected}
 
 
+def _regime_settings(lambdas: List[float], wrs: List[float]) -> List[Dict[str, Any]]:
+    """Shared (Lambda, wr) grid reused across every baseline in regime view."""
+    settings: List[Dict[str, Any]] = []
+    for lam in lambdas:
+        for wr in wrs:
+            settings.append(
+                {
+                    "Lambda": float(lam),
+                    "wr": float(wr),
+                    "setting_label": f"Λ={_label_value(lam)}, wr={_label_value(wr)}",
+                }
+            )
+    return settings
+
+
+def _build_regime_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
+    """Service specs for the regime view.
+
+    Each baseline sweeps the same shared (Lambda, wr) grid at its own
+    library defaults. `make_method` ignores the setting dict (Lambda / wr
+    are applied by `_run_setting_task` as per-setting overrides passed into
+    `run_baseline`). Every cloud point therefore represents "method M's best
+    design at system regime (Λ, wr)" — same axes, same interpretation.
+    """
+    shared_settings = _regime_settings(args.regime_lambdas, args.regime_wrs)
+    first_lambda = float(args.regime_lambdas[0]) if args.regime_lambdas else float(args.Lambda)
+    first_wr = float(args.regime_wrs[0]) if args.regime_wrs else float(args.wr)
+    regime_note = (
+        "shared (Λ, wr) regime sweep at method library defaults; "
+        "wv pinned to 1.0"
+    )
+
+    fr_max_fleet = (
+        float(args.regime_fr_max_fleet)
+        if getattr(args, "regime_fr_max_fleet", None) is not None
+        else None
+    )
+    fr_fleet_note = (
+        f" (max_fleet={fr_max_fleet:g})"
+        if fr_max_fleet is not None
+        else " (max_fleet falls back to num_districts)"
+    )
+
+    specs: Dict[str, Dict[str, Any]] = {
+        "multi_fr": {
+            "display_name": "Multi-FR (Jacquillat)",
+            "data_group": "fr",
+            "base_lambda": first_lambda,
+            "base_wr": first_wr,
+            "varying_note": regime_note + fr_fleet_note,
+            "settings": list(shared_settings),
+            "make_method": lambda s: FRDetour(
+                delta=0.0,
+                max_iters=args.rs_iters,
+                max_fleet=fr_max_fleet,
+                name="Multi-FR (Jacquillat)",
+            ),
+        },
+        "multi_fr_detour": {
+            "display_name": "Multi-FR-Detour (Jacquillat)",
+            "data_group": "fr",
+            "base_lambda": first_lambda,
+            "base_wr": first_wr,
+            "varying_note": regime_note + fr_fleet_note,
+            "settings": list(shared_settings),
+            "make_method": lambda s: FRDetour(
+                delta=float(args.fr_delta),
+                max_iters=args.rs_iters,
+                max_fleet=fr_max_fleet,
+            ),
+        },
+        "sp_lit": {
+            "display_name": "SP-Lit (Carlsson)",
+            "data_group": "grid",
+            "base_lambda": first_lambda,
+            "base_wr": first_wr,
+            "varying_note": regime_note + " (SP-Lit uses fixed T_fixed; design is regime-insensitive)",
+            "settings": list(shared_settings),
+            "make_method": lambda s: CarlssonPartition(),
+        },
+        "tp_lit": {
+            "display_name": "TP-Lit (Liu)",
+            "data_group": "tp",
+            "base_lambda": first_lambda,
+            "base_wr": first_wr,
+            "varying_note": regime_note,
+            "settings": list(shared_settings),
+            "make_method": lambda s: TemporalOnly(
+                n_candidates=args.tp_candidates,
+                region_km=args.tp_region_km,
+                region_low=args.tp_region_low,
+            ),
+        },
+        "joint_nom": {
+            "display_name": "Joint-Nom",
+            "data_group": "grid",
+            "base_lambda": first_lambda,
+            "base_wr": first_wr,
+            "varying_note": regime_note,
+            "settings": list(shared_settings),
+            "make_method": lambda s: JointNom(max_iters=args.rs_iters),
+        },
+        "joint_dro": {
+            "display_name": "Joint-DRO",
+            "data_group": "grid",
+            "base_lambda": first_lambda,
+            "base_wr": first_wr,
+            "varying_note": regime_note + f" (epsilon fixed at {args.epsilon})",
+            "settings": list(shared_settings),
+            "make_method": lambda s: JointDRO(
+                epsilon=float(args.epsilon),
+                max_iters=args.rs_iters,
+            ),
+        },
+        "vcc": {
+            "display_name": "VCC",
+            "data_group": "od",
+            "base_lambda": first_lambda,
+            "base_wr": first_wr,
+            "varying_note": regime_note + " (VCC uses constructor fleet_size; design is regime-insensitive in wr)",
+            "settings": list(shared_settings),
+            "make_method": lambda s: VCC(fleet_size=30),
+        },
+        "od": {
+            "display_name": "OD",
+            "data_group": "od",
+            "base_lambda": first_lambda,
+            "base_wr": first_wr,
+            "varying_note": regime_note + " (OD uses fixed T_min; design is regime-insensitive)",
+            "settings": list(shared_settings),
+            "make_method": lambda s: FullyOD(),
+        },
+    }
+
+    selected = args.services or [
+        "multi_fr", "multi_fr_detour",
+        "sp_lit", "tp_lit", "joint_nom", "joint_dro", "vcc", "od",
+    ]
+    return {key: specs[key] for key in selected if key in specs}
+
+
 def _plot_cloud(df: pd.DataFrame, out_path: Path, meta: Dict[str, Any]) -> None:
     fig = plt.figure(figsize=(10.5, 8.8))
     gs = fig.add_gridspec(nrows=2, ncols=1, height_ratios=[12, 1.8], hspace=0.18)
     ax = fig.add_subplot(gs[0, 0])
     notes_ax = fig.add_subplot(gs[1, 0])
     notes_ax.axis("off")
+
+    is_regime = meta.get("view") == "regime"
+    regime_lambdas = sorted(set(meta.get("regime_lambdas") or [])) if is_regime else []
+    # Marker size per Lambda (small / medium / large) so within-cloud
+    # structure is visible in regime view.
+    size_for_lambda: Dict[float, float] = {}
+    if regime_lambdas:
+        min_s, max_s = 28.0, 110.0
+        if len(regime_lambdas) == 1:
+            size_for_lambda[regime_lambdas[0]] = 0.5 * (min_s + max_s)
+        else:
+            for i, lam in enumerate(regime_lambdas):
+                frac = i / (len(regime_lambdas) - 1)
+                size_for_lambda[float(lam)] = min_s + frac * (max_s - min_s)
+
+    def _sizes_for_group(group: pd.DataFrame) -> np.ndarray:
+        if not is_regime or "Lambda" not in group.columns or not size_for_lambda:
+            return np.full(len(group), 52.0)
+        return np.array(
+            [size_for_lambda.get(float(lam), 52.0) for lam in group["Lambda"].to_numpy()],
+            dtype=float,
+        )
 
     for baseline_name, group in df.groupby("baseline", sort=False):
         group = _filter_cloud_outliers(group)
@@ -588,7 +850,7 @@ def _plot_cloud(df: pd.DataFrame, out_path: Path, meta: Dict[str, Any]) -> None:
         ax.scatter(
             group["Provider cost"],
             group["User Total (h)"],
-            s=52,
+            s=_sizes_for_group(group),
             alpha=0.78,
             color=style["color"],
             marker=style["marker"],
@@ -612,12 +874,20 @@ def _plot_cloud(df: pd.DataFrame, out_path: Path, meta: Dict[str, Any]) -> None:
     ax.set_xscale("log")
     ax.set_xlabel("Provider cost rate")
     ax.set_ylabel("User time (hours per rider)")
-    ax.set_title(
-        "Baseline Performance Clouds\n"
-        f"base K={meta['districts']}, Λ={meta['Lambda']}, wr={meta['wr']}, wv={meta['wv']}",
-        fontsize=12,
-        fontweight="bold",
-    )
+    if is_regime:
+        lambdas_txt = ", ".join(f"{l:g}" for l in regime_lambdas) if regime_lambdas else "-"
+        wrs_txt = ", ".join(f"{w:g}" for w in (meta.get("regime_wrs") or [])) or "-"
+        title = (
+            "Baseline Performance Clouds — shared regime sweep\n"
+            f"K={meta['districts']}, Λ∈{{{lambdas_txt}}}, wr∈{{{wrs_txt}}}, "
+            f"wv={meta['wv']} (pinned); marker size ∝ Λ"
+        )
+    else:
+        title = (
+            "Baseline Performance Clouds — per-method hyperparameter sweep\n"
+            f"base K={meta['districts']}, Λ={meta['Lambda']}, wr={meta['wr']}, wv={meta['wv']}"
+        )
+    ax.set_title(title, fontsize=12, fontweight="bold")
     ax.grid(True, alpha=0.2, linestyle="--", which="both")
     ax.legend(loc="best", framealpha=0.92, fontsize=8)
 
@@ -643,18 +913,37 @@ def _plot_cloud(df: pd.DataFrame, out_path: Path, meta: Dict[str, Any]) -> None:
 
 def main() -> None:
     args = _parse_args()
+
+    # Regime view pins wv=1 so the optimization side (uses wv explicitly)
+    # matches the evaluation side (builds provider_cost in km/hour with
+    # implicit wv=1). See module docstring for the full rationale.
+    if args.view == "regime" and args.wv != 1.0:
+        print(
+            f"[regime view] pinning wv=1.0 (was {args.wv}) so design-time and "
+            f"evaluation-time provider costing are on the same scale."
+        )
+        args.wv = 1.0
+
     out_dir = _build_output_dir(args)
-    service_specs = _build_service_specs(args)
+    service_specs = _build_specs_for_view(args)
 
     aggregate_rows: List[Dict[str, Any]] = []
     experiment_meta = {
         "timestamp": datetime.now().isoformat(),
+        "view": args.view,
         "mode": args.mode,
         "districts": args.districts,
         "grid_size": args.grid_size if args.mode == "synthetic" else None,
         "Lambda": args.Lambda,
         "wr": args.wr,
         "wv": args.wv,
+        "regime_lambdas": list(args.regime_lambdas) if args.view == "regime" else None,
+        "regime_wrs": list(args.regime_wrs) if args.view == "regime" else None,
+        "regime_fr_max_fleet": (
+            float(args.regime_fr_max_fleet)
+            if args.view == "regime" and args.regime_fr_max_fleet is not None
+            else None
+        ),
         "fleet_cost_rate": args.fleet_cost_rate,
         "epsilon": args.epsilon,
         "use_odd": args.use_odd,
@@ -666,7 +955,7 @@ def main() -> None:
         },
         "settings_per_baseline": args.settings_per_baseline,
         "jobs": args.jobs,
-        "fixed_lambda": True,
+        "fixed_lambda": args.view != "regime",
         "tp_candidates": args.tp_candidates,
         "tp_region_km": args.tp_region_km,
         "tp_region_low": args.tp_region_low,

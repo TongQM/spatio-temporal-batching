@@ -462,6 +462,7 @@ def main():
             "In-district":         round(r.in_district_cost, 4),
             "Total travel":        round(r.total_travel_cost, 4),
             "Fleet":               round(r.fleet_size, 2),
+            "Raw fleet":           int(r.raw_fleet_size),
             "Dispatch interval (h)": round(r.avg_dispatch_interval, 4),
             # Aggregates
             "ODD cost":            round(r.odd_cost, 4),
@@ -478,7 +479,7 @@ def main():
     # Print two-panel table matching the figure layout
     # ------------------------------------------------------------------ #
     user_cols     = ["Wait (h)", "In-vehicle (h)", "Walk (h)", "User Total (h)"]
-    provider_cols = ["Linehaul", "In-district", "Total travel", "Fleet",
+    provider_cols = ["Linehaul", "In-district", "Total travel", "Fleet", "Raw fleet",
                      "Dispatch interval (h)"]
 
     print("\n" + "=" * 95)

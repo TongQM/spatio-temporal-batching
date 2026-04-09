@@ -57,12 +57,13 @@ class EvaluationResult:
     in_district_cost   : Σ (in-district tour) / discount / T_i  (weighted)
     total_travel_cost  : linehaul_cost + in_district_cost
     fleet_size         : amortized fleet requirement / average active vehicles
+    raw_fleet_size     : effective fleet count used for fixed fleet cost
     avg_dispatch_interval : demand-weighted mean T* across districts (hours)
 
     Aggregates
     ----------
     odd_cost           : Σ F_i / T_i  (ODD operating cost)
-    provider_cost      : linehaul + in_district + odd
+    provider_cost      : linehaul + in_district + odd + fixed fleet cost
     user_cost          : wr * total_user_time (weighted by demand)
     total_cost         : provider_cost + user_cost
     """
@@ -79,6 +80,7 @@ class EvaluationResult:
     in_district_cost: float
     total_travel_cost: float
     fleet_size: float
+    raw_fleet_size: int
     avg_dispatch_interval: float  # hours
 
     # --- Aggregates ---
@@ -103,6 +105,7 @@ class EvaluationResult:
                 "total_travel_cost":     round(self.total_travel_cost, 6),
                 "odd_cost":              round(self.odd_cost, 6),
                 "fleet_size":            round(self.fleet_size, 4),
+                "raw_fleet_size":        int(self.raw_fleet_size),
                 "avg_dispatch_interval_h": round(self.avg_dispatch_interval, 6),
                 "provider_cost":         round(self.provider_cost, 6),
             },
@@ -221,26 +224,59 @@ def _centroid_block(geodata, block_ids: List[str]) -> str:
 # Core shared evaluation
 # ---------------------------------------------------------------------------
 
-def _nn_tsp_length(depot: np.ndarray, points: np.ndarray) -> float:
-    """Nearest-neighbour TSP tour: depot → points → depot.  Returns km."""
+def _nn_tsp_route(
+    depot: np.ndarray,
+    points: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Nearest-neighbour TSP tour: depot → points → depot.
+
+    Returns
+    -------
+    order : permutation of point indices in visit order
+    cumulative_km : cumulative travel from depot to each visited point
+    total_km : depot → points → depot route length
+    """
     n = len(points)
     if n == 0:
-        return 0.0
-    if n == 1:
-        return 2.0 * float(np.linalg.norm(points[0] - depot))
+        return (
+            np.array([], dtype=int),
+            np.array([], dtype=float),
+            0.0,
+        )
 
     used = np.zeros(n, dtype=bool)
-    current = depot.copy()
+    order = np.empty(n, dtype=int)
+    cumulative = np.empty(n, dtype=float)
+    current = np.asarray(depot, dtype=float)
     total = 0.0
-    for _ in range(n):
+    for k in range(n):
         dists = np.linalg.norm(points - current, axis=1)
         dists[used] = np.inf
         nearest = int(np.argmin(dists))
         total += float(dists[nearest])
+        order[k] = nearest
+        cumulative[k] = total
         current = points[nearest]
         used[nearest] = True
     total += float(np.linalg.norm(current - depot))
-    return total
+    return order, cumulative, total
+
+
+def _nn_tsp_length(depot: np.ndarray, points: np.ndarray) -> float:
+    """Nearest-neighbour TSP tour length: depot → points → depot.  Returns km."""
+    return _nn_tsp_route(depot, points)[2]
+
+
+def _effective_fleet_size(
+    route_km: float,
+    dispatch_interval_h: float,
+    speed_kmh: float = VEHICLE_SPEED_KMH,
+) -> int:
+    """Convert continuous fleet utilization into an effective vehicle count."""
+    if route_km <= 1e-12 or dispatch_interval_h <= 1e-12 or speed_kmh <= 1e-12:
+        return 0
+    cont_fleet = route_km / (speed_kmh * dispatch_interval_h)
+    return int(math.ceil(max(cont_fleet - 1e-12, 0.0)))
 
 
 def simulate_design(
@@ -411,6 +447,10 @@ def simulate_design(
     acc_in_district = float((avg_tour_km / (discount * T_dist) * p_dist).sum())
     acc_odd         = float((F_dist / T_dist * p_dist).sum())
     acc_fleet       = float((avg_tour_km / (VEHICLE_SPEED_KMH * T_dist)).sum())
+    raw_fleet_size  = int(sum(
+        _effective_fleet_size(float(avg_tour_km[d]), float(T_dist[d]))
+        for d in range(n_districts)
+    ))
     acc_wait        = float((T_dist / 2.0 * p_dist).sum())
     acc_invehicle   = float((avg_tour_km / (2.0 * VEHICLE_SPEED_KMH) * p_dist).sum())
     acc_T_w         = float((T_dist * p_dist).sum())
@@ -431,7 +471,7 @@ def simulate_design(
         linehaul_cost
         + in_district_cost
         + odd_cost
-        + fleet_cost_rate * fleet_size
+        + fleet_cost_rate * raw_fleet_size
     )
     user_cost     = wr * total_user_time * total_prob
     total_cost    = provider_cost + user_cost
@@ -446,6 +486,7 @@ def simulate_design(
         in_district_cost=in_district_cost,
         total_travel_cost=total_travel_cost,
         fleet_size=fleet_size,
+        raw_fleet_size=raw_fleet_size,
         avg_dispatch_interval=avg_dispatch_interval,
         odd_cost=odd_cost,
         provider_cost=provider_cost,
@@ -477,7 +518,8 @@ def evaluate_design(
       K_i  = dist(depot → closest block in B_i)           [linehaul, km]
       F_i  = J(max ODD vector over B_i)                   [ODD cost]
       tour_i = BHH β√(Λ T_i) α_i  OR  road TSP on B_i    [in-district, km]
-      fleet_i = tour_i / (speed × T_i)                    [vehicles]
+      fleet_i = tour_i / (speed × T_i)                    [amortized vehicles]
+      raw_fleet_i = ceil(fleet_i)                         [effective fleet]
 
     User costs (per rider, averaged over demand):
       wait      = T_i / 2
@@ -511,7 +553,8 @@ def evaluate_design(
     acc_odd = 0.0
     acc_wait = 0.0          # hours × prob
     acc_invehicle = 0.0     # hours × prob
-    acc_fleet = 0.0         # vehicles (summed, not averaged)
+    acc_fleet = 0.0         # amortized vehicles
+    acc_raw_fleet = 0       # effective fleet count
     acc_T_weighted = 0.0    # T_i × prob  (for demand-weighted mean T)
     acc_prob = 0.0
 
@@ -565,8 +608,9 @@ def evaluate_design(
         period_in_district = provider_in_district / T_i
         period_odd         = F_i / T_i
 
-        # Fleet for this district: vehicles needed so one vehicle finishes before next dispatch
-        fleet_i = tour_km / (VEHICLE_SPEED_KMH * T_i)   # continuous; round up in practice
+        # Fleet for this district: amortized utilization and effective count.
+        fleet_i = tour_km / (VEHICLE_SPEED_KMH * T_i)
+        raw_fleet_i = _effective_fleet_size(tour_km, T_i)
 
         # User times per rider (hours)
         wait_i      = T_i / 2.0
@@ -577,7 +621,8 @@ def evaluate_design(
         acc_odd         += period_odd         * district_prob
         acc_wait        += wait_i             * district_prob
         acc_invehicle   += invehicle_i        * district_prob
-        acc_fleet       += fleet_i                             # fleet is summed, not averaged
+        acc_fleet       += fleet_i
+        acc_raw_fleet   += raw_fleet_i
         acc_T_weighted  += T_i               * district_prob
         acc_prob        += district_prob
 
@@ -594,13 +639,14 @@ def evaluate_design(
     total_travel_cost  = linehaul_cost + in_district_cost
     odd_cost           = acc_odd
     fleet_size         = acc_fleet
+    raw_fleet_size     = int(acc_raw_fleet)
     avg_dispatch_interval = acc_T_weighted / acc_prob
 
     provider_cost = (
         linehaul_cost
         + in_district_cost
         + odd_cost
-        + fleet_cost_rate * fleet_size
+        + fleet_cost_rate * raw_fleet_size
     )
     user_cost     = wr * total_user_time * acc_prob   # aggregate over demand
     total_cost    = provider_cost + user_cost
@@ -615,6 +661,7 @@ def evaluate_design(
         in_district_cost=in_district_cost,
         total_travel_cost=total_travel_cost,
         fleet_size=fleet_size,
+        raw_fleet_size=raw_fleet_size,
         avg_dispatch_interval=avg_dispatch_interval,
         odd_cost=odd_cost,
         provider_cost=provider_cost,

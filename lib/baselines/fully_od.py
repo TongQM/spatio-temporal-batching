@@ -10,7 +10,7 @@ import numpy as np
 
 from lib.baselines.base import (
     BETA, BaselineMethod, EvaluationResult, ServiceDesign,
-    VEHICLE_SPEED_KMH, _get_pos,
+    VEHICLE_SPEED_KMH, _effective_fleet_size, _get_pos,
 )
 from lib.constants import DEFAULT_FLEET_COST_RATE
 
@@ -152,7 +152,8 @@ class FullyOD(BaselineMethod):
         avg_route_km_per_cycle = total_route_km / max(n_scenarios, 1)
         in_district_cost = avg_route_km_per_cycle / max(T, 1e-9)
         fleet_size = avg_route_km_per_cycle / (VEHICLE_SPEED_KMH * max(T, 1e-9))
-        provider_cost = in_district_cost + fleet_cost_rate * fleet_size
+        raw_fleet_size = _effective_fleet_size(avg_route_km_per_cycle, T)
+        provider_cost = in_district_cost + fleet_cost_rate * raw_fleet_size
         user_cost = wr * total_user_time
         total_cost = provider_cost + user_cost
 
@@ -166,6 +167,7 @@ class FullyOD(BaselineMethod):
             in_district_cost=in_district_cost,
             total_travel_cost=in_district_cost,
             fleet_size=fleet_size,
+            raw_fleet_size=raw_fleet_size,
             avg_dispatch_interval=T,
             odd_cost=0.0,
             provider_cost=provider_cost,

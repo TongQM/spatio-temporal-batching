@@ -665,9 +665,10 @@ class VCC(BaselineMethod):
         fleet_size = raw_avg_travel_km / (
             float(meta["vehicle_speed_kmh"]) * max(horizon_h, 1e-9)
         )
+        raw_fleet_size = int(meta["fleet_size"])
         avg_dispatch_interval = horizon_h
 
-        provider_cost = total_travel_cost + fleet_cost_rate * fleet_size
+        provider_cost = total_travel_cost + fleet_cost_rate * raw_fleet_size
         user_cost = wr * total_user_time
         total_cost = provider_cost + user_cost
 
@@ -681,6 +682,7 @@ class VCC(BaselineMethod):
             in_district_cost=in_district_cost,
             total_travel_cost=total_travel_cost,
             fleet_size=fleet_size,
+            raw_fleet_size=raw_fleet_size,
             avg_dispatch_interval=avg_dispatch_interval,
             odd_cost=odd_cost,
             provider_cost=provider_cost,

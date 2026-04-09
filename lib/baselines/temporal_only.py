@@ -1058,6 +1058,7 @@ class TemporalOnly(BaselineMethod):
             sum_customers += total_demand
 
         if sum_customers == 0:
+            raw_fleet_size = int(meta.get("fleet_size", self._fleet_size))
             return EvaluationResult(
                 name=design.name,
                 avg_wait_time=T / 2.0,
@@ -1068,11 +1069,12 @@ class TemporalOnly(BaselineMethod):
                 in_district_cost=0.0,
                 total_travel_cost=0.0,
                 fleet_size=0.0,
+                raw_fleet_size=raw_fleet_size,
                 avg_dispatch_interval=T,
                 odd_cost=0.0,
-                provider_cost=0.0,
+                provider_cost=fleet_cost_rate * raw_fleet_size,
                 user_cost=wr * T / 2.0,
-                total_cost=wr * T / 2.0,
+                total_cost=fleet_cost_rate * raw_fleet_size + wr * T / 2.0,
             )
 
         avg_wait = sum_wait_h / sum_customers
@@ -1086,9 +1088,10 @@ class TemporalOnly(BaselineMethod):
         odd_cost = 0.0
         total_travel_cost = in_district_cost
         fleet_size = avg_travel_km / (VEHICLE_SPEED_KMH * T)
+        raw_fleet_size = int(meta.get("fleet_size", self._fleet_size))
         avg_dispatch_interval = T
 
-        provider_cost = total_travel_cost + fleet_cost_rate * fleet_size
+        provider_cost = total_travel_cost + fleet_cost_rate * raw_fleet_size
         user_cost = wr * total_user_time
         total_cost = provider_cost + user_cost
 
@@ -1102,6 +1105,7 @@ class TemporalOnly(BaselineMethod):
             in_district_cost=in_district_cost,
             total_travel_cost=total_travel_cost,
             fleet_size=fleet_size,
+            raw_fleet_size=raw_fleet_size,
             avg_dispatch_interval=avg_dispatch_interval,
             odd_cost=odd_cost,
             provider_cost=provider_cost,
