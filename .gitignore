@@ -2,6 +2,9 @@
 data/
 cache/
 papers/
+results/
+.vscode/
+.zhang2023code/
 
 # Legacy paths (now inside data/)
 2020_target_block_population/

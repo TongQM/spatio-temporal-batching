@@ -464,8 +464,29 @@ def _parse_args() -> argparse.Namespace:
         "--regime_wrs",
         type=float,
         nargs="+",
-        default=[0.3, 1.0, 3.0],
+        default=[1.0, 3.0, 10.0],
         help="Rider-time weights for regime view. wv is pinned to 1.0.",
+    )
+    parser.add_argument(
+        "--fr_t_max",
+        type=float,
+        default=3.0,
+        help=(
+            "Max dispatch interval (hours) in Multi-FR / Multi-FR-Detour's "
+            "internal T_values grid. Default 3.0 extends the grid to "
+            "[0.1, ..., 1.0, 1.5, 2.0, 3.0] so FR can explore longer "
+            "headways comparable to partition methods' T*."
+        ),
+    )
+    parser.add_argument(
+        "--fr_t_dense",
+        action="store_true",
+        help=(
+            "Use a denser T grid for Multi-FR / Multi-FR-Detour by inserting "
+            "midpoints between every pair of adjacent values. Roughly doubles "
+            "the number of grid points and lets FR approximate a continuous "
+            "T* more precisely, at the cost of ~2x Benders runtime."
+        ),
     )
     parser.add_argument(
         "--regime_fr_max_fleet",
@@ -653,6 +674,27 @@ def _build_service_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
     return {key: specs[key] for key in selected}
 
 
+def _od_fleet_grid(Lambda: float) -> List[int]:
+    """Lambda-scaled fleet-size candidates for OD's queueing optimization.
+
+    Sizes the grid so the minimum vehicle count keeps utilisation below
+    ~85% at the given arrival rate. Rough calculation:
+        required_fleet ≈ ceil(Lambda · round_trip_h / 0.85)
+    where round_trip ≈ 4 km at 30 km/h = 0.133 h. Candidates span from
+    near-saturation (cheap, moderate queue) to large-fleet (near-zero queue).
+    """
+    round_trip_h = 4.0 / 30.0
+    min_fleet = max(3, int(np.ceil(Lambda * round_trip_h / 0.85)))
+    raw = [
+        min_fleet,
+        int(np.ceil(min_fleet * 1.25)),
+        int(np.ceil(min_fleet * 1.5)),
+        int(np.ceil(min_fleet * 2.0)),
+        int(np.ceil(min_fleet * 3.0)),
+    ]
+    return sorted(set(raw))
+
+
 def _regime_settings(lambdas: List[float], wrs: List[float]) -> List[Dict[str, Any]]:
     """Shared (Lambda, wr) grid reused across every baseline in regime view."""
     settings: List[Dict[str, Any]] = []
@@ -696,18 +738,37 @@ def _build_regime_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
         else " (max_fleet falls back to num_districts)"
     )
 
+    # Build extended T_values grid for FR so it can explore longer
+    # dispatch intervals comparable to partition methods' Newton T*.
+    # Denser grid in [0.1, 1.0] so FR can approximate Joint's continuous T*
+    # (which lands near 0.11, 0.33, 0.88 in our regime sweep).
+    fr_t_max = float(getattr(args, "fr_t_max", 3.0))
+    base_t = [0.05, 0.075, 0.1, 0.125, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4,
+              0.5, 0.625, 0.75, 0.875, 1.0]
+    extended_t = [1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
+    fr_t_values = sorted(set(t for t in base_t + extended_t if t <= fr_t_max + 1e-9))
+
+    if getattr(args, "fr_t_dense", False):
+        # Insert midpoints between every adjacent pair → roughly doubles density.
+        midpoints = [(fr_t_values[i] + fr_t_values[i + 1]) / 2.0
+                     for i in range(len(fr_t_values) - 1)]
+        fr_t_values = sorted(set(fr_t_values + [round(m, 6) for m in midpoints]))
+
+    fr_t_note = f" (T_values up to {fr_t_max:g}h, {len(fr_t_values)} values)"
+
     specs: Dict[str, Dict[str, Any]] = {
         "multi_fr": {
             "display_name": "Multi-FR (Jacquillat)",
             "data_group": "fr",
             "base_lambda": first_lambda,
             "base_wr": first_wr,
-            "varying_note": regime_note + fr_fleet_note,
+            "varying_note": regime_note + fr_fleet_note + fr_t_note,
             "settings": list(shared_settings),
             "make_method": lambda s: FRDetour(
                 delta=0.0,
                 max_iters=args.rs_iters,
                 max_fleet=fr_max_fleet,
+                T_values=fr_t_values,
                 name="Multi-FR (Jacquillat)",
             ),
         },
@@ -716,12 +777,13 @@ def _build_regime_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "data_group": "fr",
             "base_lambda": first_lambda,
             "base_wr": first_wr,
-            "varying_note": regime_note + fr_fleet_note,
+            "varying_note": regime_note + fr_fleet_note + fr_t_note,
             "settings": list(shared_settings),
             "make_method": lambda s: FRDetour(
                 delta=float(args.fr_delta),
                 max_iters=args.rs_iters,
                 max_fleet=fr_max_fleet,
+                T_values=fr_t_values,
             ),
         },
         "sp_lit": {
@@ -729,9 +791,9 @@ def _build_regime_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "data_group": "grid",
             "base_lambda": first_lambda,
             "base_wr": first_wr,
-            "varying_note": regime_note + " (SP-Lit uses fixed T_fixed; design is regime-insensitive)",
+            "varying_note": regime_note + " (T* optimized per district via Newton, same as Joint)",
             "settings": list(shared_settings),
-            "make_method": lambda s: CarlssonPartition(),
+            "make_method": lambda s: CarlssonPartition(T_fixed=None),
         },
         "tp_lit": {
             "display_name": "TP-Lit (Liu)",
@@ -760,7 +822,7 @@ def _build_regime_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "data_group": "grid",
             "base_lambda": first_lambda,
             "base_wr": first_wr,
-            "varying_note": regime_note + f" (epsilon fixed at {args.epsilon})",
+            "varying_note": regime_note + f" (epsilon={args.epsilon})",
             "settings": list(shared_settings),
             "make_method": lambda s: JointDRO(
                 epsilon=float(args.epsilon),
@@ -781,9 +843,15 @@ def _build_regime_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "data_group": "od",
             "base_lambda": first_lambda,
             "base_wr": first_wr,
-            "varying_note": regime_note + " (OD uses fixed T_min; design is regime-insensitive)",
+            "varying_note": regime_note + " (queueing, Lambda-scaled fleet grid; best picked per regime)",
             "settings": list(shared_settings),
-            "make_method": lambda s: FullyOD(),
+            # Lambda-scaled fleet grid: minimum fleet sized to keep utilisation
+            # below ~85% (round-trip 4 km @ 30 km/h → 0.133 h per trip).
+            # Avoids the unrealistic "fleet=3 at Λ=300" case where OD queues
+            # grow unboundedly.
+            "make_method": lambda s: FullyOD(
+                fleet_size_grid=_od_fleet_grid(float(s["Lambda"])),
+            ),
         },
     }
 
@@ -1000,12 +1068,28 @@ def main() -> None:
             )
 
     if args.jobs == 1:
-        for task in tasks:
+        import time as _time
+        n_tasks = len(tasks)
+        t0 = _time.monotonic()
+        for task_i, task in enumerate(tasks):
             setting_index = task["setting_index"]
             service_key = task["service_key"]
             spec = service_specs[service_key]
             setting = spec["settings"][setting_index - 1]
-            print(f"  [{spec['display_name']} #{setting_index:02d}] {setting['setting_label']}")
+            elapsed = _time.monotonic() - t0
+            if task_i > 0:
+                avg = elapsed / task_i
+                eta = avg * (n_tasks - task_i)
+                eta_str = f"ETA {eta / 60:.0f}m"
+            else:
+                eta_str = "ETA --"
+            print(
+                f"  [{task_i + 1}/{n_tasks}] "
+                f"{spec['display_name']} #{setting_index:02d} "
+                f"| {setting['setting_label']} "
+                f"| elapsed {elapsed / 60:.1f}m, {eta_str}",
+                flush=True,
+            )
             task_result = _run_setting_task(task)
             if task_result["status"] == "completed":
                 baseline_rows_map[service_key].append(task_result["row"])

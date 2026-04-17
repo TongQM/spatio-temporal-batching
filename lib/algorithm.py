@@ -362,7 +362,7 @@ class Partition:
         return best_depot, block_centers, best_assignment, best_obj_val, best_district_info
 
 
-    def _CQCP_benders(self, assigned_blocks, root, prob_dict, epsilon, K_i, F_i, grid_points=20, beta=None, Lambda=None, single_threaded=False, T_override=None):
+    def _CQCP_benders(self, assigned_blocks, root, prob_dict, epsilon, K_i, F_i, grid_points=20, beta=None, Lambda=None, single_threaded=False, T_override=None, wr=None, wv=None):
         """
         Updated CQCP subproblem that accepts partition-dependent costs K_i and F_i as parameters.
         
@@ -452,15 +452,17 @@ class Partition:
         alpha_i = beta * np.sqrt(Lambda) * raw_alpha
         alpha_provider = alpha_i / travel_discount
         
-        # Use speeds consistent with distance units (km). Prefer km/h if available.
-        wr = getattr(self.geodata, 'wr_kmh', None)
-        wv = getattr(self.geodata, 'wv_kmh', None)
-        if wr is None or wv is None:
-            # Fallback: convert mph to km/h if only mph provided
-            wr_mph = getattr(self.geodata, 'wr', 1.0)
-            wv_mph = getattr(self.geodata, 'wv', 10.0)
-            wr = wr_mph * 1.60934
-            wv = wv_mph * 1.60934
+        # Use wr/wv passed by the caller (from the sweep / design interface).
+        # Fall back to geodata attributes only for legacy callers that don't
+        # pass wr/wv explicitly.
+        if wr is None:
+            wr = getattr(self.geodata, 'wr_kmh', None)
+            if wr is None:
+                wr = getattr(self.geodata, 'wr', 1.0)
+        if wv is None:
+            wv = getattr(self.geodata, 'wv_kmh', None)
+            if wv is None:
+                wv = getattr(self.geodata, 'wv', 10.0)
         
         def g_bar_objective(ci):
             """Objective function g_bar(ci)"""
@@ -546,16 +548,16 @@ class Partition:
         """
         Wrapper function for parallel subproblem solving
         """
-        assigned_block_ids, root_id, prob_dict, epsilon, K_i, F_i, J_function, omega_sol, beta, Lambda = args
-        
+        assigned_block_ids, root_id, prob_dict, epsilon, K_i, F_i, J_function, omega_sol, beta, Lambda, wr, wv = args
+
         # Calculate actual F_i using the J_function and the district's ODD vector
         actual_F_i = J_function(omega_sol)
-        
+
         # Call subproblem solver with thread-safe flag
         return self._CQCP_benders(
-            assigned_block_ids, root_id, prob_dict, epsilon, 
+            assigned_block_ids, root_id, prob_dict, epsilon,
             K_i=K_i, F_i=actual_F_i, single_threaded=True,
-            beta=beta, Lambda=Lambda
+            beta=beta, Lambda=Lambda, wr=wr, wv=wv,
         )
 
     def benders_decomposition(self, max_iterations=50, tolerance=1e-3, verbose=True, 
@@ -861,8 +863,8 @@ class Partition:
                     assigned_blocks = [j for j in range(N) if round(z_sol[j, root]) == 1]
                     assigned_block_ids = [block_ids[j] for j in assigned_blocks]
                     district_omega = omega_sol[root]
-                    args = (assigned_block_ids, block_ids[root], self.prob_dict, self.epsilon, 
-                            K_sol[root], F_sol[root], J_function, district_omega, beta, Lambda)
+                    args = (assigned_block_ids, block_ids[root], self.prob_dict, self.epsilon,
+                            K_sol[root], F_sol[root], J_function, district_omega, beta, Lambda, wr, wv)
                     subproblem_args.append((args, root, assigned_blocks))
             
                 # Solve subproblems in parallel with timing
@@ -899,9 +901,9 @@ class Partition:
                     actual_F_i = J_function(district_omega)
                 
                     cost, x_star, subgrad, T_star, alpha_i, subgrad_K_i, subgrad_F_i = self._CQCP_benders(
-                        [block_ids[j] for j in assigned_blocks], block_ids[root], 
+                        [block_ids[j] for j in assigned_blocks], block_ids[root],
                         self.prob_dict, self.epsilon, K_i=K_sol[root], F_i=actual_F_i,
-                        beta=beta, Lambda=Lambda)
+                        beta=beta, Lambda=Lambda, wr=wr, wv=wv)
                     district_costs.append((cost, root, assigned_blocks, subgrad, x_star, T_star, alpha_i, subgrad_K_i, subgrad_F_i))
                     subgrads.append(subgrad)
                 
@@ -1230,7 +1232,8 @@ class Partition:
             # CQCP inner maximization with updated costs
             cost, x_star, _, T_star, alpha_i, subgrad_K_i, subgrad_F_i = self._CQCP_benders(
                 assigned_blocks, root, prob_dict, epsilon, K_i=K_i, F_i=F_i,
-                beta=beta, Lambda=Lambda, T_override=T_override
+                beta=beta, Lambda=Lambda, T_override=T_override,
+                wr=wr, wv=wv,
             )
             
             district_info.append((cost, root, K_i, F_i, T_star, x_star))

@@ -25,6 +25,7 @@ import numpy as np
 from lib.baselines.base import (
     BETA, BaselineMethod, EvaluationResult, ServiceDesign,
     VEHICLE_SPEED_KMH, _effective_fleet_size, _get_pos, _nn_tsp_route,
+    _newton_T_star, _bhh_alpha,
 )
 from lib.constants import DEFAULT_FLEET_COST_RATE
 
@@ -525,14 +526,17 @@ class CarlssonPartition(BaselineMethod):
 
     Parameters
     ----------
-    T_fixed    : fixed dispatch interval for all districts (hours)
+    T_fixed    : fixed dispatch interval for all districts (hours).
+                 If None, compute T* per district via Newton's method
+                 using the same _newton_T_star formula as Joint baselines,
+                 making the design regime-responsive to (Lambda, wr, wv).
     n_angles   : angular resolution for ham-sandwich line search
     resolution : side length of the fine integration grid  (resolution^2 cells)
     """
 
     def __init__(
         self,
-        T_fixed: float = 0.5,
+        T_fixed: float | None = 0.5,
         n_angles: int = 360,
         resolution: int = 100,
         name: str | None = None,
@@ -549,6 +553,9 @@ class CarlssonPartition(BaselineMethod):
         Omega_dict,
         J_function: Callable,
         num_districts: int,
+        Lambda: float = 1.0,
+        wr: float = 1.0,
+        wv: float = 1.0,
         **kwargs,
     ) -> ServiceDesign:
         block_ids = geodata.short_geoid_list
@@ -612,12 +619,37 @@ class CarlssonPartition(BaselineMethod):
             for j in group:
                 assignment[j, root_idx] = 1.0
 
+        # Compute dispatch intervals: fixed or per-district optimal T*
+        if self.T_fixed is not None:
+            dispatch_intervals = {r: self.T_fixed for r in roots}
+        else:
+            # Per-district T* via Newton's method, same formula as Joint
+            dispatch_intervals = {}
+            for r in roots:
+                r_idx = block_ids.index(r)
+                assigned_blocks = [block_ids[j] for j in range(N)
+                                   if round(assignment[j, r_idx]) == 1]
+                K_i = min(
+                    float(np.linalg.norm(block_pos[depot_idx] - block_pos[block_ids.index(b)]))
+                    / 1000.0  # metres → km
+                    for b in assigned_blocks
+                )
+                alpha_i = _bhh_alpha(geodata, assigned_blocks, prob_dict)
+                F_i = 0.0
+                if Omega_dict and J_function:
+                    ref = next(iter(Omega_dict.values()))
+                    d_omega = np.zeros_like(ref)
+                    for b in assigned_blocks:
+                        d_omega = np.maximum(d_omega, Omega_dict.get(b, np.zeros_like(ref)))
+                    F_i = J_function(d_omega)
+                dispatch_intervals[r] = _newton_T_star(K_i, F_i, alpha_i, wr, wv)
+
         return ServiceDesign(
             name=self._name,
             assignment=assignment,
             depot_id=depot_id,
             district_roots=roots,
-            dispatch_intervals={r: self.T_fixed for r in roots},
+            dispatch_intervals=dispatch_intervals,
             service_metadata={
                 "grid_label": grid_label.copy(),
                 "resolution": self.resolution,

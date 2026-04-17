@@ -1,10 +1,20 @@
 """
 Fully on-demand (OD) baseline: one district, dispatch every T → 0.
 Represents maximum route flexibility, no spatial or temporal batching.
+
+Supports finite fleet with queueing:
+  - ``fleet_size`` caps the number of vehicles operating in parallel.
+  - Each request is served depot → destination → depot; a request waits
+    in queue when all vehicles are busy.
+  - When ``fleet_size_grid`` is supplied, the method sweeps over the grid
+    per call and keeps the fleet size that minimises total cost at the
+    given (Lambda, wr, wv, fleet_cost_rate), analogous to SP-Lit's T*
+    optimisation.
 """
 from __future__ import annotations
 
-from typing import Callable, Dict
+import heapq
+from typing import Callable, Dict, Iterable, Optional
 
 import numpy as np
 
@@ -22,14 +32,35 @@ class FullyOD(BaselineMethod):
     (or nearly so), minimising wait time at the expense of high travel cost.
     """
 
-    def __init__(self, T_min: float = 1.0 / 60.0):
+    def __init__(
+        self,
+        T_min: float = 1.0 / 60.0,
+        fleet_size: Optional[int] = None,
+        fleet_size_grid: Optional[Iterable[int]] = None,
+        horizon_h: float = 1.0,
+    ):
         """
         Parameters
         ----------
         T_min : float
             Dispatch interval in hours (default: 1 minute = 1/60 h).
+        fleet_size : int or None
+            Fixed fleet cap. None = infinite fleet (no queueing).
+        fleet_size_grid : iterable[int] or None
+            When provided, ``custom_simulate`` tries each candidate fleet
+            size and keeps the one minimising total_cost at the given
+            (Lambda, wr, wv, fleet_cost_rate). Overrides ``fleet_size``.
+        horizon_h : float
+            Simulation horizon per scenario (hours). Longer horizons
+            give tighter estimates of steady-state queue dynamics.
         """
         self.T_min = T_min
+        self.fleet_size = int(fleet_size) if fleet_size is not None else None
+        self.fleet_size_grid = (
+            tuple(int(f) for f in fleet_size_grid)
+            if fleet_size_grid is not None else None
+        )
+        self.horizon_h = float(horizon_h)
 
     def design(
         self,
@@ -76,16 +107,18 @@ class FullyOD(BaselineMethod):
         wr: float,
         wv: float,
         fleet_cost_rate: float = DEFAULT_FLEET_COST_RATE,
-        n_scenarios: int = 500,
+        n_scenarios: int = 50,
     ) -> EvaluationResult:
-        """Simulate depot-origin fully on-demand service.
+        """Simulate depot-origin fully on-demand service with queueing.
 
         Each realized demand is served by its own vehicle:
           depot -> destination -> depot
 
-        A group sharing the same destination is treated as one demand atom by
-        the Poisson draw at the location level.
+        When ``fleet_size`` (or a chosen candidate from ``fleet_size_grid``)
+        is finite, an event-driven queue assigns each arrival to the next
+        free vehicle; arrivals wait in queue when all vehicles are busy.
         """
+        # ---- Precompute geometry / demand density (independent of fleet_size) ----
         block_ids = geodata.short_geoid_list
         block_pos_m = np.array([_get_pos(geodata, b) for b in block_ids], dtype=float)
         block_pos_km = block_pos_m / 1000.0
@@ -120,40 +153,117 @@ class FullyOD(BaselineMethod):
         else:
             cell_prob = np.ones(len(grid_pos_km), dtype=float) / max(len(grid_pos_km), 1)
 
+        # ---- Pre-sample arrivals and destinations once, reuse across fleet sizes ----
+        horizon_h = self.horizon_h
+        speed = VEHICLE_SPEED_KMH
         rng = np.random.default_rng(42)
-        total_wait_h = 0.0
-        total_invehicle_h = 0.0
-        total_route_km = 0.0
-        total_demands = 0
 
+        scenario_arrivals = []        # list of (arrivals_h, one_way_km)
         for _ in range(n_scenarios):
-            demand_counts = rng.poisson(Lambda * T * probs)
-            n_demands = int(demand_counts.sum())
-            if n_demands <= 0:
+            n_demands = int(rng.poisson(Lambda * horizon_h))
+            if n_demands == 0:
+                scenario_arrivals.append((np.array([]), np.array([])))
                 continue
-
-            arrivals_h = rng.uniform(0.0, T, size=n_demands)
-            total_wait_h += float((T - arrivals_h).sum())
-
+            arrivals = np.sort(rng.uniform(0.0, horizon_h, size=n_demands))
             sampled = rng.choice(len(grid_pos_km), size=n_demands, p=cell_prob)
             dest_points = grid_pos_km[sampled].copy()
             dest_points[:, 0] += rng.uniform(-0.5 * cell_dx, 0.5 * cell_dx, size=n_demands)
             dest_points[:, 1] += rng.uniform(-0.5 * cell_dy, 0.5 * cell_dy, size=n_demands)
+            one_way = np.linalg.norm(dest_points - depot_pos_km[None, :], axis=1)
+            scenario_arrivals.append((arrivals, one_way))
 
-            one_way_km = np.linalg.norm(dest_points - depot_pos_km[None, :], axis=1)
-            total_invehicle_h += float((one_way_km / VEHICLE_SPEED_KMH).sum())
+        # ---- Try each candidate fleet size and keep the best ----
+        if self.fleet_size_grid is not None:
+            candidates = list(self.fleet_size_grid)
+        elif self.fleet_size is not None:
+            candidates = [self.fleet_size]
+        else:
+            candidates = [None]  # infinite fleet (legacy)
+
+        best_result = None
+        best_total = float("inf")
+
+        for f_cap in candidates:
+            result = self._simulate_one_fleet(
+                scenario_arrivals=scenario_arrivals,
+                fleet_cap=f_cap,
+                horizon_h=horizon_h,
+                speed=speed,
+                T=T,
+                wr=wr,
+                fleet_cost_rate=fleet_cost_rate,
+            )
+            if result.total_cost < best_total:
+                best_total = result.total_cost
+                best_result = result
+                best_result.name = f"OD"
+                # Stash chosen fleet size for diagnostics
+                best_fleet_cap = f_cap
+
+        if best_result is None:
+            raise RuntimeError("No OD fleet size candidate produced a result.")
+        return best_result
+
+    def _simulate_one_fleet(
+        self,
+        scenario_arrivals,
+        fleet_cap: Optional[int],
+        horizon_h: float,
+        speed: float,
+        T: float,
+        wr: float,
+        fleet_cost_rate: float,
+    ) -> EvaluationResult:
+        total_wait_h = 0.0
+        total_invehicle_h = 0.0
+        total_route_km = 0.0
+        total_demands = 0
+        # For provider cost rate: average km/hour over horizon across scenarios
+        total_horizon_km = 0.0
+
+        for arrivals, one_way_km in scenario_arrivals:
+            n = len(arrivals)
+            if n == 0:
+                continue
+
+            # Event-driven queueing with fleet_cap vehicles.
+            if fleet_cap is None or fleet_cap <= 0:
+                # Infinite fleet: every arrival served immediately (wait=T/2 dispatch only).
+                queue_wait = np.zeros(n)
+            else:
+                free_times = [0.0] * fleet_cap
+                heapq.heapify(free_times)
+                queue_wait = np.empty(n)
+                for i in range(n):
+                    earliest = heapq.heappop(free_times)
+                    start = max(arrivals[i], earliest)
+                    queue_wait[i] = start - arrivals[i]
+                    trip_dur = 2.0 * one_way_km[i] / speed  # round-trip
+                    heapq.heappush(free_times, start + trip_dur)
+
+            # User times per rider: dispatch wait (T/2) + queue wait + in-vehicle (one-way)
+            total_wait_h += float((T / 2.0 + queue_wait).sum())
+            total_invehicle_h += float((one_way_km / speed).sum())
             total_route_km += float((2.0 * one_way_km).sum())
-            total_demands += n_demands
+            total_horizon_km += float((2.0 * one_way_km).sum())  # alias
+            total_demands += n
 
+        n_scen = max(len(scenario_arrivals), 1)
         avg_wait_h = total_wait_h / max(total_demands, 1)
         avg_invehicle_h = total_invehicle_h / max(total_demands, 1)
         total_user_time = avg_wait_h + avg_invehicle_h
 
-        avg_route_km_per_cycle = total_route_km / max(n_scenarios, 1)
-        in_district_cost = avg_route_km_per_cycle / max(T, 1e-9)
-        fleet_size = avg_route_km_per_cycle / (VEHICLE_SPEED_KMH * max(T, 1e-9))
-        raw_fleet_size = _effective_fleet_size(avg_route_km_per_cycle, T)
-        provider_cost = in_district_cost + fleet_cost_rate * raw_fleet_size
+        # Provider cost rate: km per hour = total_km / (n_scenarios * horizon)
+        in_district_rate_km_per_h = total_horizon_km / (n_scen * horizon_h)
+        fleet_size_metric = in_district_rate_km_per_h / speed  # continuous utilisation
+        if fleet_cap is not None:
+            raw_fleet_size = int(fleet_cap)
+        else:
+            raw_fleet_size = _effective_fleet_size(
+                total_horizon_km / n_scen, horizon_h,
+            )
+
+        provider_cost = in_district_rate_km_per_h + fleet_cost_rate * raw_fleet_size
         user_cost = wr * total_user_time
         total_cost = provider_cost + user_cost
 
@@ -164,9 +274,9 @@ class FullyOD(BaselineMethod):
             avg_walk_time=0.0,
             total_user_time=total_user_time,
             linehaul_cost=0.0,
-            in_district_cost=in_district_cost,
-            total_travel_cost=in_district_cost,
-            fleet_size=fleet_size,
+            in_district_cost=in_district_rate_km_per_h,
+            total_travel_cost=in_district_rate_km_per_h,
+            fleet_size=fleet_size_metric,
             raw_fleet_size=raw_fleet_size,
             avg_dispatch_interval=T,
             odd_cost=0.0,
