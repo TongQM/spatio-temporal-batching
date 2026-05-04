@@ -1,5 +1,11 @@
-# Data directories
-data/
+# Data directories: ignore everything under data/ except small per-city
+# config artefacts (driver inputs and JSON populations).
+data/*
+!data/city_bg_lists/
+!data/city_bg_lists/*
+!data/city_bg_populations/
+!data/city_bg_populations/*
+
 cache/
 papers/
 results/
@@ -30,3 +36,7 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Third-party reference code (kept locally, not part of this repo)
+zhang2023code/
+.codex/

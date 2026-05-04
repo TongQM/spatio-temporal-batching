@@ -204,6 +204,22 @@ def _get_pos(geodata, block_id: str) -> Tuple[float, float]:
     raise AttributeError(f"geodata has no 'pos' for block '{block_id}'")
 
 
+def _get_pos_road_aware(geodata, block_id: str) -> Tuple[float, float]:
+    """(x, y) in metres, MDS-embedded so Euclidean distance ≈ road km when
+    a road-distance matrix is attached. Falls back to ``_get_pos`` (Euclidean
+    EPSG:2163 metres) otherwise.
+
+    Use this in baseline routing helpers (Multi-FR, TP-Lit) that compute
+    pairwise distances via ``np.linalg.norm`` and want road-aware behaviour
+    automatically.
+    """
+    pos_road = getattr(geodata, "pos_road_km", None)
+    if pos_road is not None and block_id in pos_road:
+        x_km, y_km = pos_road[block_id]
+        return x_km * 1000.0, y_km * 1000.0
+    return _get_pos(geodata, block_id)
+
+
 def _bhh_alpha(geodata, block_ids: List[str], prob_dict: Dict[str, float]) -> float:
     """BHH spatial term for a district: Σ_j sqrt(p_j * A_j)."""
     return sum(

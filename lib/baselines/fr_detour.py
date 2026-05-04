@@ -88,7 +88,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
 
 from lib.baselines.base import (
     BETA, VEHICLE_SPEED_KMH, BaselineMethod, EvaluationResult, ServiceDesign,
-    _effective_fleet_size, _get_pos,
+    _effective_fleet_size, _get_pos, _get_pos_road_aware,
 )
 from lib.constants import DEFAULT_FLEET_COST_RATE, TSP_TRAVEL_DISCOUNT
 
@@ -1405,10 +1405,14 @@ def _generate_line_library(geodata, depot_id, block_ids, n_angular,
     K-way coverage), and singleton fallbacks.
     """
     N = len(block_ids)
-    depot_pos = np.array(_get_pos(geodata, depot_id), dtype=float) / 1000.0
+    # Use road-aware MDS-embedded positions when available so the angular
+    # partition + 2-opt + tour_distance helpers below operate on
+    # road-distance-consistent geometry instead of Euclidean.
+    depot_pos = np.array(_get_pos_road_aware(geodata, depot_id), dtype=float) / 1000.0
     block_pos_km = {}
     for b in block_ids:
-        block_pos_km[b] = np.array(_get_pos(geodata, b), dtype=float) / 1000.0
+        block_pos_km[b] = np.array(_get_pos_road_aware(geodata, b),
+                                    dtype=float) / 1000.0
 
     # Use only checkpoint IDs for building route geometry.
     # Stopping locations are reachable via corridor detours.
@@ -3068,12 +3072,12 @@ class FRDetour(BaselineMethod):
         rider_time_weight = float(wr)
         vehicle_cost_weight = float(wv)
 
-        # Build block positions in km
+        # Build block positions in km (road-aware when MDS embedding available)
         block_pos_km = {}
         for b in block_ids:
-            block_pos_km[b] = np.array(_get_pos(geodata, b),
+            block_pos_km[b] = np.array(_get_pos_road_aware(geodata, b),
                                        dtype=float) / 1000.0
-        depot_pos_km = np.array(_get_pos(geodata, depot_id),
+        depot_pos_km = np.array(_get_pos_road_aware(geodata, depot_id),
                                 dtype=float) / 1000.0
 
         # Pre-compute walking geometry per block (still needed for optimization

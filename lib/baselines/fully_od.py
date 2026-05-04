@@ -158,6 +158,22 @@ class FullyOD(BaselineMethod):
         speed = VEHICLE_SPEED_KMH
         rng = np.random.default_rng(42)
 
+        # Use road distances when available: snap each sampled grid cell to
+        # its nearest BG centroid and look up depot→BG road km.
+        use_road = (
+            getattr(geodata, "road_dist_lookup", None) is not None
+            and getattr(geodata, "road_dist_matrix", None) is not None
+        )
+        if use_road:
+            depot_road_dists = np.array([
+                geodata.road_dist_lookup.get((design.depot_id, b), 0.0)
+                for b in block_ids
+            ])
+            # Map grid cell → nearest BG → road km from depot
+            cell_road_one_way = depot_road_dists[nearest_block]
+        else:
+            cell_road_one_way = None
+
         scenario_arrivals = []        # list of (arrivals_h, one_way_km)
         for _ in range(n_scenarios):
             n_demands = int(rng.poisson(Lambda * horizon_h))
@@ -166,10 +182,14 @@ class FullyOD(BaselineMethod):
                 continue
             arrivals = np.sort(rng.uniform(0.0, horizon_h, size=n_demands))
             sampled = rng.choice(len(grid_pos_km), size=n_demands, p=cell_prob)
-            dest_points = grid_pos_km[sampled].copy()
-            dest_points[:, 0] += rng.uniform(-0.5 * cell_dx, 0.5 * cell_dx, size=n_demands)
-            dest_points[:, 1] += rng.uniform(-0.5 * cell_dy, 0.5 * cell_dy, size=n_demands)
-            one_way = np.linalg.norm(dest_points - depot_pos_km[None, :], axis=1)
+            if use_road:
+                # Centroid-snap road distance (no jitter — block-level distance)
+                one_way = cell_road_one_way[sampled].copy()
+            else:
+                dest_points = grid_pos_km[sampled].copy()
+                dest_points[:, 0] += rng.uniform(-0.5 * cell_dx, 0.5 * cell_dx, size=n_demands)
+                dest_points[:, 1] += rng.uniform(-0.5 * cell_dy, 0.5 * cell_dy, size=n_demands)
+                one_way = np.linalg.norm(dest_points - depot_pos_km[None, :], axis=1)
             scenario_arrivals.append((arrivals, one_way))
 
         # ---- Try each candidate fleet size and keep the best ----
@@ -193,12 +213,15 @@ class FullyOD(BaselineMethod):
                 wr=wr,
                 fleet_cost_rate=fleet_cost_rate,
             )
-            if result.total_cost < best_total:
-                best_total = result.total_cost
+            # Fleet selection uses AGGREGATE user cost (× Lambda) so the
+            # optimizer accounts for all riders experiencing the queue, not
+            # just one. The EvaluationResult still reports per-rider user
+            # metrics for cross-method comparability.
+            selection_cost = result.provider_cost + wr * result.total_user_time * Lambda
+            if selection_cost < best_total:
+                best_total = selection_cost
                 best_result = result
                 best_result.name = f"OD"
-                # Stash chosen fleet size for diagnostics
-                best_fleet_cap = f_cap
 
         if best_result is None:
             raise RuntimeError("No OD fleet size candidate produced a result.")

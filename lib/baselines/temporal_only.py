@@ -27,7 +27,7 @@ import numpy as np
 
 from lib.baselines.base import (
     BETA, VEHICLE_SPEED_KMH, BaselineMethod, EvaluationResult, ServiceDesign,
-    _get_pos, _nn_tsp_length,
+    _get_pos, _get_pos_road_aware, _nn_tsp_length,
 )
 from lib.constants import DEFAULT_FLEET_COST_RATE, TSP_TRAVEL_DISCOUNT
 
@@ -810,7 +810,7 @@ class TemporalOnly(BaselineMethod):
             # Fall back to geodata block positions
             block_ids = geodata.short_geoid_list
             N = len(block_ids)
-            positions_m = np.array([_get_pos(geodata, b) for b in block_ids])
+            positions_m = np.array([_get_pos_road_aware(geodata, b) for b in block_ids])
             candidate_pos_km = positions_m / 1000.0
             candidate_probs = np.array([prob_dict.get(b, 0.0) for b in block_ids])
             total_p = candidate_probs.sum()
@@ -996,7 +996,7 @@ class TemporalOnly(BaselineMethod):
         depot_km = self._depot_km
         if candidate_pos_km is None:
             block_ids = geodata.short_geoid_list
-            positions_m = np.array([_get_pos(geodata, b) for b in block_ids])
+            positions_m = np.array([_get_pos_road_aware(geodata, b) for b in block_ids])
             candidate_pos_km = positions_m / 1000.0
             candidate_probs = np.array([prob_dict.get(b, 0.0)
                                         for b in block_ids])
@@ -1007,7 +1007,7 @@ class TemporalOnly(BaselineMethod):
             self._candidate_probs = candidate_probs
         if depot_km is None:
             block_ids = geodata.short_geoid_list
-            positions_m = np.array([_get_pos(geodata, b) for b in block_ids])
+            positions_m = np.array([_get_pos_road_aware(geodata, b) for b in block_ids])
             centroid = positions_m.mean(axis=0)
             depot_idx = int(np.argmin(
                 np.linalg.norm(positions_m - centroid, axis=1)))

@@ -124,6 +124,41 @@ are on a different fleet axis by design:
 When you add a new scheduled baseline, wire it through the same
 `num_districts` → fleet-budget default so the fleet-parity rule holds.
 
+### Cost-weight interpretation for `wr`
+
+There is a known asymmetry in how `wr` enters the design objective
+across baselines. The two conventions coexist in the codebase:
+
+**Per-rider convention** (Joint-Nom, Joint-DRO, SP-Lit):
+  The Newton `T*` formula uses `wr · T` as the wait-cost term — cost
+  for **one rider** waiting `T` hours. `Λ` enters the objective only
+  indirectly through the BHH tour term `α_i = β · √Λ · ...`, not
+  through the wait term. This follows the continuous-approximation
+  literature's per-district normalisation.
+
+**Aggregate convention** (Multi-FR, OD, VCC):
+  - Multi-FR's Benders master objective includes
+    `wr · T/2 · expected_demand · z`, which is **aggregate** wait cost
+    across all riders assigned to a trip.
+  - OD and VCC use aggregate cost `provider + wr · user_time · Λ` as
+    the **selection criterion** when sweeping over fleet-size candidates.
+    This is a post-hoc selection rule, not part of the original
+    optimisation — the simulation itself still reports per-rider metrics.
+
+**Consequence**: partition methods' `T*` responds weakly to `Λ` in the
+wait dimension (only via `√Λ` in the tour), while FR's `T*` responds
+strongly (`T* ∝ 1/√Λ` from the aggregate wait term). This is visible
+in the cloud: FR's user time **decreases** with `Λ` (economies of
+density on fixed routes), while Joint's barely changes.
+
+This asymmetry is **documented, not a bug to be fixed immediately**.
+It reflects a genuine difference in service-design philosophy:
+per-rider fairness (partition) vs system-wide efficiency (FR/OD/VCC).
+Aligning them would require changing either the CA literature's
+normalisation or FR's Benders objective, both of which have downstream
+implications. For now, interpret the cloud comparison with this
+asymmetry in mind.
+
 ## Cloud interpretation
 
 ### Regime view

@@ -489,6 +489,35 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--real_subset_size",
+        type=int,
+        default=25,
+        help=(
+            "When --mode real, use the N centermost block groups from "
+            "config.BG_GEOID_LIST instead of all 130. Set to 0 to use all. "
+            "Default 25 keeps real-data sweeps comparable to the synthetic 5x5."
+        ),
+    )
+    parser.add_argument(
+        "--real_use_population_prob",
+        action="store_true",
+        help=(
+            "When --mode real, use ACS population to weight prob_dict instead "
+            "of uniform."
+        ),
+    )
+    parser.add_argument(
+        "--population_json",
+        type=str,
+        default=None,
+        help=(
+            "Path to a per-city {GEOID -> population} JSON (produced by "
+            "fetch_city_populations.py). Used when "
+            "--real_use_population_prob is set; falls back to "
+            "real_case.inputs (Pittsburgh) if not provided."
+        ),
+    )
+    parser.add_argument(
         "--regime_fr_max_fleet",
         type=float,
         default=None,
@@ -503,6 +532,9 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _build_data_context(args: argparse.Namespace, use_odd: bool) -> Dict[str, Any]:
+    if args.mode == "real":
+        return _build_data_context_real(args, use_odd)
+
     road_network = build_road_network(args) if args.mode == "real" else None
 
     grid_geodata = build_geodata(args)
@@ -515,6 +547,127 @@ def _build_data_context(args: argparse.Namespace, use_odd: bool) -> Dict[str, An
         "grid": (grid_geodata, grid_prob, grid_omega),
         "tp": (grid_geodata, grid_prob, grid_omega),
         "od": (grid_geodata, grid_prob, grid_omega),
+    }
+
+
+def _real_population_prob(geodata, args) -> Dict[str, float]:
+    """Build a population-weighted prob_dict for the loaded geodata.
+
+    Source priority:
+      1. ``--population_json <file>`` (per-city ACS dump from
+         ``fetch_city_populations.py``).
+      2. ``real_case.inputs.load_probability_from_population`` (Pittsburgh
+         legacy path).
+      3. Uniform fallback if neither is available.
+    """
+    # Path 1: explicit JSON dump
+    pop_json = getattr(args, "population_json", None)
+    if pop_json:
+        with open(pop_json) as f:
+            pop_full = json.load(f)
+        # Map full GEOID → short_GEOID (last 7 chars after stripping prefix)
+        full_to_short = {}
+        for full_id, pop in pop_full.items():
+            raw = full_id.replace("1500000US", "")
+            short = raw[-7:]
+            full_to_short[short] = float(pop)
+        total = sum(full_to_short.get(b, 0.0)
+                    for b in geodata.short_geoid_list)
+        if total > 0:
+            prob = {b: full_to_short.get(b, 0.0) / total
+                    for b in geodata.short_geoid_list}
+            print(f"[real-data] population prob from {pop_json}: "
+                  f"{sum(1 for v in prob.values() if v > 0)}/{len(prob)} non-zero")
+            return prob
+        print(f"[real-data] population JSON {pop_json} has zero total; falling back")
+
+    # Path 2: Pittsburgh legacy
+    try:
+        from real_case.inputs import load_probability_from_population
+        return load_probability_from_population(geodata)
+    except Exception as e:
+        print(f"[real-data] population prob unavailable ({e}); using uniform")
+        return build_prob_dict(geodata)
+
+
+def _build_data_context_real(args: argparse.Namespace, use_odd: bool) -> Dict[str, Any]:
+    """Real-data variant.
+
+    Three ways to specify the geodata, in priority order:
+      1. ``--geoid_list <file>`` — pre-built list (one GEOID per line);
+         use this for non-Pittsburgh cities. Requires ``--shapefile``.
+      2. ``--shapefile`` + Pittsburgh ``BG_GEOID_LIST`` (legacy path):
+         loads the full Pittsburgh list and optionally subsets by
+         centroid distance.
+      3. Default: ``real_case.inputs.load_geodata()`` (Pittsburgh).
+    """
+    import numpy as np
+    from lib.data import GeoData
+    from lib.road_network import RoadNetwork
+
+    n_subset = int(args.real_subset_size)
+
+    if args.geoid_list:
+        # Path 1: explicit per-city list
+        if not args.shapefile:
+            raise ValueError("--geoid_list requires --shapefile")
+        with open(args.geoid_list) as f:
+            geoid_list = [l.strip() for l in f if l.strip()]
+        if n_subset > 0 and n_subset < len(geoid_list):
+            geoid_list = geoid_list[:n_subset]
+        geodata = GeoData(args.shapefile, geoid_list, level="block_group")
+    else:
+        # Path 2/3: Pittsburgh-only legacy path
+        from real_case.inputs import load_geodata
+        from config import DATA_PATHS
+        g_full = load_geodata()
+        if n_subset > 0 and n_subset < len(g_full.short_geoid_list):
+            positions = np.array([g_full.pos[b] for b in g_full.short_geoid_list])
+            center = positions.mean(axis=0)
+            order = np.argsort(np.linalg.norm(positions - center, axis=1))
+            subset_geoids = [g_full.short_geoid_list[i] for i in order[:n_subset]]
+            geodata = GeoData(DATA_PATHS["shapefile"], subset_geoids, level="block_group")
+        else:
+            geodata = g_full
+
+    if args.real_use_population_prob:
+        prob = _real_population_prob(geodata, args)
+    else:
+        prob = build_prob_dict(geodata)
+    omega = build_omega_dict(geodata, use_odd=use_odd)
+
+    road_network = None
+    if args.road_network:
+        bounds = geodata.gdf.to_crs("EPSG:4326").total_bounds
+        west, south, east, north = bounds
+        pad = 0.005
+        print(f"[real-data] Auto-bbox: N={north + pad:.4f} S={south - pad:.4f} "
+              f"E={east + pad:.4f} W={west - pad:.4f}")
+        road_network = RoadNetwork.from_bbox(
+            north + pad, south - pad, east + pad, west - pad,
+        )
+        # Pre-compute road-network shortest-path distances between BG
+        # centroids so geodata.get_dist returns road km. This makes
+        # linehaul (K_i) and any baseline routing that calls get_dist
+        # use real road distances instead of Euclidean.
+        if hasattr(geodata, "attach_road_distances"):
+            try:
+                geodata.attach_road_distances(road_network)
+                print(f"[real-data] road distance matrix attached "
+                      f"({len(geodata.short_geoid_list)}^2 centroid pairs)")
+            except Exception as e:
+                print(f"[real-data] road distance matrix attach failed: {e}")
+
+    print(f"[real-data] {len(geodata.short_geoid_list)} BGs | "
+          f"prob source={'population' if args.real_use_population_prob else 'uniform'} | "
+          f"road_network={'yes' if road_network is not None else 'no'}")
+
+    return {
+        "road_network": road_network,
+        "fr": (geodata, prob, omega),
+        "grid": (geodata, prob, omega),
+        "tp": (geodata, prob, omega),
+        "od": (geodata, prob, omega),
     }
 
 
@@ -695,6 +848,166 @@ def _od_fleet_grid(Lambda: float) -> List[int]:
     return sorted(set(raw))
 
 
+class _PartitionKSweep:
+    """Wrapper that sweeps num_districts for a partition baseline.
+
+    For each call to custom_simulate, tries each K in ``k_grid``,
+    runs design + simulate for each, and returns the result with the
+    lowest aggregate cost (provider + wr * user_time * Lambda).
+    The reported EvaluationResult uses per-rider metrics as usual.
+    """
+
+    def __init__(self, base_cls, k_grid, ctor_grid=None, **base_kwargs):
+        """Sweep partition method over K and (optionally) a constructor-arg grid.
+
+        ``ctor_grid`` is an optional dict mapping constructor-arg name to
+        list of values. The wrapper sweeps the Cartesian product of K and
+        those values, re-instantiating the baseline for each combo.
+        """
+        self.base_cls = base_cls
+        self.k_grid = list(k_grid)
+        self.ctor_grid = dict(ctor_grid) if ctor_grid else {}
+        self.base_kwargs = base_kwargs
+
+    def _iter_ctor_combos(self):
+        import itertools
+        if not self.ctor_grid:
+            yield {}
+            return
+        keys = list(self.ctor_grid.keys())
+        for vals in itertools.product(*(self.ctor_grid[k] for k in keys)):
+            yield dict(zip(keys, vals))
+
+    def design(self, geodata, prob_dict, Omega_dict, J_function,
+               num_districts, **kwargs):
+        self._design_extra = kwargs
+        first_ctor = next(self._iter_ctor_combos())
+        method = self.base_cls(**{**self.base_kwargs, **first_ctor})
+        return method.design(geodata, prob_dict, Omega_dict, J_function,
+                             num_districts, **kwargs)
+
+    def custom_simulate(self, design, geodata, prob_dict, Omega_dict,
+                        J_function, Lambda, wr, wv,
+                        fleet_cost_rate=0.0, **kwargs):
+        from lib.baselines.base import simulate_design
+
+        best_result = None
+        best_sel = float("inf")
+        design_kw = dict(self._design_extra) if hasattr(self, "_design_extra") else {}
+        for key in ("Lambda", "wr", "wv"):
+            design_kw.pop(key, None)
+
+        for k in self.k_grid:
+          for ctor_extra in self._iter_ctor_combos():
+            method = self.base_cls(**{**self.base_kwargs, **ctor_extra})
+            d = method.design(geodata, prob_dict, Omega_dict, J_function, k,
+                              Lambda=Lambda, wr=wr, wv=wv, **design_kw)
+            if hasattr(method, "custom_simulate"):
+                r = method.custom_simulate(
+                    d, geodata, prob_dict, Omega_dict, J_function,
+                    Lambda, wr, wv, fleet_cost_rate,
+                )
+            else:
+                r = simulate_design(
+                    d, geodata, prob_dict, Omega_dict, J_function,
+                    Lambda, wr, wv, fleet_cost_rate=fleet_cost_rate,
+                )
+            sel_cost = r.provider_cost + wr * r.total_user_time * Lambda
+            if sel_cost < best_sel:
+                best_sel = sel_cost
+                best_result = r
+        if best_result is None:
+            raise RuntimeError("No partition sweep combo produced a result.")
+        return best_result
+
+
+class _FRDetourSweep:
+    """Wrapper that sweeps delta and max_fleet for FR-Detour.
+
+    For each call to custom_simulate, tries each (delta, fleet) combo,
+    runs design + custom_simulate, and returns the result with the lowest
+    aggregate cost. Uses reduced solver params for memory safety.
+
+    If ``combos`` is provided, only those (delta, fleet) pairs are tried
+    instead of the full Cartesian product of delta_grid × fleet_grid.
+    """
+
+    def __init__(self, delta_grid=None, fleet_grid=None, combos=None,
+                 T_values=None,
+                 max_iters=5, n_saa=15, max_cg_iters=15, **extra_kw):
+        if combos is not None:
+            self.combos = [(float(d), float(f)) for d, f in combos]
+        else:
+            self.combos = [
+                (float(d), float(f))
+                for d in (delta_grid or [0.5])
+                for f in (fleet_grid or [3])
+            ]
+        self.T_values = T_values
+        self.max_iters = max_iters
+        self.n_saa = n_saa
+        self.max_cg_iters = max_cg_iters
+        self.extra_kw = extra_kw
+
+    def design(self, geodata, prob_dict, Omega_dict, J_function,
+               num_districts, **kwargs):
+        self._design_args = (geodata, prob_dict, Omega_dict, J_function,
+                             num_districts)
+        self._design_kw = {k: v for k, v in kwargs.items()
+                           if k not in ("Lambda", "wr", "wv")}
+        self._design_regime = {k: kwargs[k] for k in ("Lambda", "wr", "wv")
+                               if k in kwargs}
+        method = FRDetour(
+            delta=self.combos[0][0],
+            max_fleet=float(self.combos[0][1]),
+            max_iters=self.max_iters,
+            n_saa=self.n_saa,
+            max_cg_iters=self.max_cg_iters,
+            T_values=self.T_values,
+            **self.extra_kw,
+        )
+        return method.design(geodata, prob_dict, Omega_dict, J_function,
+                             num_districts, **kwargs)
+
+    def custom_simulate(self, design, geodata, prob_dict, Omega_dict,
+                        J_function, Lambda, wr, wv,
+                        fleet_cost_rate=0.0, **kwargs):
+        args = self._design_args
+        extra = dict(self._design_kw)
+
+        best_result = None
+        best_sel = float("inf")
+
+        for delta, fleet in self.combos:
+                try:
+                    method = FRDetour(
+                        delta=delta,
+                        max_fleet=float(fleet),
+                        max_iters=self.max_iters,
+                        n_saa=self.n_saa,
+                        max_cg_iters=self.max_cg_iters,
+                        T_values=self.T_values,
+                        **self.extra_kw,
+                    )
+                    d = method.design(
+                        *args, Lambda=Lambda, wr=wr, wv=wv, **extra,
+                    )
+                    r = method.custom_simulate(
+                        d, geodata, prob_dict, Omega_dict, J_function,
+                        Lambda, wr, wv, fleet_cost_rate=fleet_cost_rate,
+                    )
+                    sel = r.provider_cost + wr * r.total_user_time * Lambda
+                    if sel < best_sel:
+                        best_sel = sel
+                        best_result = r
+                except Exception as exc:
+                    print(f"    [FR sweep] delta={delta}, fleet={fleet} "
+                          f"failed: {exc}")
+        if best_result is None:
+            raise RuntimeError("All FR configs failed.")
+        return best_result
+
+
 def _regime_settings(lambdas: List[float], wrs: List[float]) -> List[Dict[str, Any]]:
     """Shared (Lambda, wr) grid reused across every baseline in regime view."""
     settings: List[Dict[str, Any]] = []
@@ -762,14 +1075,11 @@ def _build_regime_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "data_group": "fr",
             "base_lambda": first_lambda,
             "base_wr": first_wr,
-            "varying_note": regime_note + fr_fleet_note + fr_t_note,
+            "varying_note": regime_note + " (sweep fleet ∈ {3, 5} at delta=0; best by aggregate cost)",
             "settings": list(shared_settings),
-            "make_method": lambda s: FRDetour(
-                delta=0.0,
-                max_iters=args.rs_iters,
-                max_fleet=fr_max_fleet,
+            "make_method": lambda s: _FRDetourSweep(
+                combos=[(0.0, 3), (0.0, 5)],
                 T_values=fr_t_values,
-                name="Multi-FR (Jacquillat)",
             ),
         },
         "multi_fr_detour": {
@@ -777,12 +1087,10 @@ def _build_regime_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "data_group": "fr",
             "base_lambda": first_lambda,
             "base_wr": first_wr,
-            "varying_note": regime_note + fr_fleet_note + fr_t_note,
+            "varying_note": regime_note + " (2 combos: delta=0.5/fleet=3, delta=1.0/fleet=5)",
             "settings": list(shared_settings),
-            "make_method": lambda s: FRDetour(
-                delta=float(args.fr_delta),
-                max_iters=args.rs_iters,
-                max_fleet=fr_max_fleet,
+            "make_method": lambda s: _FRDetourSweep(
+                combos=[(0.5, 3), (1.0, 5)],
                 T_values=fr_t_values,
             ),
         },
@@ -791,19 +1099,31 @@ def _build_regime_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "data_group": "grid",
             "base_lambda": first_lambda,
             "base_wr": first_wr,
-            "varying_note": regime_note + " (T* optimized per district via Newton, same as Joint)",
+            "varying_note": regime_note + " (sweep K x T_fixed; best by aggregate cost)",
             "settings": list(shared_settings),
-            "make_method": lambda s: CarlssonPartition(T_fixed=None),
+            "make_method": lambda s: _PartitionKSweep(
+                CarlssonPartition,
+                k_grid=[2, 3, 4, 5, 6],
+                ctor_grid={"T_fixed": [0.1, 0.2, 0.3, 0.5, 0.8, 1.0]},
+            ),
         },
         "tp_lit": {
             "display_name": "TP-Lit (Liu)",
             "data_group": "tp",
             "base_lambda": first_lambda,
             "base_wr": first_wr,
-            "varying_note": regime_note,
+            "varying_note": regime_note + " (reduced T_fixed x max_fleet; best by aggregate cost)",
             "settings": list(shared_settings),
-            "make_method": lambda s: TemporalOnly(
-                n_candidates=args.tp_candidates,
+            "make_method": lambda s: _PartitionKSweep(
+                TemporalOnly,
+                k_grid=[int(args.districts)],  # TP-Lit ignores K, pass once
+                ctor_grid={
+                    "T_fixed": [0.15, 0.5],
+                    "max_fleet": [30, 100],
+                },
+                # n_candidates=0 → fall back to real BG centroids and
+                # population-weighted prob_dict (instead of random uniform points).
+                n_candidates=(0 if args.mode == "real" else args.tp_candidates),
                 region_km=args.tp_region_km,
                 region_low=args.tp_region_low,
             ),
@@ -813,18 +1133,22 @@ def _build_regime_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "data_group": "grid",
             "base_lambda": first_lambda,
             "base_wr": first_wr,
-            "varying_note": regime_note,
+            "varying_note": regime_note + " (K swept; best K by aggregate cost)",
             "settings": list(shared_settings),
-            "make_method": lambda s: JointNom(max_iters=args.rs_iters),
+            "make_method": lambda s: _PartitionKSweep(
+                JointNom, k_grid=[2, 3, 4, 5, 6],
+                max_iters=args.rs_iters,
+            ),
         },
         "joint_dro": {
             "display_name": "Joint-DRO",
             "data_group": "grid",
             "base_lambda": first_lambda,
             "base_wr": first_wr,
-            "varying_note": regime_note + f" (epsilon={args.epsilon})",
+            "varying_note": regime_note + f" (K swept, epsilon={args.epsilon}; best K by aggregate cost)",
             "settings": list(shared_settings),
-            "make_method": lambda s: JointDRO(
+            "make_method": lambda s: _PartitionKSweep(
+                JointDRO, k_grid=[2, 3, 4, 5, 6],
                 epsilon=float(args.epsilon),
                 max_iters=args.rs_iters,
             ),
@@ -834,23 +1158,26 @@ def _build_regime_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "data_group": "od",
             "base_lambda": first_lambda,
             "base_wr": first_wr,
-            "varying_note": regime_note + " (VCC uses constructor fleet_size; design is regime-insensitive in wr)",
+            "varying_note": regime_note + " (fleet × walk grid; best picked per regime by aggregate cost)",
             "settings": list(shared_settings),
-            "make_method": lambda s: VCC(fleet_size=30),
+            "make_method": lambda s: VCC(
+                fleet_size_grid=[5, 10, 20, 30, 50],
+                max_walk_grid=[0.1, 0.3, 0.5],
+            ),
         },
         "od": {
             "display_name": "OD",
             "data_group": "od",
             "base_lambda": first_lambda,
             "base_wr": first_wr,
-            "varying_note": regime_note + " (queueing, Lambda-scaled fleet grid; best picked per regime)",
+            "varying_note": regime_note + " (queueing, fixed fleet grid; best picked per regime)",
             "settings": list(shared_settings),
-            # Lambda-scaled fleet grid: minimum fleet sized to keep utilisation
-            # below ~85% (round-trip 4 km @ 30 km/h → 0.133 h per trip).
-            # Avoids the unrealistic "fleet=3 at Λ=300" case where OD queues
-            # grow unboundedly.
+            # Fixed fleet grid across all (Λ, wr) settings. At low Λ the
+            # smallest fleet suffices; at high Λ it's undersized and queueing
+            # pushes cost into user time. The optimizer trades fleet cost vs
+            # queue wait, producing a genuine Pareto curve for OD.
             "make_method": lambda s: FullyOD(
-                fleet_size_grid=_od_fleet_grid(float(s["Lambda"])),
+                fleet_size_grid=[5, 10, 15, 20, 30, 50, 80],
             ),
         },
     }
@@ -1028,6 +1355,10 @@ def main() -> None:
         "tp_region_km": args.tp_region_km,
         "tp_region_low": args.tp_region_low,
         "fr_delta": args.fr_delta,
+        "shapefile": getattr(args, "shapefile", None),
+        "road_network": getattr(args, "road_network", False),
+        "real_subset_size": getattr(args, "real_subset_size", None),
+        "real_use_population_prob": getattr(args, "real_use_population_prob", False),
     }
 
     _save_json(out_dir / "experiment.json", experiment_meta)

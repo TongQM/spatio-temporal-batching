@@ -38,11 +38,20 @@ class GeoData:
         
         elif level == 'block_group':
             self.gdf = gpd.read_file(filepath)
-            self.gdf["short_GEOID"] = self.gdf["GEOID"].str[-7:]  # Create a short GEOID column, which also uniquely identifies each block group
-            self.gdf.set_index("short_GEOID", inplace=True)  # Set the short GEOID as the index for easier access
-            self.short_geoid_list = [geoid[-7:] for geoid in geoid_list]
-            # Retrieve block groups with the specified GEOIDs
-            self.gdf = self.gdf.loc[self.short_geoid_list]
+            # Pre-filter by FULL GEOID to avoid last-7-char collisions across
+            # states/counties (e.g. NY has 16k BGs with only 10k unique 7-char
+            # suffixes — tract+BG suffix repeats across counties).
+            full_ids = [
+                g[-12:] if g.startswith("1500000US") else g
+                for g in geoid_list
+            ]
+            self.gdf = self.gdf[self.gdf["GEOID"].isin(full_ids)].copy()
+            self.gdf = self.gdf.drop_duplicates(subset="GEOID")
+            self.gdf["short_GEOID"] = self.gdf["GEOID"].str[-7:]
+            self.gdf.set_index("short_GEOID", inplace=True)
+            # Re-derive short_geoid_list from the filtered gdf to preserve
+            # ordering and ensure consistency
+            self.short_geoid_list = self.gdf.index.tolist()
 
         elif level == 'block':
             self.gdf = gpd.read_file(filepath)
@@ -82,6 +91,12 @@ class GeoData:
             self.G[node1][node2]['distance'] = distance  # Store distance in the graph
             self.edge_labels[(node1, node2)] = f"{distance:.2f} km"
             self.distance_dict[(node1, node2)] = distance
+
+        # Road-distance matrix is populated lazily via attach_road_distances.
+        # When set, get_dist() returns road km instead of Euclidean.
+        self.road_dist_matrix = None
+        self.road_dist_lookup = None
+        self._short_to_idx = {b: i for i, b in enumerate(self.short_geoid_list)}
 
         # Compute shortest path lengths for all pairs using Dijkstra
         shortest_paths = dict(nx.all_pairs_dijkstra_path_length(self.G, weight='distance'))
@@ -132,7 +147,77 @@ class GeoData:
         return self.gdf['area'][bg_geoid]
     
     def get_dist(self, node1, node2):
+        # Prefer real road-network shortest-path km when available.
+        if self.road_dist_lookup is not None:
+            d = self.road_dist_lookup.get((node1, node2))
+            if d is not None:
+                return d
         return self.shortest_distance_dict[(node1, node2)]
+
+    def attach_road_distances(self, road_network) -> None:
+        """Pre-compute road-network shortest-path distances between every pair
+        of block-group centroids and cache as:
+
+          - ``self.road_dist_matrix`` : N×N numpy matrix of road km
+          - ``self.road_dist_lookup`` : ``(node1, node2) -> km`` dict
+          - ``self.pos_road_km``      : ``node -> (x, y)`` MDS embedding such
+            that Euclidean distance between two embedded positions
+            approximates the road distance between the corresponding
+            block groups
+
+        After this call, ``get_dist`` returns road km; baselines that call
+        ``geodata.get_dist`` automatically pick up the change. Baselines that
+        use Euclidean ``np.linalg.norm`` over positions can opt in to road
+        awareness by reading ``pos_road_km`` instead of ``pos``.
+        """
+        from pyproj import Transformer
+        T = Transformer.from_crs("EPSG:2163", "EPSG:4326", always_xy=False)
+        latlon = []
+        for b in self.short_geoid_list:
+            x, y = self.pos[b]
+            lat, lon = T.transform(x, y)
+            latlon.append((lat, lon))
+        D = road_network.get_dist_matrix_km(latlon)
+        # Symmetrise (road network may be slightly asymmetric due to one-ways)
+        D = 0.5 * (D + D.T)
+        np.fill_diagonal(D, 0.0)
+        self.road_dist_matrix = D
+        self.road_dist_lookup = {}
+        for i, b1 in enumerate(self.short_geoid_list):
+            for j, b2 in enumerate(self.short_geoid_list):
+                self.road_dist_lookup[(b1, b2)] = float(D[i, j])
+
+        # MDS embed road distances into 2D so Euclidean over embedded positions
+        # approximates road km. Useful for baselines that use np.linalg.norm
+        # internally (Multi-FR, TP-Lit, VCC).
+        try:
+            from sklearn.manifold import MDS
+            mds = MDS(
+                n_components=2,
+                dissimilarity="precomputed",
+                random_state=42,
+                normalized_stress="auto",
+                n_init=4,
+                max_iter=300,
+            )
+            # MDS expects km-scale distances; output is also km-scale by default
+            embedded = mds.fit_transform(D * 1000.0)  # in metres for stable fit
+            embedded = embedded / 1000.0              # back to km
+            self.pos_road_km = {
+                b: (float(embedded[i, 0]), float(embedded[i, 1]))
+                for i, b in enumerate(self.short_geoid_list)
+            }
+            self.mds_stress = float(getattr(mds, "stress_", -1.0))
+        except Exception as e:
+            print(f"[GeoData] MDS embedding failed: {e}")
+            self.pos_road_km = None
+            self.mds_stress = None
+
+    def road_dist_km(self, b1: str, b2: str):
+        """Explicit accessor returning road km if matrix is attached, else None."""
+        if self.road_dist_lookup is None:
+            return None
+        return self.road_dist_lookup.get((b1, b2))
 
     def generate_demand_dist(self, commuting_df, population_df):
         '''

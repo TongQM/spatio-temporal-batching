@@ -30,6 +30,7 @@ from lib.baselines.base import (
     ServiceDesign,
     _centroid_block,
     _get_pos,
+    _get_pos_road_aware,
 )
 from lib.constants import DEFAULT_FLEET_COST_RATE
 
@@ -414,11 +415,11 @@ def _sample_requests(
 
     veh_speed = VEHICLE_SPEED_KMH
     requests: List[_Request] = []
-    depot_pos = np.array(_get_pos(geodata, depot_id), dtype=float) / 1000.0
+    depot_pos = np.array(_get_pos_road_aware(geodata, depot_id), dtype=float) / 1000.0
     for req_id in range(n_requests):
         dest_idx = int(rng.choice(len(block_ids), p=probs))
         dest_block = block_ids[dest_idx]
-        dest_pos = np.array(_get_pos(geodata, dest_block), dtype=float) / 1000.0
+        dest_pos = np.array(_get_pos_road_aware(geodata, dest_block), dtype=float) / 1000.0
         direct_km = float(np.linalg.norm(dest_pos - depot_pos))
         direct_time_h = direct_km / veh_speed
         release_h = float(rng.uniform(0.0, planning_horizon_h))
@@ -508,8 +509,10 @@ class VCC(BaselineMethod):
     def __init__(
         self,
         fleet_size: Optional[int] = None,
+        fleet_size_grid: Optional[list] = None,
         vehicle_capacity: int = 3,
         max_walk_km: float = 0.3,
+        max_walk_grid: Optional[list] = None,
         deadline_slack_h: float = 0.5,
         walk_speed_kmh: float = 5.0,
         vehicle_speed_kmh: float = VEHICLE_SPEED_KMH,
@@ -519,6 +522,14 @@ class VCC(BaselineMethod):
         random_seed: int = 42,
     ):
         self.fleet_size = None if fleet_size is None else int(fleet_size)
+        self.fleet_size_grid = (
+            tuple(int(f) for f in fleet_size_grid)
+            if fleet_size_grid is not None else None
+        )
+        self.max_walk_grid = (
+            tuple(float(w) for w in max_walk_grid)
+            if max_walk_grid is not None else None
+        )
         self.vehicle_capacity = int(vehicle_capacity)
         self.max_walk_km = float(max_walk_km)
         self.deadline_slack_h = float(deadline_slack_h)
@@ -613,7 +624,7 @@ class VCC(BaselineMethod):
                 "travel_km": 0.0,
             }
 
-        start_pos = np.array(_get_pos(geodata, design.depot_id), dtype=float) / 1000.0
+        start_pos = np.array(_get_pos_road_aware(geodata, design.depot_id), dtype=float) / 1000.0
         routes, rejected = _choose_best_insertion(
             requests=requests,
             fleet_size=fleet_size,
@@ -627,6 +638,69 @@ class VCC(BaselineMethod):
             planning_horizon_h=horizon_h,
         )
         return _scenario_metrics(routes, rejected, requests, start_pos, horizon_h)
+
+    def _simulate_one_config(
+        self,
+        design: ServiceDesign,
+        geodata,
+        prob_dict: Dict[str, float],
+        Lambda: float,
+        wr: float,
+        fleet_cost_rate: float,
+        fleet_override: int,
+        walk_override: Optional[float] = None,
+    ) -> EvaluationResult:
+        """Run VCC simulation with fleet size and walk tolerance overrides."""
+        import copy
+        mod_design = copy.deepcopy(design)
+        mod_design.service_metadata["fleet_size"] = fleet_override
+        mod_design.service_metadata["planning_horizon_h"] = self._planning_horizon(
+            Lambda, fleet_override,
+        )
+        if walk_override is not None:
+            mod_design.service_metadata["max_walk_km"] = walk_override
+
+        meta = mod_design.service_metadata
+        rng = np.random.default_rng(int(meta.get("random_seed", self.random_seed)))
+        scenario_stats = [
+            self._simulate_one_scenario(mod_design, geodata, prob_dict, Lambda, wr, rng)
+            for _ in range(int(meta.get("n_scenarios", self.n_scenarios)))
+        ]
+
+        avg_wait = float(np.mean([s["wait_h"] for s in scenario_stats]))
+        avg_walk = float(np.mean([s["walk_h"] for s in scenario_stats]))
+        avg_invehicle = float(np.mean([s["invehicle_h"] for s in scenario_stats]))
+        total_user_time = avg_wait + avg_walk + avg_invehicle
+
+        raw_avg_travel_km = float(np.mean([s["travel_km"] for s in scenario_stats]))
+        horizon_h = float(meta["planning_horizon_h"])
+        in_district_cost = raw_avg_travel_km / max(horizon_h, 1e-9)
+        total_travel_cost = in_district_cost
+        fleet_size_metric = raw_avg_travel_km / (
+            float(meta["vehicle_speed_kmh"]) * max(horizon_h, 1e-9)
+        )
+
+        provider_cost = total_travel_cost + fleet_cost_rate * fleet_override
+        user_cost = wr * total_user_time
+        total_cost = provider_cost + user_cost
+
+        return EvaluationResult(
+            name="VCC",
+            avg_wait_time=avg_wait,
+            avg_invehicle_time=avg_invehicle,
+            avg_walk_time=avg_walk,
+            total_user_time=total_user_time,
+            linehaul_cost=0.0,
+            in_district_cost=in_district_cost,
+            total_travel_cost=total_travel_cost,
+            fleet_size=fleet_size_metric,
+            raw_fleet_size=fleet_override,
+            avg_dispatch_interval=horizon_h,
+            odd_cost=0.0,
+            provider_cost=provider_cost,
+            user_cost=user_cost,
+            total_cost=total_cost,
+        )
 
     def custom_simulate(
         self,
@@ -644,6 +718,25 @@ class VCC(BaselineMethod):
         if design.service_mode != "vcc":
             raise ValueError("VCC.custom_simulate requires a VCC service design.")
 
+        if self.fleet_size_grid is not None:
+            walk_candidates = self.max_walk_grid or (self.max_walk_km,)
+            best_result = None
+            best_sel = float("inf")
+            for f_cap in self.fleet_size_grid:
+                for walk_km in walk_candidates:
+                    result = self._simulate_one_config(
+                        design, geodata, prob_dict, Lambda, wr,
+                        fleet_cost_rate, f_cap, walk_override=float(walk_km),
+                    )
+                    sel_cost = result.provider_cost + wr * result.total_user_time * Lambda
+                    if sel_cost < best_sel:
+                        best_sel = sel_cost
+                        best_result = result
+            if best_result is None:
+                raise RuntimeError("No VCC config candidate produced a result.")
+            return best_result
+
+        # Original single-fleet path
         meta = design.service_metadata
         rng = np.random.default_rng(int(meta.get("random_seed", self.random_seed)))
         scenario_stats = [

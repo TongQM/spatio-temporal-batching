@@ -1,0 +1,248 @@
+% =============================================================================
+% Real-city experiment design (Pittsburgh / Chicago / Manhattan / Los Angeles)
+%
+% Drop into your Overleaf project and \input{real_city_experiment} where
+% needed. Self-contained: no other doc cross-references required.
+% Requires: amsmath, booktabs, array, hyperref (optional).
+% =============================================================================
+
+\subsection{Real-City Experiment Design}\label{sec:real-city-design}
+
+This section documents the design of the real-city baseline sweep
+described in \S\ref{sec:multi-city}. The goal is to compare the seven
+service-design baselines on the same regime grid as the synthetic
+$5\times5$ run, but on \emph{actual} U.S.\ census block groups (BGs)
+linked together by \emph{actual} street networks --- preserving
+real demand density (population) and real driving distances.
+
+% -----------------------------------------------------------------------
+\subsubsection{Cities and their road topologies}
+
+Four cities were chosen to span the major U.S.\ road-network archetypes:
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+\toprule
+City & Focal area / topology & BG suburb \\
+\midrule
+Pittsburgh, PA & Downtown + Oakland; hilly, river-cut, irregular grid &
+   Allegheny Co.\ (FIPS 42003) \\
+Chicago, IL    & Loop + River North; strict cardinal grid &
+   Cook Co.\ (FIPS 17031) \\
+Manhattan, NY  & Midtown; avenue-and-street grid plus Broadway &
+   New York Co.\ (FIPS 36061) \\
+Los Angeles, CA & DTLA; sprawled grid bisected by freeways &
+   LA Co.\ (FIPS 06037) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+For each city we keep the $25$ block groups whose centroids are
+closest to the centroid of a focal $\sim 5\,$km bbox. Twenty-five BGs
+match the synthetic $5\times5$ instance and keep every per-baseline
+sweep tractable on a workstation; the centermost selection avoids
+boundary BGs whose road network is partially clipped.
+
+% -----------------------------------------------------------------------
+\subsubsection{Data sources}
+
+\begin{description}
+  \item[Block-group polygons] U.S.\ Census Bureau TIGER 2023
+    shapefiles (one file per state, downloaded via
+    \texttt{www2.census.gov/geo/tiger/TIGER2023/BG}). Reprojected to
+    EPSG:2163 for area + Euclidean distance computations.
+  \item[Population per BG] American Community Survey 5-year 2023
+    table B01003 (total population), fetched per BG via the public
+    Census Data API. Saved as a per-city JSON
+    \verb|data/city_bg_populations/<city>.json|.
+  \item[Road network] OpenStreetMap drive-network graph fetched via
+    OSMnx 2.x for each city's bbox (with a $0.005^\circ$ pad).
+    Cached on disk under \verb|cache/road_graph_*.pkl|.
+\end{description}
+
+The end-to-end fetch takes a few minutes per city; helper scripts
+(\verb|build_city_geoid_lists.py|, \verb|fetch_city_populations.py|)
+handle this once and write the artefacts to disk for reproducible
+sweeps.
+
+% -----------------------------------------------------------------------
+\subsubsection{Distances: road network + MDS embedding}
+
+The repository historically used Euclidean centroid-to-centroid
+distances throughout. For real cities we replace these with
+\textbf{road-network shortest-path distances} on three layers:
+
+\paragraph{1. Centroid pair distances (\texttt{geodata.get\_dist}).}
+After OSMnx fetches the drive graph, every BG centroid is mapped to
+its nearest road-network node and an all-pairs shortest-path matrix
+$D_{\mathrm{road}} \in \mathbb{R}^{N \times N}$ is precomputed
+(\verb|GeoData.attach_road_distances|). Once attached,
+\verb|GeoData.get_dist(b_1, b_2)| returns the road km from
+$D_{\mathrm{road}}$, so any baseline that already calls
+\verb|get_dist| (e.g.\ Joint-Nom/DRO and SP-Lit's linehaul
+$K_i$) automatically becomes road-aware without code changes.
+
+\paragraph{2. MDS-embedded positions for routing helpers.}
+Several baselines (Multi-FR, TP-Lit, VCC) compute pairwise
+distances via \verb|np.linalg.norm| over centroid coordinates
+in EPSG:2163 metres. Replacing every call site with matrix
+look-ups would be invasive. Instead, when the road-distance matrix
+is attached we compute a \textbf{2D MDS embedding}
+$\Phi : \mathrm{BG} \to \mathbb{R}^2$ such that
+$\| \Phi(b_1) - \Phi(b_2) \|_2 \approx D_{\mathrm{road}}(b_1, b_2)$
+and expose it as \verb|geodata.pos_road_km|. The embedding is
+computed with scikit-learn's \verb|sklearn.manifold.MDS|
+(precomputed dissimilarity, $n=2$, $4$ initialisations,
+$300$ iterations).
+
+A new helper \verb|_get_pos_road_aware(geodata, b)| returns
+\verb|pos_road_km[b]| when available and falls back to the
+Euclidean \verb|pos[b]| otherwise. We swapped this in for the
+position lookups inside Multi-FR's line library, TP-Lit's ADP+VRP
+candidate locations, and VCC's depot/dest/start positions. The
+existing $L^2$-norm logic then operates on road-distance-consistent
+geometry.
+
+The MDS embedding is approximate --- general road-distance metrics
+are not exactly Euclidean-embeddable in two dimensions --- but the
+stress is moderate (typical pairwise error $\le 30\%$ on these 25-BG
+instances) and the embedding propagates road awareness through
+hundreds of $L^2$-norm call sites without bespoke refactors.
+
+\paragraph{3. Continuous-sample distances in OD.}
+OD samples customer destinations as continuous points within block
+polygons, then routes \verb|depot -> destination -> depot|. We
+\textbf{centroid-snap} each sampled point to its containing BG and
+look up the road km from $D_{\mathrm{road}}$. This is faster than
+on-the-fly road queries per sample and accurate to within one
+centroid-radius ($\approx 100$--$300$\,m for our 25-BG areas).
+
+\paragraph{Summary of distance use per baseline.}
+\begin{center}
+\small
+\begin{tabular}{l p{4.6cm} p{4.6cm}}
+\toprule
+Baseline & Optimisation distances & Evaluation distances \\
+\midrule
+Joint-Nom / Joint-DRO &
+   BHH $\alpha_i = \beta\sqrt{\Lambda}\sum_b \sqrt{p_b A_b}$;
+   $K_i$ via road km ($\verb|get_dist|$ override). &
+   In-district NN-TSP on road km via
+   $\verb|road_network.get_dist_matrix_km|$. \\
+SP-Lit (Carlsson) &
+   Same as Joint; ham-sandwich bisection on Euclidean grid in
+   EPSG:2163 metres (BG centroids unchanged). &
+   Same as Joint. \\
+Multi-FR / Multi-FR-Detour &
+   Angular partition + 2-opt + subpath LP on road-aware MDS
+   positions $\Phi(b)$ (Euclidean over $\Phi$). &
+   Custom Benders simulate; Euclidean over $\Phi$. \\
+TP-Lit (Liu) &
+   ADP+VRP cost matrices via Euclidean over $\Phi$
+   ($n_{\mathrm{candidates}} = 0$ so candidates are real BG
+   centroids). &
+   Custom simulate; Euclidean over $\Phi$. \\
+VCC &
+   Dial-a-ride routing via Euclidean over $\Phi$. &
+   Same. Continuous walk distances within blocks remain Euclidean. \\
+OD &
+   Single trip $\verb|depot -> dest -> depot|$. &
+   Centroid-snap road km from $D_{\mathrm{road}}$. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% -----------------------------------------------------------------------
+\subsubsection{Demand}
+
+Demand at each BG is proportional to its ACS 2023 total population
+(table B01003).
+Per-block probabilities are normalised to sum to one over the 25-BG
+subset:
+
+\begin{equation*}
+  p_b = \frac{\mathrm{pop}_b}{\sum_{b' \in \mathrm{subset}} \mathrm{pop}_{b'}}.
+\end{equation*}
+
+Total subset populations vary across cities (Pittsburgh: 24{,}604;
+Chicago: 63{,}522; Manhattan: 26{,}326; Los Angeles: 37{,}428),
+which alone introduces meaningful per-block density differences ---
+Manhattan's 25 BGs are roughly half the area of Pittsburgh's but
+have similar total population. The system arrival rate $\Lambda$
+is swept independently of population total; the population
+distribution only sets the spatial pattern $p_b$.
+
+% -----------------------------------------------------------------------
+\subsubsection{Sweep grid (regime view)}
+
+Identical to the synthetic $5\times5$ design (\S\ref{sec:regime-view})
+so cross-instance comparison is direct:
+
+\begin{itemize}
+  \item $\Lambda \in \{50, 150, 300\}$ pax/h
+  \item $w_r \in \{1, 3, 10\}$
+  \item $w_v = 1.0$ (pinned)
+  \item $c_f = 4.0$ \$/veh-h (5-yr fleet amortisation)
+  \item $K = 3$ baseline (used by Multi-FR's fleet fall-back; partition methods sweep $K \in \{2,...,6\}$ internally)
+\end{itemize}
+
+For each $(\Lambda, w_r)$ point, every baseline runs its
+internal hyperparameter sweep
+(\S\ref{sec:sweep-params}: K for partition, $T_{\mathrm{fixed}}$ for
+SP-Lit, fleet for OD/VCC, etc.) and reports the operating point
+with the lowest aggregate cost
+$C_{\mathrm{provider}} + w_r \cdot \bar{u} \cdot \Lambda$.
+
+% -----------------------------------------------------------------------
+\subsubsection{Reproducibility}
+
+Three scripts implement the pipeline end to end:
+
+\begin{enumerate}
+  \item \texttt{scripts/experiments/build\_city\_geoid\_lists.py} \\
+    Filter each state's TIGER BG shapefile by the city's focal bbox,
+    keep the $25$ centermost BGs, save GEOID lists to
+    \verb|data/city_bg_lists/<city>.txt|.
+  \item \texttt{scripts/experiments/fetch\_city\_populations.py} \\
+    Query the Census API for ACS 2023 B01003 per BG, save
+    per-city JSON to \verb|data/city_bg_populations/<city>.json|.
+  \item \texttt{scripts/experiments/run\_per\_city\_full.sh} \\
+    Run the regime sweep across all 4 cities with road-aware
+    optimisation, population-weighted demand, and all 7 baselines
+    (Multi-FR + TP-Lit included). Resumable via per-setting JSON
+    cache.
+\end{enumerate}
+
+The plotting helpers
+\verb|scripts/plots/multi_city_designs_map.py| and the city-aware
+extension of \verb|rebuild_latest_sweeps.py| produce the
+4-panel scatter cloud and the $4 \times N_{\mathrm{baseline}}$
+design map shown in Fig.~\ref{fig:cities-cloud} and
+Fig.~\ref{fig:cities-designs}.
+
+% -----------------------------------------------------------------------
+\subsubsection{Known limitations}
+
+\begin{itemize}
+  \item \textbf{MDS approximation error.} Road-distance metrics are
+    not exactly Euclidean-embeddable in 2D; pairwise distances
+    after embedding can deviate by up to $\sim 30\%$ on irregular
+    networks (Pittsburgh). A stricter alternative is to refactor
+    each baseline's routing helpers to consume an explicit
+    distance-matrix function; this is left for future work.
+  \item \textbf{Continuous-point road distance in VCC.} VCC's
+    inner dial-a-ride routing operates on continuous coordinates
+    (interpolated meeting points). Those interior moves remain
+    Euclidean over MDS positions; only depot, destination, and
+    block-anchor distances are road-aware.
+  \item \textbf{Demand temporality.} ACS B01003 is total residential
+    population, not time-varying ridership. A more realistic
+    deployment study would weight by trip-generation tables
+    (e.g.\ ACS B08303 commuting) at peak hours. Population-weighted
+    demand is a stand-in for cross-city methodology validation.
+  \item \textbf{Single bbox per city.} Each city is represented by
+    a single $\sim 5\,$km focal area. Multi-bbox runs (e.g.\
+    Pittsburgh downtown + suburbs) would test whether topology
+    rankings hold across intra-city heterogeneity.
+\end{itemize}

@@ -64,7 +64,13 @@ class RoadNetwork:
                 G = pickle.load(f)
         else:
             logger.info(f"Fetching road network for bbox ({north},{south},{east},{west})")
-            G = ox.graph_from_bbox(north, south, east, west, network_type=network_type)
+            # osmnx 2.x: graph_from_bbox takes a tuple (left, bottom, right, top) = (west, south, east, north)
+            try:
+                G = ox.graph_from_bbox(bbox=(west, south, east, north), network_type=network_type)
+            except TypeError:
+                # osmnx 1.x fallback: keyword args (north, south, east, west)
+                G = ox.graph_from_bbox(north=north, south=south, east=east, west=west,
+                                       network_type=network_type)
             with open(path, 'wb') as f:
                 pickle.dump(G, f)
             logger.info(f"Cached road network to {path}")
