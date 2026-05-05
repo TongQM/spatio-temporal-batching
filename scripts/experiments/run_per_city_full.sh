@@ -15,8 +15,9 @@ ALL_SERVICES="joint_nom joint_dro sp_lit od vcc multi_fr tp_lit"
 run_city() {
   local CITY="$1"
   local SHAPEFILE="$2"
+  local SUBSET_SIZE="${3:-25}"
   echo "========================================"
-  echo "  CITY: $CITY (population-weighted demand)"
+  echo "  CITY: $CITY  (subset_size=$SUBSET_SIZE, population-weighted demand)"
   echo "========================================"
   local OUT="results/baseline_clouds/cities_road/${CITY}"
   python scripts/experiments/baseline_cloud_sweep.py \
@@ -25,7 +26,7 @@ run_city() {
     --road_network \
     --shapefile "$SHAPEFILE" \
     --geoid_list "data/city_bg_lists/${CITY}.txt" \
-    --real_subset_size 25 \
+    --real_subset_size "$SUBSET_SIZE" \
     --real_use_population_prob \
     --population_json "data/city_bg_populations/${CITY}.json" \
     --regime_lambdas 50 150 300 \
@@ -39,9 +40,12 @@ run_city() {
   echo ""
 }
 
-run_city pittsburgh "data/2023_shape_files/census_shape_block_group/tl_2023_42_bg.shp"
-run_city chicago    "data/tiger_2023/tl_2023_17_bg/tl_2023_17_bg.shp"
-run_city manhattan  "data/tiger_2023/tl_2023_36_bg/tl_2023_36_bg.shp"
-run_city la         "data/tiger_2023/tl_2023_06_bg/tl_2023_06_bg.shp"
+# Manhattan uses 50 BGs (~2.4 km^2): the original 25-BG Midtown footprint
+# (~1 km^2) was too small for FR-Detour candidate-line library to produce
+# feasible trips. The other cities stay at 25 BGs.
+run_city pittsburgh "data/2023_shape_files/census_shape_block_group/tl_2023_42_bg.shp"  25
+run_city chicago    "data/tiger_2023/tl_2023_17_bg/tl_2023_17_bg.shp"                    25
+run_city manhattan  "data/tiger_2023/tl_2023_36_bg/tl_2023_36_bg.shp"                    50
+run_city la         "data/tiger_2023/tl_2023_06_bg/tl_2023_06_bg.shp"                    25
 
 echo "Done. Results in results/baseline_clouds/cities_pop/"

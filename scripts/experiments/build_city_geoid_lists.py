@@ -28,7 +28,10 @@ CITY_AREAS = {
         shapefile="data/tiger_2023/tl_2023_17_bg/tl_2023_17_bg.shp",
     ),
     "manhattan": dict(
-        bbox=(40.785, 40.745, -73.96, -74.00),  # Midtown
+        # Wider Midtown + bordering blocks; original 1.2x1.6 km Midtown-only
+        # bbox was too small for FR-Detour candidate-line library to produce
+        # feasible trips. ~3x larger bounding box now covers ~3-4 km^2 with 50 BGs.
+        bbox=(40.795, 40.735, -73.94, -74.01),
         shapefile="data/tiger_2023/tl_2023_36_bg/tl_2023_36_bg.shp",
     ),
     "la": dict(
@@ -94,13 +97,25 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--n_subset", type=int, default=25)
     p.add_argument("--out_dir", type=str, default="data/city_bg_lists")
+    p.add_argument("--cities", nargs="+", default=None,
+                   help="Restrict to a subset of cities (default: all)")
+    p.add_argument("--n_subset_per_city", nargs="*", default=None,
+                   help="Per-city overrides as 'city:n', e.g. manhattan:50")
     args = p.parse_args()
 
+    overrides = {}
+    if args.n_subset_per_city:
+        for kv in args.n_subset_per_city:
+            k, v = kv.split(":")
+            overrides[k.strip()] = int(v)
+
     os.makedirs(args.out_dir, exist_ok=True)
-    for city in CITY_AREAS:
-        print(f"\n[{city}]")
+    cities = args.cities or list(CITY_AREAS)
+    for city in cities:
+        n = overrides.get(city, args.n_subset)
+        print(f"\n[{city}] n_subset={n}")
         try:
-            geoids = build_city_list(city, n_subset=args.n_subset)
+            geoids = build_city_list(city, n_subset=n)
         except Exception as e:
             print(f"  FAILED: {e}")
             continue

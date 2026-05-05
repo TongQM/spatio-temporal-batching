@@ -2214,6 +2214,7 @@ class FRDetour(BaselineMethod):
         walk_speed_kmh: float = 5.0,
         num_scenarios: int = 200,
         max_fleet: float | None = None,
+        min_fleet: float | None = None,
         capacity: int = 15,
         n_angular: int = 8,
         K_skip: int = 2,
@@ -2233,6 +2234,7 @@ class FRDetour(BaselineMethod):
         self.walk_speed_kmh = walk_speed_kmh
         self.num_scenarios = num_scenarios
         self.max_fleet = max_fleet
+        self.min_fleet = min_fleet
         self.capacity = capacity
         self.n_angular = n_angular
         self.K_skip = K_skip
@@ -2509,6 +2511,9 @@ class FRDetour(BaselineMethod):
                                / (speed * T_vals[ti])) * x_v[k]
             master.addConstr(fleet_expr <= fleet_budget,
                              name="fleet_budget")
+            if self.min_fleet is not None:
+                master.addConstr(fleet_expr >= float(self.min_fleet),
+                                 name="fleet_floor")
 
             # Route count: at most K lines can operate.
             # This prevents the optimizer from selecting many small
@@ -2517,6 +2522,11 @@ class FRDetour(BaselineMethod):
                 gp.quicksum(x_v[k] for k in x_v)
                 <= int(fleet_budget) + 1,
                 name="max_routes")
+            if self.min_fleet is not None:
+                master.addConstr(
+                    gp.quicksum(x_v[k] for k in x_v)
+                    >= int(self.min_fleet),
+                    name="min_routes")
 
             # Scenario-specific load-factor bounds, with soft slacks for robustness.
             kappa = self.load_factor_kappa
@@ -2566,7 +2576,10 @@ class FRDetour(BaselineMethod):
 
             # Objective: recourse cost + soft load penalties + expected wait
             # + paper-style coverage reward proxy on assigned scenario demand.
-            coverage_reward = rider_time_weight * 10.0
+            # Paper (Jacquillat et al. Table EC.4) sets M = 10000 with unit
+            # rider-time weights. We scale by wr so the per-passenger net
+            # benefit M - rider_penalties stays invariant in wr.
+            coverage_reward = rider_time_weight * float(self.coverage_penalty_factor) * 10000.0
 
             obj_expr = gp.LinExpr()
             for li, ti in x_v:

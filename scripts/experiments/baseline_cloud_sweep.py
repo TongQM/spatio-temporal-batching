@@ -1075,11 +1075,12 @@ def _build_regime_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "data_group": "fr",
             "base_lambda": first_lambda,
             "base_wr": first_wr,
-            "varying_note": regime_note + " (sweep fleet ∈ {3, 5} at delta=0; best by aggregate cost)",
+            "varying_note": regime_note + " (sweep fleet ∈ {3, 5, 8, 12} at delta=0; best by aggregate cost)",
             "settings": list(shared_settings),
             "make_method": lambda s: _FRDetourSweep(
-                combos=[(0.0, 3), (0.0, 5)],
+                combos=[(0.0, 3), (0.0, 5), (0.0, 8), (0.0, 12)],
                 T_values=fr_t_values,
+                max_iters=8, n_saa=20, max_cg_iters=20,
             ),
         },
         "multi_fr_detour": {
@@ -1087,11 +1088,12 @@ def _build_regime_specs(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
             "data_group": "fr",
             "base_lambda": first_lambda,
             "base_wr": first_wr,
-            "varying_note": regime_note + " (2 combos: delta=0.5/fleet=3, delta=1.0/fleet=5)",
+            "varying_note": regime_note + " (4 combos: delta∈{0.5,1.0} × fleet∈{3,5}; best by aggregate cost)",
             "settings": list(shared_settings),
             "make_method": lambda s: _FRDetourSweep(
-                combos=[(0.5, 3), (1.0, 5)],
+                combos=[(0.5, 3), (0.5, 5), (1.0, 3), (1.0, 5)],
                 T_values=fr_t_values,
+                max_iters=8, n_saa=20, max_cg_iters=20,
             ),
         },
         "sp_lit": {
@@ -1274,13 +1276,15 @@ def _plot_cloud(df: pd.DataFrame, out_path: Path, meta: Dict[str, Any]) -> None:
         wrs_txt = ", ".join(f"{w:g}" for w in (meta.get("regime_wrs") or [])) or "-"
         title = (
             "Baseline Performance Clouds — shared regime sweep\n"
-            f"K={meta['districts']}, Λ∈{{{lambdas_txt}}}, wr∈{{{wrs_txt}}}, "
-            f"wv={meta['wv']} (pinned); marker size ∝ Λ"
+            f"Λ∈{{{lambdas_txt}}}, wr∈{{{wrs_txt}}}, wv={meta['wv']} (pinned); "
+            f"each baseline picks best K (FR fleet fallback K={meta['districts']}); "
+            f"marker size ∝ Λ"
         )
     else:
         title = (
             "Baseline Performance Clouds — per-method hyperparameter sweep\n"
-            f"base K={meta['districts']}, Λ={meta['Lambda']}, wr={meta['wr']}, wv={meta['wv']}"
+            f"FR fleet fallback K={meta['districts']}, Λ={meta['Lambda']}, "
+            f"wr={meta['wr']}, wv={meta['wv']}"
         )
     ax.set_title(title, fontsize=12, fontweight="bold")
     ax.grid(True, alpha=0.2, linestyle="--", which="both")

@@ -145,10 +145,10 @@ def plot_cloud(df: pd.DataFrame, meta: dict, out_path: Path) -> None:
     fcr = meta.get("fleet_cost_rate", 0)
     ax.set_title(
         f"Baseline Performance Clouds — latest sweep results\n"
-        f"K={meta.get('districts', '?')}, "
         + "\u039b \u2208 {" + ",".join(str(int(l)) for l in regime_lambdas) + "}, "
         + "wr \u2208 {" + ",".join(str(w) for w in regime_wrs) + "}, "
-        + f"wv={meta.get('wv', '?')}, $c_f$={fcr}",
+        + f"wv={meta.get('wv', '?')}, $c_f$={fcr}; "
+        + f"each baseline picks best K (FR fleet fallback K={meta.get('districts', '?')})",
         fontsize=11, fontweight="bold",
     )
     ax.grid(True, alpha=0.2, ls="--", which="both")
