@@ -109,8 +109,10 @@ Joint methods occupy the \textbf{left band} of the cloud
 (provider cost 28--136), spanning a wide user-time range
 (0.11--0.78\,h).
 Two design knobs respond to the regime: the number of
-districts~$K$ and the per-district dispatch interval~$T^*$ from
-the internal Newton solve.
+districts~$K$ (swept externally over $\{2,\dots,6\}$ by the
+harness, with the best $K$ picked per regime point by aggregate
+cost) and the per-district dispatch interval~$T^*$ (computed
+internally by Newton's method for each candidate~$K$).
 
 \begin{center}
 \small
@@ -137,10 +139,10 @@ near real-time dispatch --- at the cost of $3$--$4\times$ higher
 provider spending.
 
 \paragraph{$K$ increases with $w_r$ and $\Lambda$.}
-At $(\Lambda{=}50, w_r{=}1)$ the optimizer picks $K{=}4$; at
-$(\Lambda{=}300, w_r{=}10)$ it picks $K{=}6$.  More districts means
-shorter BHH tours per district and lower per-rider in-vehicle time,
-at the cost of a larger fleet and more linehaul.
+At $(\Lambda{=}50, w_r{=}1)$ the aggregate-cost sweep selects
+$K{=}4$; at $(\Lambda{=}300, w_r{=}10)$ it selects $K{=}6$.  More
+districts means shorter BHH tours per district and lower per-rider
+in-vehicle time, at the cost of a larger fleet and more linehaul.
 This is the degree of freedom that pins Joint's cloud to the
 cheapest-provider edge of the Pareto region.
 
@@ -150,7 +152,7 @@ The Newton $T^*$ formula uses a per-rider wait term $w_r \cdot T$
 affects the objective only through the BHH tour term
 $\alpha_i \propto \sqrt{\Lambda}$.
 Meanwhile, the $K$ sweep partially compensates: at higher~$\Lambda$
-the optimizer picks more districts, keeping per-district demand
+the harness picks more districts, keeping per-district demand
 roughly stable.
 The net effect is that user time varies only modestly with~$\Lambda$
 (0.60--0.78\,h at $w_r{=}1$), with most of the cloud spread coming
