@@ -2,123 +2,62 @@
 % Analysis of baseline performance clouds.
 % Drop into your Overleaf project and \input{cloud_analysis} where needed.
 % Requires: amsmath, booktabs, array.
+% Figure paths assume Overleaf layout: figures/external baselines/<name>
 % =============================================================================
 
 \section{External Baselines}\label{sec:external-baselines}
 
-We benchmark our proposed service-design framework against a
-suite of seven external baselines drawn from three families: (i)
-partition + continuous-approximation methods (\textbf{Joint-Nom},
-\textbf{Joint-DRO}, \textbf{SP-Lit (Carlsson)}); (ii) routing-based
-methods (\textbf{Multi-FR (Jacquillat)}, \textbf{TP-Lit (Liu)});
-and (iii) operational-extreme baselines (\textbf{VCC},
-\textbf{OD/fully-on-demand}).  Each baseline is benchmarked on a
-shared regime grid $(\Lambda, w_r)$ and at each grid point picks
-its best internal hyperparameters by minimising the aggregate
-cost $C_{\mathrm{prov}} + w_r \cdot \bar{u} \cdot \Lambda$, so
-every cloud point already reflects an internally-optimised design
-for its $(\Lambda, w_r)$ regime.  We progressively stress-test the
-comparison: \S\ref{sec:cloud-analysis} on a $5{\times}5$ synthetic
-grid; \S\ref{sec:real-cloud} on a 25-block-group subset of
-Pittsburgh with real road-network distances and ACS-population
-demand; and \S\ref{sec:multi-city} across four U.S.\ cities chosen
-to span topology archetypes (Pittsburgh, Chicago, Manhattan, LA).
+We benchmark our service-design framework against seven external baselines drawn from three families: (i) partition with continuous approximation (\textbf{Joint-Nom}, \textbf{Joint-DRO}, \textbf{SP-Lit (Carlsson)}); (ii) routing-based (\textbf{Multi-FR (Jacquillat)}, \textbf{TP-Lit (Liu)}); (iii) operational extremes (\textbf{VCC}, \textbf{OD/fully-on-demand}). Each baseline sweeps its own structural hyperparameters internally per regime point and picks the combination minimising the aggregate cost $C_{\mathrm{prov}} + w_r \cdot \bar{u} \cdot \Lambda$. The comparison is stress-tested at three tiers: \S\ref{sec:cloud-analysis} synthetic $5{\times}5$ grid; \S\ref{sec:real-cloud} a 25-block-group Pittsburgh slice with real road distances and ACS population demand; \S\ref{sec:multi-city} four U.S.\ cities spanning topology archetypes (Pittsburgh, Chicago, Manhattan, LA). To keep clouds readable, each scatter figure is presented twice: once with all seven baselines overlaid (Pareto-overview view) and once sliced into a Pareto-core panel (Joint-Nom/DRO, SP-Lit, Multi-FR, TP-Lit) and an operational-extremes panel (VCC, OD) with separate $x$-axes.
 
-\subsection{Analysis of Baseline Performance Clouds}\label{sec:cloud-analysis}
+\subsection{Analysis on the synthetic instance}\label{sec:cloud-analysis}
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=0.92\linewidth]{results/baseline_clouds/regime_synthetic_grid5x5_K3_L300_wr1.0_wv1.0_cloud_20260415_224723/scatter_user_provider_cloud}
-\caption{\textbf{Baseline performance clouds on the $5{\times}5$
-synthetic instance.}  Each marker is one baseline at one regime
-point ($\Lambda \in \{50, 150, 300\}$, $w_r \in \{1, 3, 10\}$,
-$w_v{=}1$, $c_f{=}4.0$).  Marker size encodes $\Lambda$ (small$=50$,
-large$=300$); fill shade encodes $w_r$ (light$=1$, dark$=10$);
-shaded hull is each baseline's spread across the $3{\times}3$
-regime grid.  At each point, each baseline picks its best internal
-hyperparameters by minimising aggregate cost
-$C_{\mathrm{prov}} + w_r \cdot \bar{u} \cdot \Lambda$.}
+\includegraphics[width=0.92\linewidth]{figures/external baselines/cloud_synthetic}
+\caption{Performance cloud on the $5{\times}5$ synthetic instance ($\Lambda \in \{50, 150, 300\}$\,pax/h, $w_r \in \{1, 3, 10\}$, $w_v{=}1$, $c_f{=}4.0$\,\$/veh-h). Marker size $\propto \Lambda$, fill shade $\propto w_r$ (lighter $=$ larger $w_r$), shaded hull is each baseline's spread over the $3{\times}3$ regime grid.}
 \label{fig:cloud}
 \end{figure}
 
-Figure~\ref{fig:cloud} plots each baseline's provider cost rate
-(log scale, $x$-axis) against average user time per rider ($y$-axis)
-across the shared regime grid
-$\Lambda \in \{50, 150, 300\}$~pax/hour,
-$w_r \in \{1, 3, 10\}$,
-with vehicle-km weight $w_v = 1$ and fleet amortisation
-$c_f = 4.0$~\$/veh-hour, on the $5 \times 5$ synthetic instance.
-Each baseline sweeps its own structural hyperparameters
-internally per regime point --- partition methods sweep
-$K \in \{2,\dots,6\}$, Multi-FR sweeps a (fleet, $\delta$)
-combo grid, OD/VCC sweep fleet --- and picks the combination
-minimising the aggregate cost
-$C_{\mathrm{prov}} + w_r \cdot \bar{u} \cdot \Lambda$; no fixed
-$K$ is imposed across the comparison.
-Marker size encodes~$\Lambda$ (small = 50, large = 300);
-fill shade encodes~$w_r$ (light = 1, dark = 10);
-lines connect the $w_r$ sweep at each fixed~$\Lambda$.
-Seven baselines are shown: Joint-Nom, Joint-DRO,
-Multi-FR (Jacquillat), SP-Lit (Carlsson), TP-Lit (Liu), VCC, and OD.
-Each baseline produces $3 \times 3 = 9$ rows, but visually some
-markers overlap: if a baseline's chosen design does not respond to
-$w_r$ at a given $\Lambda$, the three $w_r$ points coincide on the
-plot.  TP-Lit shows exactly three visible points (one per $\Lambda$)
-for this reason --- see \S\ref{sec:tplit-cloud} below.  Multi-FR
-similarly collapses the three $w_r$ markers at $\Lambda = 50$ into
-one point because the smallest available $T$ in its internal grid
-is already binding at that demand level.
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/external baselines/cloud_synthetic_split}
+\caption{Synthetic cloud sliced by baseline family: (a) Pareto-core methods (Joint, SP-Lit, Multi-FR, TP-Lit), (b) operational extremes (VCC, OD). Axes auto-scaled per panel so VCC/OD's wide provider-cost range does not compress the Pareto-core into a sliver.}
+\label{fig:cloud-split}
+\end{figure}
 
-% -----------------------------------------------------------------------
-\subsubsection{Sweep parameters by service}
+Figure~\ref{fig:cloud} plots each baseline's provider cost rate (log scale) against average user time per rider across the shared regime grid. Each baseline sweeps its own structural hyperparameters internally: partition methods sweep $K \in \{2,\dots,6\}$, Multi-FR sweeps a (fleet, $\delta$) combo grid, OD and VCC sweep fleet. No fixed $K$ is imposed across the comparison. Some markers visually overlap when a baseline's chosen design does not respond to $w_r$ at a given $\Lambda$ (e.g.\ TP-Lit shows three points, one per $\Lambda$). Figure~\ref{fig:cloud-split} splits the same data into a Pareto-core panel and an operational-extremes panel; the split makes the Pareto-core's structure (which the merged plot crowds into the left band) directly readable.
 
-The table below summarises, for each baseline, the hyperparameters
-swept internally at every regime point.  The ``best'' setting is
-selected by aggregate cost, so each cloud point already reflects
-an internally-optimised design for its $(\Lambda, w_r)$ regime.
+\subsubsection{Per-baseline sweep grids}
 
 \begin{center}
 \small
 \renewcommand{\arraystretch}{1.15}
 \begin{tabular}{lll}
 \toprule
-Baseline & Swept hyperparameters & Selection rule \\
+Baseline & Swept hyperparameters & Selection \\
 \midrule
-Joint-Nom  & $K \in \{2,3,4,5,6\}$ (random-search partition) & best $K$ by agg.\ cost \\
-Joint-DRO  & $K \in \{2,3,4,5,6\}$, $\varepsilon = 0.5$ fixed & best $K$ by agg.\ cost \\
-Multi-FR   & (fleet, $\delta$) $\in \{(3, 0), (5, 0)\}$, $T$-grid & best combo by agg.\ cost \\
-SP-Lit     & $K \in \{2,\dots,6\}$ $\times$ $T_{\mathrm{fixed}} \in \{0.1, 0.2, 0.3, 0.5, 0.8, 1.0\}$ & best $(K, T)$ by agg.\ cost \\
-TP-Lit     & \texttt{max\_fleet} $\in \{20, 50, 100\}$; 25 candidate stops & best fleet by agg.\ cost \\
-VCC        & fleet $\in \{5, 10, 20, 30, 50\}$ $\times$ $\delta_w \in \{0.1, 0.3, 0.5\}$~km & best (fleet, $\delta_w$) by agg.\ cost \\
-OD         & fleet $\in \{5, 10, 15, 20, 30, 50, 80\}$ (queueing) & best fleet by agg.\ cost \\
+Joint-Nom  & $K \in \{2,\dots,6\}$ (random-search partition) & best $K$ by aggregate cost \\
+Joint-DRO  & $K \in \{2,\dots,6\}$, $\varepsilon = 0.5$ fixed & best $K$ by aggregate cost \\
+SP-Lit     & $K \in \{2,\dots,6\}$ $\times$ $T_{\mathrm{fixed}} \in \{0.1, 0.2, 0.3, 0.5, 0.8, 1.0\}$ & best $(K, T)$ \\
+Multi-FR   & (fleet, $\delta$) $\in$ $\{(3,0), (5,0), (8,0), (12,0)\}$, internal $T$-grid & best combo \\
+TP-Lit     & $\mathtt{max\_fleet} \in \{20, 50, 100\}$; 25 candidate stops & best fleet \\
+VCC        & fleet $\in \{5,10,20,30,50\} \times \delta_w \in \{0.1, 0.3, 0.5\}$\,km & best (fleet, $\delta_w$) \\
+OD         & fleet $\in \{5,10,15,20,30,50,80\}$ with queueing & best fleet \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-Partition methods sweep~$K$ (and, for SP-Lit, also $T_{\mathrm{fixed}}$);
-fleet-scheduled methods (TP-Lit, VCC, OD) sweep fleet size; VCC also
-sweeps walk tolerance; Multi-FR sweeps a small (fleet, $\delta$) pair
-grid combined with an internal $T$-grid.  Joint-DRO's $\varepsilon$ is
-held fixed at 0.5 because it is a robustness knob, not a
-provider/user Pareto knob.
+Joint-DRO holds $\varepsilon{=}0.5$ fixed because it is a robustness knob, not a provider/user Pareto knob.
 
-% -----------------------------------------------------------------------
 \subsubsection{Joint-Nom and Joint-DRO}
 
-Joint methods occupy the \textbf{left band} of the cloud
-(provider cost 28--136), spanning a wide user-time range
-(0.11--0.78\,h).
-Two design knobs respond to the regime: the number of
-districts~$K$ (swept externally over $\{2,\dots,6\}$ by the
-harness, with the best $K$ picked per regime point by aggregate
-cost) and the per-district dispatch interval~$T^*$ (computed
-internally by Newton's method for each candidate~$K$).
+Joint methods occupy the left band of the cloud (provider cost 28 to 136), spanning a wide user-time range (0.11 to 0.78\,h). Two design knobs respond to the regime: the number of districts $K$ (swept externally over $\{2,\dots,6\}$ by the harness, best $K$ picked per regime point by aggregate cost) and the per-district dispatch interval $T^*$ (computed internally by Newton's method for each candidate $K$).
 
 \begin{center}
 \small
 \begin{tabular}{cccccc}
 \toprule
-$\Lambda$ & $w_r$ & $K$ chosen & $T^*$ (h) & User time (h) & Provider cost \\
+$\Lambda$ & $w_r$ & $K$ & $T^*$ (h) & User time (h) & Provider cost \\
 \midrule
  50 &  1 & 4 & 0.88 & 0.60 &  28 \\
  50 & 10 & 5 & 0.13 & 0.12 &  50 \\
@@ -130,55 +69,13 @@ $\Lambda$ & $w_r$ & $K$ chosen & $T^*$ (h) & User time (h) & Provider cost \\
 \end{tabular}
 \end{center}
 
-\paragraph{$T^*$ is highly $w_r$-responsive.}
-At $w_r = 1$, the optimizer values rider time cheaply and picks
-long dispatch intervals ($T^* \approx 0.9$--$1.0$\,h), batching
-demand to minimise provider travel.
-At $w_r = 10$, $T^*$ drops to $\approx 0.13$\,h (8~min) ---
-near real-time dispatch --- at the cost of $3$--$4\times$ higher
-provider spending.
+$T^*$ is highly $w_r$-responsive: at $w_r{=}1$ the optimiser values rider time cheaply and picks $T^* \approx 0.9$ to $1.0$\,h (heavy batching), while at $w_r{=}10$ it drops to $\approx 0.13$\,h (near real-time dispatch) at 3 to 4$\times$ the provider cost. $K$ increases with both $w_r$ and $\Lambda$ (from $K{=}4$ at the cheap end to $K{=}6$ at the expensive end). User time barely responds to $\Lambda$ at low $w_r$ because the Newton $T^*$ formula uses a per-rider wait term $w_r \cdot T$ rather than aggregate $w_r \cdot T \cdot \Lambda$, and the $K$ sweep partially compensates by adding districts at higher $\Lambda$.
 
-\paragraph{$K$ increases with $w_r$ and $\Lambda$.}
-At $(\Lambda{=}50, w_r{=}1)$ the aggregate-cost sweep selects
-$K{=}4$; at $(\Lambda{=}300, w_r{=}10)$ it selects $K{=}6$.  More
-districts means shorter BHH tours per district and lower per-rider
-in-vehicle time, at the cost of a larger fleet and more linehaul.
-This is the degree of freedom that pins Joint's cloud to the
-cheapest-provider edge of the Pareto region.
+Joint-DRO separates from Joint-Nom only at high $\Lambda$ and $w_r$: at $(\Lambda{=}300, w_r{=}10)$, DRO picks fleet 17 / provider cost 136 versus Nom's fleet 15 / provider cost 124 ($\sim 10\%$ premium). Under uniform demand the DRO premium stays modest; non-uniform demand amplifies it.
 
-\paragraph{Why user time barely responds to~$\Lambda$.}
-The Newton $T^*$ formula uses a per-rider wait term $w_r \cdot T$
-(not aggregate $w_r \cdot T \cdot \Lambda$), so increasing $\Lambda$
-affects the objective only through the BHH tour term
-$\alpha_i \propto \sqrt{\Lambda}$.
-Meanwhile, the $K$ sweep partially compensates: at higher~$\Lambda$
-the harness picks more districts, keeping per-district demand
-roughly stable.
-The net effect is that user time varies only modestly with~$\Lambda$
-(0.60--0.78\,h at $w_r{=}1$), with most of the cloud spread coming
-from the $w_r$ dimension.
-
-\paragraph{Joint-DRO vs.\ Joint-Nom.}
-With the $K$ sweep, DRO visibly separates from Nom at high
-$\Lambda$ and $w_r$.
-At $(\Lambda{=}300, w_r{=}10)$: DRO picks $K{=}6$ with fleet~17 and
-provider cost~136, versus Nom's $K{=}6$ with fleet~15 and provider
-cost~124.
-The DRO worst-case demand distribution forces slightly more
-conservative (higher-cost) partitions.
-Under uniform demand this effect stays modest ($\sim 10\%$
-provider-cost premium); non-uniform demand would amplify it.
-
-% -----------------------------------------------------------------------
 \subsubsection{Multi-FR (Jacquillat)}
 
-Multi-FR occupies the \textbf{mid-left} region, overlapping
-substantially with Joint at moderate $\Lambda$.
-Its distinctive feature is the \emph{opposite} $\Lambda$ response
-on user time: \textbf{user time decreases with~$\Lambda$}.
-The fleet-3 variant dominates the picked combinations at every
-regime point in this sweep; fleet-5 is available but rarely
-preferred under the aggregate-cost criterion at these scales.
+Multi-FR occupies the mid-left region and is the only method with $\Lambda$-decreasing user time on the synthetic grid (the Mohring effect): more riders justify shorter dispatch headways on the same fixed-route backbone, so $T^*$ scales roughly as $1/\sqrt{\Lambda}$. Fleet 3 wins at every synthetic regime point; fleet 5 is available but rarely preferred.
 
 \begin{center}
 \small
@@ -194,444 +91,91 @@ $\Lambda$ & $w_r$ & $T$ (h) & Wait (h) & User time (h) & Provider cost \\
 \end{tabular}
 \end{center}
 
-\paragraph{Why user time decreases with~$\Lambda$ (Mohring effect).}
-FR operates fixed routes: the vehicle drives the same
-depot--checkpoint--depot backbone regardless of how many riders
-board.
-The aggregate wait cost in FR's Benders objective is
-$w_r \cdot T/2 \cdot \text{demand}$, which scales linearly with~$\Lambda$.
-At higher~$\Lambda$, the optimizer picks shorter~$T$ from the
-internal $T$-grid (more frequent service) because more riders
-justify the additional dispatch.
-Provider cost rises only mildly (same route driven more often),
-while wait drops as $T^* \propto 1/\sqrt{\Lambda}$.
-This is the \emph{Mohring effect}: fixed-route transit exhibits
-economies of density.
-Partition methods do not exhibit this because their tour length
-also grows with demand ($\ell \propto \sqrt{\Lambda T}$).
+Multi-FR is one of the few baselines with non-zero walk time ($\approx 0.07$ to $0.12$\,h on the grid), reflecting the rider-to-checkpoint distance. The evaluator assigns each sampled rider to the nearest realised service point globally rather than to a partition-assigned route.
 
-\paragraph{FR vs.\ Joint at high $\Lambda$.}
-At $(\Lambda{=}300, w_r{=}1)$: FR achieves user time 0.56\,h at
-provider cost~44, while Joint-Nom achieves 0.78\,h at provider
-cost~43.
-FR's user time advantage (0.22\,h shorter) comes from the
-Mohring effect; Joint's provider cost is comparable thanks to the
-$K{=}6$ partition.
-
-\paragraph{Walk time.}
-Multi-FR is one of the few methods with non-zero walk time
-($\approx 0.07$--$0.12$\,h), reflecting the distance from a rider's
-origin to the nearest checkpoint on the fixed route.
-In the refactored evaluator, stopping locations that fall outside
-any route's $\delta$-corridor are handled by walking to the
-nearest checkpoint globally, not to a partition-assigned route.
-
-% -----------------------------------------------------------------------
 \subsubsection{SP-Lit (Carlsson)}
 
-SP-Lit sits in the \textbf{centre-right} of the cloud, shifted
-right of Joint despite using the same partition-plus-BHH structure.
-The $(K, T_{\mathrm{fixed}})$ sweep over 30 combinations lets SP-Lit
-respond to regime changes via both district count and headway.
+SP-Lit sits in the centre-right of the cloud, shifted right of Joint despite the same partition-plus-BHH structure. At every regime point its provider cost is 1.6 to 3.1$\times$ Joint-Nom's. The gap is a partition-quality difference: SP-Lit's deterministic ham-sandwich bisection balances the continuous measures $\mu_1$ (spatial) and $\mu_2$ (radial workload) but does not directly minimise per-district cost; Joint's random search with local improvement finds lower-$\alpha_i$ partitions for the same $K$.
 
-\begin{center}
-\small
-\begin{tabular}{ccccccc}
-\toprule
-$\Lambda$ & $w_r$ & $K$ & $T_{\mathrm{fixed}}$ (h) & User time (h) & Provider cost & Joint-Nom provider \\
-\midrule
- 50 &  1 & 2 & 0.80 & 0.60 &  45 & 28 \\
-150 &  3 & 5 & 0.30 & 0.24 & 140 & 49 \\
-300 & 10 & 6 & 0.10 & 0.13 & 382 & 124 \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-At every regime point, SP-Lit's provider cost is $1.6$--$3.1\times$
-that of Joint-Nom.
-The gap is a \textbf{partition-quality difference}: SP-Lit uses a
-deterministic ham-sandwich bisection that balances the continuous
-measures $\mu_1$ (BHH spatial term) and $\mu_2$ (radial workload)
-but does not directly minimise the per-district cost function.
-Joint-Nom's random search with local improvement finds partitions
-with lower $\alpha_i$ (BHH spatial coefficient) per district,
-yielding shorter tours for equivalent $K$.
-
-SP-Lit tends to pick fewer districts than Joint at low $w_r$
-(e.g.\ $K{=}2$ at $\Lambda{=}50, w_r{=}1$ vs Joint's $K{=}4$),
-because its less efficient partitions make the marginal district
-less attractive.  The $T_{\mathrm{fixed}}$ sweep nonetheless allows
-SP-Lit to follow the regime diagonally: at high $w_r$, it picks
-$T_{\mathrm{fixed}} \in \{0.1, 0.2\}$ and achieves user times
-comparable to Joint, but always at higher provider cost.
-
-% -----------------------------------------------------------------------
 \subsubsection{TP-Lit (Liu)}\label{sec:tplit-cloud}
 
-TP-Lit occupies a \textbf{narrow horizontal band} at user time
-$\approx 0.20$--$0.23$\,h with provider cost 233--244.
-Its cloud is nearly \emph{flat}: neither axis responds materially to
-$(\Lambda, w_r)$.
+TP-Lit occupies a narrow horizontal band at user time $\approx 0.20$ to $0.23$\,h with provider cost 233 to 244. Its cloud is nearly flat in both axes because the design is essentially $w_r$-insensitive: fixed $T{=}0.25$\,h and the consistently-picked fleet-20 design give realised wait $T/2 = 0.125$\,h regardless of $\Lambda$ or $w_r$. The three visible markers correspond to the three $\Lambda$ values (in-vehicle time varies mildly with candidate-stop proximity). Maintaining a fleet of 20 vehicles for 25 candidate stops makes the fleet-cost term alone ($c_f \times 20 \approx 80$) account for $\sim 35\%$ of provider cost.
 
-\paragraph{Why only three points are visible.}
-TP-Lit produces nine rows in the aggregate CSV (one per $(\Lambda,
-w_r)$ combination), but the three $w_r$ rows at each fixed $\Lambda$
-are \emph{identical} --- same design, same realized metrics --- so
-they plot on top of each other.  The figure therefore shows exactly
-three visible TP-Lit markers, one per $\Lambda$.  This is the
-visual signature of a baseline whose chosen design is completely
-$w_r$-insensitive.
+\subsubsection{VCC and OD}
 
-\paragraph{Why TP-Lit is regime-insensitive.}
-TP-Lit uses a fixed dispatch interval $T = 0.25$\,h and an internal
-\texttt{max\_fleet} sweep over $\{20, 50, 100\}$, but at every
-regime point the optimizer picks fleet~20 and returns the same
-base design.  Wait time is always $T/2 = 0.125$\,h regardless of
-$\Lambda$ or $w_r$.  In-vehicle time varies mildly (0.07--0.11\,h)
-as candidate-stop proximity changes with~$\Lambda$.
-The fixed $T$ together with the consistently-picked fleet-20 design
-means TP-Lit cannot trade wait for provider cost within this
-regime grid --- it always dispatches at 15-minute headways with
-20 vehicles.  The only visible variation across the nine settings
-is the mild $\Lambda$-dependence of in-vehicle time, producing the
-three horizontally-shifted markers.
+VCC and OD form the operational-extremes panel (Fig.~\ref{fig:cloud-split}b). Both achieve user time below 0.16\,h on the synthetic grid but at provider cost 1 to 2 orders of magnitude above Joint-Nom. VCC sweeps fleet ($\{5,10,20,30,50\}$) and walk tolerance $\delta_w \in \{0.1,0.3,0.5\}$\,km; the optimiser picks larger fleets at higher $\Lambda$ to keep user time constant ($\approx 0.15$\,h), producing a horizontal trajectory in the cloud. OD serves each request individually (depot $\to$ destination $\to$ depot) and is the cost ceiling on provider expense and the cost floor on user time: every other baseline is interpreted relative to OD's extreme. At low $w_r$, OD tolerates moderate queueing (fleet 5--15); at $w_r{=}10$ it upgrades to 50 vehicles at $\Lambda{=}300$.
 
-\paragraph{High provider cost.}
-TP-Lit's provider cost is $5$--$8\times$ that of Joint at low
-$\Lambda$ because it maintains a fleet of 20 vehicles to cover the
-25 candidate stops regardless of demand.
-The fleet cost term alone ($c_f \times 20 \approx 80$) accounts for
-$\sim 35\%$ of provider cost.
+\subsubsection{Cross-method synthesis}
 
-% -----------------------------------------------------------------------
-\subsubsection{VCC}
+No single method dominates across the regime grid. The approximate Pareto frontier runs from Joint-Nom/DRO (cheapest provider, highest user time at low $w_r$) through Multi-FR (Mohring-aided at high $\Lambda$) to VCC and OD (lowest user time, highest provider cost). SP-Lit and TP-Lit are dominated on the frontier: SP-Lit by Joint-Nom (same structure, better partitions) and TP-Lit by VCC (lower user time at comparable provider cost). The clearest architectural distinction is the response to $\Lambda$: Multi-FR's user time \emph{decreases} (Mohring); Joint/SP-Lit barely respond (the $K$ sweep absorbs the demand change); VCC/OD are nearly constant in user time (fleet scales with $\Lambda$); TP-Lit is perfectly flat (its design is $\Lambda$-insensitive in this range).
 
-VCC sits at the \textbf{centre-right, low user-time} region: user
-time $\approx 0.14$--$0.16$\,h and provider cost 148--861.
-The fleet and walk-tolerance sweep gives VCC a wide provider-cost
-range as $\Lambda$ varies.
-
-\begin{center}
-\small
-\begin{tabular}{cccccc}
-\toprule
-$\Lambda$ & $w_r$ & Fleet & $\delta_w$ (km) & Walk (h) & Provider cost \\
-\midrule
- 50 &  1 &  5 & 0.3 & 0.054 & 152 \\
-150 &  1 & 20 & 0.4 & 0.067 & 429 \\
-300 & 10 & 30 & 0.3 & 0.052 & 842 \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\paragraph{Walk tolerance as a design knob.}
-VCC sweeps fleet size $\in \{5, 10, 20, 30, 50\}$ and walk
-tolerance $\delta_w \in \{0.1, 0.3, 0.5\}$\,km.
-Larger $\delta_w$ lets vehicles serve riders farther from the
-optimised route, reducing detour km but increasing walk time.
-The optimizer picks the (fleet, $\delta_w$) pair minimising
-aggregate cost.
-
-\paragraph{Fleet scales with~$\Lambda$.}
-VCC picks fleet 5 at $\Lambda = 50$, 20 at $\Lambda = 150$, and 30
-at $\Lambda = 300$.
-Despite this scaling, user time stays nearly constant
-($\approx 0.15$\,h) because the larger fleet absorbs extra demand
-without congestion.  All $\Lambda$ variation appears on the
-provider axis, producing VCC's characteristic horizontal
-trajectory in the cloud.
-
-% -----------------------------------------------------------------------
-\subsubsection{OD (Fully On-Demand)}
-
-OD occupies the \textbf{far right} of the cloud: very low user time
-($\approx 0.07$--$0.19$\,h) but the highest provider cost
-(197--1243).
-
-\paragraph{No batching, no routing optimisation.}
-Each request is served individually (depot $\to$ destination $\to$
-depot).  User time is dominated by trip duration plus a small queue
-wait.  Provider cost $\approx \Lambda \times 2\bar{d}_{\mathrm{trip}}
-+ c_f \times F$ scales linearly with~$\Lambda$.
-
-\paragraph{Fleet selection with queueing.}
-OD sweeps fleet grid $\{5, 10, 15, 20, 30, 50, 80\}$ and picks the
-fleet minimising aggregate cost.
-At low $w_r$, OD tolerates moderate queueing (fleet 5--15).
-At $w_r = 10$, it upgrades (e.g.\ 50~vehicles at $\Lambda = 300$)
-to keep queue wait below 0.5\,min.
-
-\paragraph{Cost floor / cost ceiling.}
-OD represents the extreme of \emph{no service design}: maximum
-routing flexibility (direct trips) at maximum provider expense
-(no sharing, no batching).
-Its cloud position provides the \textbf{cost floor on user time}
-and the \textbf{cost ceiling on provider expense} against which
-every other method is compared.
-
-% -----------------------------------------------------------------------
-\subsubsection{Cross-Method Comparison}
-
-\paragraph{Pareto frontier.}
-No single method dominates across the regime grid.
-The approximate Pareto frontier runs from Joint-Nom/DRO
-(cheapest provider, highest user time at low~$w_r$)
-through Multi-FR (moderate on both axes, benefiting from the
-Mohring effect at high $\Lambda$) to VCC and OD (lowest user time,
-highest provider cost).
-SP-Lit and TP-Lit are dominated on the frontier --- SP-Lit by
-Joint-Nom (same structure, better partitions) and TP-Lit by VCC
-(better user time at comparable provider cost).
-
-\paragraph{Economies of density.}
-The clearest architectural distinction is how methods respond to
-increasing~$\Lambda$:
-\begin{itemize}
-  \item \textbf{FR (fixed-route)}: user time \emph{decreases} ---
-    more riders justify more frequent dispatch on the same route
-    (Mohring effect), $T^* \propto 1/\sqrt{\Lambda}$.
-  \item \textbf{Joint / SP-Lit (partition + BHH)}: user time
-    \emph{varies modestly} --- the $K$ sweep partially compensates
-    by adding districts at high~$\Lambda$, but per-rider in-vehicle
-    time still grows with $\sqrt{\Lambda}$ within each district.
-  \item \textbf{OD / VCC}: user time \emph{nearly constant} ---
-    fleet scales with~$\Lambda$ to absorb demand, keeping per-rider
-    experience fixed.  All $\Lambda$ variation appears on the
-    provider axis.
-  \item \textbf{TP-Lit}: user time \emph{perfectly flat} ---
-    fixed $T = 0.25$\,h and fixed fleet-20 design give an almost
-    constant point on the $y$-axis.
-\end{itemize}
-
-\paragraph{Effect of $K$ optimisation on partition methods.}
-With $K$ swept over $\{2, 3, 4, 5, 6\}$, Joint-Nom picks
-$K \in \{4, 5, 6\}$ depending on regime --- more districts at high
-$w_r$ and $\Lambda$.  This shifts Joint's cloud \textbf{down and
-right} compared to a hypothetical single fixed-$K$ baseline: user
-time improves (shorter tours per district) at the cost of a larger
-fleet.  SP-Lit shows the same pattern but at uniformly higher
-provider cost because its partition geometry is less efficient per
-district.
-
-\paragraph{When each method is preferred.}
-\begin{itemize}
-  \item \textbf{Low $\Lambda$, low $w_r$}: Joint-Nom dominates ---
-    cheapest provider (28), acceptable user time (0.60\,h) at
-    $K{=}4$.
-    Multi-FR is penalised by infrequent dispatch
-    ($T \approx 1.75$\,h, user time 1.04\,h).
-  \item \textbf{High $\Lambda$, low $w_r$}: Joint-Nom (provider
-    $\approx$43, user 0.78\,h) and Multi-FR (provider 44, user
-    0.56\,h) are close.  FR wins on user time via the Mohring
-    effect; Joint ties on provider cost via the $K{=}6$ partition.
-  \item \textbf{High $w_r$ (any $\Lambda$)}: every method compresses
-    toward low user time.  Joint picks $K \in \{5,6\}$ with
-    $T^* \approx 0.13$\,h, achieving user time 0.12--0.19\,h at
-    provider cost 50--124.  Multi-FR reaches user time 0.39--0.51\,h
-    at provider cost 44--69.
-    Joint is more user-responsive; Multi-FR is cheaper on the
-    provider side.
-  \item \textbf{Premium service}: VCC or OD for user time below
-    0.15\,h, but at 3--20$\times$ the provider cost of partition
-    methods.
-\end{itemize}
-
-% =============================================================================
-\subsection{Real-data validation: Pittsburgh road network}\label{sec:real-cloud}
+\subsection{Pittsburgh real-data validation}\label{sec:real-cloud}
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\linewidth]{results/baseline_clouds/cities_road/pittsburgh/scatter_user_provider_cloud}
-\caption{\textbf{Pittsburgh real-data cloud}: 25 census block groups
-in Allegheny County, road-network shortest paths everywhere
-(optimisation + evaluation), ACS 2023 population-weighted demand.
-Same regime grid and same axes as Fig.~\ref{fig:cloud}.}
+\includegraphics[width=\linewidth]{figures/external baselines/cloud_pittsburgh}
+\caption{Pittsburgh real-data cloud, 25 census block groups in Allegheny County, road-network shortest paths everywhere (optimisation and evaluation), ACS 2023 population-weighted demand. Same regime grid and same axes as Fig.~\ref{fig:cloud}.}
 \label{fig:cloud-real}
 \end{figure}
 
-To check whether the conclusions above survive when the synthetic
-$5\times5$ grid is replaced by a real city, we re-run the regime sweep
-on a $25$--block-group subset of Pittsburgh.
-The instance:
-\begin{itemize}
-  \item \textbf{Geometry}: 25 census block groups around the centroid
-    of HCT's service area, real polygons in EPSG:2163 ($\sim15\times15$\,km).
-  \item \textbf{Demand}: ACS-population--weighted $\mathrm{prob}_b$
-    (non-uniform; $p_b \in [0.014, 0.062]$), in contrast to the
-    uniform $p_b = 1/25$ on the synthetic grid.
-  \item \textbf{Distances}: actual road-network shortest paths via
-    OSMnx (2{,}931 nodes, 7{,}519 edges) replace Euclidean BHH where
-    each baseline supports it (Joint-Nom, Joint-DRO, SP-Lit). FR/OD/VCC
-    use Euclidean distances on real block centroids.
-  \item \textbf{All other parameters} match the synthetic sweep:
-    $\Lambda \in \{50, 150, 300\}$~pax/h, $w_r \in \{1, 3, 10\}$,
-    $w_v = 1$, $c_f = 4.0$, same per-baseline internal hyperparameter
-    grids (partition methods sweep $K \in \{2,\dots,6\}$, OD/VCC
-    sweep fleet, etc.); no fixed $K$ is imposed across baselines.
-  \item \textbf{TP-Lit is omitted} from the real-data figure because
-    its ADP+VRP solve takes ${\sim}5$~min per combo;
-    9 combos $\times$ 9 settings $\approx$ 7~hours.
-\end{itemize}
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/external baselines/cloud_pittsburgh_split}
+\caption{Pittsburgh cloud sliced by baseline family.}
+\label{fig:cloud-real-split}
+\end{figure}
 
-Figure~\ref{fig:cloud-real} shows the resulting cloud and a
-companion map (Fig.~\ref{fig:designs-map}) overlays each baseline's
-chosen design at $(\Lambda{=}150, w_r{=}1)$ on the Pittsburgh road
-network.
+We re-run the same regime grid on 25 census block groups around the centroid of HCT's Pittsburgh service area. Demand is ACS-population-weighted ($p_b \in [0.014, 0.062]$ versus the synthetic $p_b{=}1/25$); distances are OSMnx road-network shortest paths (2{,}931 nodes, 7{,}519 edges) everywhere a baseline supports them (Joint-Nom, Joint-DRO, SP-Lit in optimisation; all baselines in evaluation).
 
-\paragraph{Headline numbers ($\Lambda{=}150$, $w_r{=}1$, real data).}
+\paragraph{Headline numbers at $\Lambda{=}150$, $w_r{=}1$.}
 \begin{center}
 \small
 \begin{tabular}{lcc}
 \toprule
 Baseline & Provider cost & User time (h) \\
 \midrule
-Multi-FR (Jacquillat)  &  40.3 & 0.63 \\
-Joint-Nom              &  55.8 & 0.85 \\
-Joint-DRO              &  57.6 & 0.83 \\
+Multi-FR (Jacquillat)  &  29.5 & 1.78 \\
+Joint-Nom              &  58.6 & 0.92 \\
+Joint-DRO              &  59.5 & 0.91 \\
 SP-Lit (Carlsson)      & 134.9 & 0.70 \\
-VCC                    & 452.9 & 0.16 \\
-OD                     & 758.2 & 0.15 \\
+TP-Lit (Liu)           & 216.2 & 0.38 \\
+VCC                    & 718.1 & 0.21 \\
+OD                     & 1220.2 & 0.23 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\paragraph{What changes vs.\ synthetic.}
-\begin{itemize}
-  \item \textbf{Provider costs scale up across the board} because real
-    road distances are longer than Euclidean (typical road-to-Euclidean
-    factor of $1.3$--$1.5$ in Pittsburgh's grid). OD's provider cost
-    triples (from $\sim 200$ to $\sim 760$ at $\Lambda{=}150$, $w_r{=}1$);
-    VCC roughly doubles. Partition methods (Joint, SP-Lit) absorb most
-    of the increase via the road-network--aware in-district TSP, ending
-    up only $\sim$50\% higher.
-  \item \textbf{User-time order is preserved}. The same Pareto ranking
-    holds: Joint methods $\to$ Multi-FR $\to$ SP-Lit $\to$ VCC $\to$ OD.
-    No method swaps positions on the frontier.
-  \item \textbf{Mohring effect on Multi-FR survives}. As $\Lambda$ grows
-    from 50 to 300, FR's user time drops from 1.08\,h to 0.57\,h while
-    its provider cost rises only from 31 to 43 --- the same
-    economies-of-density behaviour as on the grid.
-  \item \textbf{Joint methods' $K$ choice tracks regime}. At
-    $(\Lambda{=}50, w_r{=}1)$, Joint-Nom picks $K{=}4$ (provider 44);
-    at $(\Lambda{=}300, w_r{=}10)$ it picks $K{=}6$ (provider 192) ---
-    same monotone pattern as on the synthetic grid.
-  \item \textbf{Non-uniform demand sharpens DRO-vs-Nom}. Pittsburgh
-    has population-density variation across the 25 BGs.  At
-    $(\Lambda{=}300, w_r{=}10)$, DRO's provider cost is $240$ vs Nom's
-    $192$ --- a $\sim 25\%$ premium, larger than the $\sim 10\%$ seen on
-    uniform synthetic data.  This matches the prediction that DRO's
-    worst-case partition diverges from nominal more aggressively when
-    demand is spatially non-uniform.
-\end{itemize}
+\paragraph{Findings.} Three patterns from the synthetic analysis carry over and one new one emerges. (i) Provider costs scale up across the board because real road distances are longer than Euclidean (typical road-to-Euclidean factor 1.3 to 1.5 in Pittsburgh's grid); OD's provider cost more than triples, while partition methods absorb most of the increase via their road-aware in-district TSPs. (ii) The Pareto ranking is preserved: same ordering Joint $\to$ SP-Lit $\to$ TP-Lit $\to$ VCC $\to$ OD on provider cost, with the reverse on user time. (iii) Joint's $K$ choice tracks regime monotonically ($K{=}4$ at $\Lambda{=}50, w_r{=}1$, $K{=}6$ at $\Lambda{=}300, w_r{=}10$). (iv) Non-uniform demand sharpens the DRO-vs-Nom premium: at $(\Lambda{=}300, w_r{=}10)$, DRO costs $\sim 25\%$ more than Nom (versus $\sim 10\%$ on uniform synthetic), matching the prediction that DRO's worst-case partition diverges more aggressively when demand is spatially non-uniform.
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\linewidth]{results/baseline_clouds/cities_road/pittsburgh/designs_map}
-\caption{\textbf{Pittsburgh service designs} at $\Lambda{=}150$,
-$w_r{=}1$, $K{=}3$ (fixed for visualisation; the cloud sweep picks
-$K$ per regime).  Each panel overlays one baseline on the real
-OSMnx road network.  Route polylines follow road shortest paths.
-Partition methods (cols 1--3): contiguous district fills with
-exact-TSP depot tours.  Multi-FR (col 4): selected reference loops.
-TP-Lit (col 5): three independent dispatch waves (blues = wave 1,
-reds = wave 2, greens = wave 3) with realised VRP routes per
-vehicle.  VCC (col 6): walk-radius halos at
-$\mathrm{max\_walk\_km} = 0.3$ around each block.  OD (col 7):
-depot + sample on-demand radial trips.}
+\includegraphics[width=\linewidth]{figures/external baselines/designs_pittsburgh}
+\caption{Pittsburgh service designs at $\Lambda{=}150$, $w_r{=}1$, with $K{=}3$ fixed for visualisation (the cloud sweep picks $K$ per regime). Route polylines follow road shortest paths. Partition methods (cols 1 to 3) show contiguous district fills with exact-TSP depot tours. Multi-FR (col 4) shows selected reference loops. TP-Lit (col 5) shows three independent dispatch waves (blues, reds, greens) with realised VRP routes per vehicle. VCC (col 6) shows walk-radius halos ($\delta_w{=}0.3$\,km). OD (col 7) shows depot plus sample on-demand radial trips.}
 \label{fig:designs-map}
 \end{figure}
 
-\paragraph{Map overlay (Fig.~\ref{fig:designs-map}).}
-The map confirms the architectural distinctions are also visible in
-the geometry:
-\begin{itemize}
-  \item \textbf{Joint-Nom, Joint-DRO}: 3 contiguous districts;
-    DRO's partition is slightly more evenly balanced (bigger central
-    yellow district) than Nom's, reflecting the worst-case demand
-    rebalancing.
-  \item \textbf{SP-Lit}: 3 districts from the ham-sandwich bisection;
-    geometry is more axis-aligned (cleaner straight cuts) than Joint's
-    random-search partition, but the resulting per-district BHH is
-    less efficient.
-  \item \textbf{Multi-FR}: 4 selected reference loops radiating from the
-    depot, each visiting a small set of checkpoints.
-  \item \textbf{OD}: every block reachable directly from the depot, no
-    structure beyond a single hub.
-  \item \textbf{VCC}: depot plus distributed pickup/dropoff candidates;
-    no partitioning, riders are matched to whichever vehicle is closest.
-\end{itemize}
+The map overlay confirms that the architectural distinctions are also visible in geometry: Joint-Nom and Joint-DRO produce contiguous random-search partitions with a Joint-Nom-optimised depot; SP-Lit's ham-sandwich partition is more axis-aligned; Multi-FR's selected reference loops radiate from the centroid depot; VCC overlays per-block walk halos; OD shows pure depot-anchored trips.
 
-\paragraph{Bottom line.}
-The conclusions from \S\ref{sec:cloud-analysis} (synthetic grid)
-hold up on real Pittsburgh data:
-\begin{enumerate}
-  \item Joint methods dominate the cheap-provider end of the Pareto
-    frontier.
-  \item Multi-FR's Mohring effect is robust to non-uniform demand and
-    real road distances.
-  \item OD/VCC pay heavily on the provider axis for low user time;
-    that gap widens on real roads.
-  \item DRO's robustness premium becomes visible (and economically
-    meaningful) under non-uniform demand.
-\end{enumerate}
-
-% =============================================================================
-\subsection{Cross-topology validation: 4 cities, 7 baselines, real BGs + ACS demand}\label{sec:multi-city}
-
-To test whether the cloud structure is sensitive to road-network
-topology, we re-run the regime sweep on four U.S.\ cities chosen to
-span topology classes:
-
-\begin{itemize}
-  \item \textbf{Pittsburgh, PA} (around the Allegheny/Monongahela
-    confluence) --- hilly, irregular street grid disrupted by three
-    rivers.
-  \item \textbf{Chicago, IL} (Loop / River North) --- strict
-    cardinal grid with regular block sizes.
-  \item \textbf{Manhattan, NY} (Midtown) --- avenue-and-street grid
-    with one diagonal (Broadway).
-  \item \textbf{Los Angeles, CA} (DTLA) --- nominally a grid, but
-    fragmented by freeways crossing the area.
-\end{itemize}
-
-Each city uses \textbf{real census block groups} (TIGER 2023): we
-take the 25 BGs (50 for Manhattan, see below) whose centroids are
-closest to the centre of a focal bbox per city, fetch the
-corresponding OSMnx road network, and feed them through the
-unmodified regime-sweep harness.  See \S\ref{sec:real-city-design}
-for the data-source and methodology details (BG selection,
-road-network fetch, MDS embedding for routing helpers,
-ACS-population demand).  Demand at each BG is proportional to its
-ACS 2023 total population (B01003), so cross-city differences
-combine \emph{block geometry, road-network topology, and population
-spatial pattern}.  All seven baselines (Joint-Nom, Joint-DRO,
-SP-Lit, Multi-FR, TP-Lit, VCC, OD) are included.  The internal
-hyperparameter sweeps (K for partition methods, fleet for OD/VCC,
-etc.) match the synthetic-grid sweep.  Multi-FR uses fleet
-$\in \{3, 5, 8, 12\}$ (with paper-faithful coverage reward
-$M = 10{,}000 \cdot w_r$ from Jacquillat et al.\ Table EC.4) and
-$T \in \{0.05, \dots, 3.0\}$\,h.
+\subsection{Cross-topology validation across four U.S.\ cities}\label{sec:multi-city}
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\linewidth]{results/baseline_clouds/cities_road/four_city_clouds}
-\caption{\textbf{Cross-city baseline performance clouds at the
-shared $(\Lambda, w_r)$ regime grid} ($\Lambda \in \{50, 150,
-300\}$\,pax/h, $w_r \in \{1, 3, 10\}$, $w_v = 1$).  Each panel
-shows one city; each marker is one baseline at one regime point;
-marker size $\propto \Lambda$, fill shade $\propto w_r$ (lighter =
-larger $w_r$); shaded hull = each baseline's spread across the
-$3 \times 3$ regime grid.  Same axes and units across panels for
-direct visual comparison.  Multi-FR is missing on Manhattan at
-$w_r{=}10$ (degenerate solver outcome --- see text).}
+\includegraphics[width=\linewidth]{figures/external baselines/cloud_four_cities}
+\caption{Cross-city baseline performance clouds on the shared regime grid. Each panel is one city; markers and shading as in Fig.~\ref{fig:cloud}.}
 \label{fig:four-city-cloud}
 \end{figure}
 
-\paragraph{Service-region geometry differs sharply across cities.}
-Holding the BG count constant at 25 does \emph{not} hold the
-service-region area or arrival density constant.  TIGER block
-groups are sized to roughly equal population, so denser cities
-pack 25 BGs into much smaller polygons:
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/external baselines/cloud_four_cities_split}
+\caption{Cross-city clouds sliced by baseline family. Rows are cities; left columns show Pareto-core methods, right columns operational extremes.}
+\label{fig:four-city-cloud-split}
+\end{figure}
+
+We re-run the regime sweep on four cities chosen for road-topology contrast: Pittsburgh (irregular hilly, river-cut), Chicago Loop (strict cardinal grid), Manhattan Midtown (avenue-and-street grid), and Los Angeles DTLA (freeway-fragmented grid). Each city uses real TIGER 2023 block groups, ACS-population demand, and full road-network shortest paths in both optimisation and evaluation.
+
+\paragraph{Service-region geometry.} BG count is held at 25 (50 for Manhattan, see below); TIGER block groups are population-sized, so denser cities pack the same count into smaller polygons.
+
 \begin{center}
 \small
 \begin{tabular}{lcrrrr}
@@ -645,31 +189,15 @@ LA         & 25 &  4.3 & $2.3 \times 2.9$ &  3.7 &  8{,}755 \\
 \bottomrule
 \end{tabular}
 \end{center}
-Pittsburgh's 25 BGs cover roughly $10{\times}$ more area than
-Manhattan's 50, so at fixed $\Lambda$ the same arrival rate is
-dispatched over very different service areas.  Cross-city
-absolute-cost comparisons should therefore be read as ``the chosen
-focal-area subset of city X'' rather than ``a fixed-size service
-area in city X.''  Manhattan in particular is enlarged from the
-default 25 BGs (1.1\,km$^2$, too small for FR-Detour's
-candidate-line library to produce feasible trips) to 50 BGs
-(2.4\,km$^2$); we keep the other three cities at 25 BGs because
-their default footprint is already large enough.  A strict
-topology-only study would fix the bbox area (and let BG count
-vary).
+
+Pittsburgh's 25 BGs cover roughly $10{\times}$ more area than Manhattan's 50, so cross-city cost comparisons reflect both topology and area. Manhattan is enlarged from the default 25 BGs ($1.1$\,km$^2$, too small for FR-Detour's candidate-line library to produce feasible trips) to 50 BGs ($2.4$\,km$^2$); the other three cities are kept at 25 BGs.
 
 \paragraph{Headline numbers at $\Lambda{=}150$, $w_r{=}1$.}
-Each baseline picks its best internal hyperparameters
-(K for partitions, fleet/walk for VCC, fleet for OD, $T_{\mathrm{fixed}}$
-for SP-Lit, $T_{\mathrm{fixed}}{\times}$fleet for TP-Lit, $T{\times}$fleet
-at $\delta{=}0$ for Multi-FR) per regime point by aggregate cost
-$C_{\mathrm{provider}} + w_r \cdot \bar{u} \cdot \Lambda$.
-
 \begin{center}
 \small
 \begin{tabular}{lrrrr}
 \toprule
-Baseline & Pittsburgh & Chicago & Manhattan & Los Angeles \\
+Baseline & Pittsburgh & Chicago & Manhattan & LA \\
 \midrule
 \multicolumn{5}{l}{\emph{Provider cost}} \\
 Joint-Nom              &   58.6 &   47.6 &   47.9 &   35.5 \\
@@ -680,7 +208,7 @@ TP-Lit (Liu)           &  216.2 &  103.1 &  104.7 &   91.5 \\
 VCC                    &  718.1 &  241.9 &  199.7 &  193.3 \\
 OD                     & 1220.2 &  476.4 &  417.5 &  343.8 \\
 \midrule
-\multicolumn{5}{l}{\emph{User time (hours per rider)}} \\
+\multicolumn{5}{l}{\emph{User time (h per rider)}} \\
 Joint-Nom              & 0.92 & 0.64 & 0.58 & 0.56 \\
 Joint-DRO              & 0.91 & 0.68 & 0.60 & 0.56 \\
 SP-Lit (Carlsson)      & 0.70 & 0.41 & 0.39 & 0.41 \\
@@ -692,203 +220,23 @@ OD                     & 0.23 & 0.07 & 0.18 & 0.08 \\
 \end{tabular}
 \end{center}
 
-\noindent\emph{Multi-FR uses the paper's coverage reward
-$M = 10{,}000 \cdot w_r$ (Jacquillat et al.\ Table EC.4).}
-With this calibration the master correctly picks
-fleet $\in \{4, 6, 9, 12\}$ across the regime grid (vs.\ a
-degenerate fleet $=1$ under our earlier $M = 10 \cdot w_r$
-heuristic), and walk time drops from $0.4$--$0.5$\,h to
-$\sim 0.07$\,h as multiple trips cover all demand blocks.
-However, the master still selects the longest scheduled
-headway in our $T$-grid ($T_{\max} = 3$\,h, hence realised
-wait $\approx 1.5$\,h) at every $(\Lambda, w_r)$ point.  This
-is a structural property of the calibrated objective:
-$M = 10{,}000 \cdot w_r$ dwarfs the per-passenger wait term
-$w_r \cdot T/2 \cdot \mathrm{demand}$ by ${\sim}6{,}700{\times}$,
-so the master's $T$ choice is driven by the
-fleet-budget--vs--trip-count tradeoff (long $T$ fits more
-trips, accumulates more $M$ reward) rather than by wait
-minimisation.  Multi-FR therefore lands at a consistent
-``many-trips, full-coverage, long-headway'' design point on
-real cities.
+\paragraph{Multi-FR calibration.} Multi-FR uses the paper-faithful coverage reward $M = 10{,}000 \cdot w_r$ (Jacquillat et al.\ Table EC.4). With this calibration the master picks fleet $\in \{4, 6, 9, 12\}$ across the regime grid (versus the degenerate fleet $=1$ under our earlier $M = 10 \cdot w_r$), and walk time drops from 0.4 to 0.5\,h down to $\sim 0.07$\,h. However, the master still selects the longest scheduled headway in our $T$-grid ($T_{\max}{=}3$\,h, realised wait $\approx 1.5$\,h) at every regime point because $M{=}10^4 \cdot w_r$ dwarfs the per-passenger wait term $w_r \cdot T/2 \cdot \mathrm{demand}$ by $\sim 6{,}700{\times}$. Multi-FR therefore lands at a many-trips, full-coverage, long-headway design point on real cities. At $w_r{=}10$ on Manhattan and LA the master sometimes flips to an empty-solution corner of the feasible set; see the discussion below.
 
-\noindent\emph{Manhattan was originally infeasible for Multi-FR}
-at the 25-BG (1.1\,km$^2$) default footprint: the angular
-line-generation step ($n_{\mathrm{angular}} = 8$) combined with
-the minimum tour-length filter and the load-factor floor
-$\kappa \cdot \mathrm{capacity} = 3.75$ pax/trip excluded every
-candidate trip.  Doubling Manhattan's BG count to 50 (2.4\,km$^2$,
-still smaller than Chicago/LA) restores feasibility, and Multi-FR
-now lands at the same long-headway, low-provider-cost regime as
-on the other cities (fleet $=4$, prov $=20$, user time
-$\approx 1.6$\,h).  See \S\ref{sec:real-city-design} for the
-build-script options used to enlarge Manhattan; the other three
-cities are kept at 25 BGs because their default footprint is
-already large enough for the candidate-line library.
+\paragraph{Cross-method ranking and Pareto positions.} The provider-cost ordering Multi-FR $<$ Joint $<$ SP-Lit $<$ TP-Lit $<$ VCC $<$ OD holds at every $(\Lambda, w_r)$ point on all four cities; the user-time ordering is essentially the reverse. Multi-FR consistently occupies the cheapest-provider corner (provider 20--30, user time 1.6--1.8\,h); OD the opposite (provider 344--1{,}220, user time 0.07--0.23\,h). The Pareto frontier is dense: at $(\Lambda{=}150, w_r{=}1)$, five to seven of the seven baselines are non-dominated on each city. The architectural distinctions between baselines correspond to genuinely different operating points on the same Pareto plane.
 
-\paragraph{Cross-method ranking and Pareto positions.}
-At every $(\Lambda, w_r)$ point and across all four cities, the
-provider-cost ordering of the seven baselines is
-\begin{equation*}
-  \text{Multi-FR} \;<\; \text{Joint-Nom/DRO} \;<\; \text{SP-Lit} \;<\; \text{TP-Lit} \;<\; \text{VCC} \;<\; \text{OD}
-\end{equation*}
-and the user-time ordering is essentially the reverse.  Multi-FR
-consistently occupies the cheapest-provider corner (provider cost
-$20$--$30$, user time $1.6$--$1.8$\,h on all four cities); OD
-occupies the opposite extreme (provider cost $344$--$1{,}220$, user
-time $0.07$--$0.23$\,h); the partition methods (Joint-Nom,
-Joint-DRO, SP-Lit) and TP-Lit fill the intermediate region.  The
-Pareto frontier is dense: at $(\Lambda{=}150, w_r{=}1)$, six to
-seven of the seven baselines are non-dominated on each city
-(seven on Chicago, six on Pittsburgh and LA, five on Manhattan
-once Joint-DRO is dominated by Joint-Nom).  This confirms that the
-architectural distinctions between baselines correspond to
-genuinely different operating points on the same Pareto plane,
-rather than one method strictly dominating another, and confirms
-that the synthetic-grid conclusions (\S\ref{sec:cloud-analysis})
-are topology-robust: changing the road network shifts absolute
-costs but does not change which method dominates which region of
-the Pareto plane.
+\paragraph{Topology controls absolute cost.} Pittsburgh (25 BGs, 24.5\,km$^2$, irregular) inflates absolute provider cost relative to Manhattan (50 BGs, 2.4\,km$^2$, dense grid): Joint-Nom $59$ vs $48$ ($1.2{\times}$), SP-Lit $135$ vs $74$ ($1.8{\times}$), TP-Lit $216$ vs $105$ ($2.1{\times}$), OD $1{,}220$ vs $418$ ($2.9{\times}$). Methods that pay distance per request (OD, VCC) amplify the geometric handicap; partition methods absorb most of it via a shared in-district TSP. Multi-FR is essentially topology-invariant in provider cost (clustering at 20--30 across all four cities) because its long-headway design is dispatch-frequency-bound, not distance-bound. The OD-to-Joint multiplier rises with topology complexity: $9{\times}$ on Manhattan, 10--13$\times$ on Chicago and LA, $21{\times}$ on Pittsburgh.
 
-\paragraph{Topology controls absolute cost more than ranking.}
-Pittsburgh (25 BGs, $24.5$\,km$^2$, irregular hilly with rivers)
-inflates absolute provider cost relative to the smaller and more
-regular Manhattan ($50$ BGs, $2.4$\,km$^2$):
-Joint-Nom $59$ vs $48$ ($\sim 1.2{\times}$),
-SP-Lit $135$ vs $74$ ($\sim 1.8{\times}$),
-TP-Lit $216$ vs $105$ ($\sim 2.1{\times}$),
-and OD $1{,}220$ vs $418$ ($\sim 2.9{\times}$).  Methods that pay
-distance per request (OD, VCC) amplify the city's geometric
-handicap; partition methods (Joint, SP-Lit) absorb most of the
-topology variance into a single shared in-district TSP per
-district.  Chicago and LA bracket between these extremes.
-Multi-FR's provider cost is the only one that is essentially
-topology-invariant (clustering tightly around $20$--$30$ across all
-four cities), because its dispatch design is dominated by the
-long-headway trip-count tradeoff rather than per-trip distance.
-Consequently, the OD-to-Joint-Nom multiplier rises with topology
-complexity: $9{\times}$ on Manhattan, $10$--$13{\times}$ on
-Chicago/LA, $21{\times}$ on Pittsburgh.  Two mechanisms compound:
-(i)~the larger service area multiplies all distance-proportional
-costs uniformly, and (ii)~irregular-grid + river crossings hit OD
-harder than partition methods.  The ``no batching, no routing''
-extreme is therefore particularly bad in irregular sparse-density
-networks; partition methods become \emph{relatively} more
-attractive as service area and topology irregularity grow.
+\paragraph{Regime responsiveness ($w_r$).} As $w_r$ rises from 1 to 10 at $\Lambda{=}150$, partition methods (Joint-Nom/DRO, SP-Lit) drop user time by 66 to 77\,\% on every city. TP-Lit and OD also respond (23 to 69\,\%); VCC is weakly responsive (10 to 13\,\%). Multi-FR is essentially $w_r$-insensitive ($-1\%$ to $-4\%$ on Pittsburgh and Chicago), and degenerates to fleet$=0$ on Manhattan and LA at $w_r{=}10$. This is a known artifact of the calibrated $M = 10{,}000 \cdot w_r$ objective: at high $w_r$ both the per-passenger reward and the wait term scale up, and the master can satisfy load-factor and trip-budget constraints either by selecting $\sim 4$ trips or by selecting zero; on the smaller cities the empty corner sometimes wins. A non-degenerate Multi-FR at $w_r{=}10$ on the smaller cities would require capping $T_{\max}$ at $\sim 1$\,h or relaxing the load-factor floor.
 
-\paragraph{Regime responsiveness (varying $w_r$ at fixed
-$\Lambda$).}
-The user-time response to $w_r$ separates the baselines sharply.
-Joint-Nom, Joint-DRO, and SP-Lit respond strongly: as $w_r$ rises
-from $1$ to $10$ (at $\Lambda{=}150$), their user time falls by
-$66\%$--$77\%$ on every city (e.g.\ Joint-Nom on Manhattan: $0.58$\,h
-$\to 0.15$\,h, $-73\%$).  TP-Lit and OD also respond meaningfully
-($-23\%$ to $-69\%$), with the largest gains at the OD extreme on
-denser cities.  VCC is weakly responsive ($-10\%$ to $-13\%$, since
-its DAR design barely consumes $w_r$).  \textbf{Multi-FR is
-essentially $w_r$-insensitive at the operating $w_r$ values}:
-$-1\%$ to $-4\%$ on Pittsburgh and Chicago, and complete
-optimisation failure (\texttt{fleet}=$0$, all-zero result) on
-Manhattan and LA at $w_r{=}10$.  This is a known degenerate regime
-of the calibrated $M = 10{,}000 \cdot w_r$ coverage objective: at
-$w_r{=}10$, the per-passenger reward $M = 10^5$ and the wait term
-$w_r \cdot T/2 \cdot \mathrm{demand} = 15$ both scale up, and the
-master can satisfy both load-factor and trip-budget constraints
-either by selecting $\sim 4$ trips or by selecting zero trips
-(empty solution); on the smaller cities the empty solution sometimes
-wins.  A non-degenerate Multi-FR run at $w_r{=}10$ on Manhattan/LA
-would require either capping $T_{\max}$ at $1.0$\,h or relaxing the
-load-factor floor.
+\paragraph{Density scaling ($\Lambda$).} Three regimes emerge as $\Lambda$ rises from 50 to 300 at $w_r{=}1$. (i) Mohring (decreasing user time): SP-Lit drops 20--54\,\%, VCC drops 10--17\,\%, TP-Lit roughly flat. (ii) Anti-Mohring (increasing user time): Joint-Nom/DRO rise 19--34\,\% across all four cities because their Newton $T^*$ \emph{lengthens} with $\Lambda$ to keep tour cost competitive (a CA-literature prediction); OD on Pittsburgh ($+39\%$) and Manhattan ($+144\%$) saturates fleet queueing. (iii) $\Lambda$-insensitive: Multi-FR ($\pm 1\%$ everywhere) because additional demand fills the same already-scheduled trips at the locked $T_{\max}$ headway.
 
-\paragraph{Density scaling and the Mohring effect (varying
-$\Lambda$).}
-Increasing demand from $\Lambda{=}50$ to $\Lambda{=}300$ at fixed
-$w_r{=}1$ produces three distinct behaviours:
-\begin{itemize}
-  \item \emph{Mohring (decreasing user time):} SP-Lit drops
-    $20$--$54\%$, VCC drops $10$--$17\%$, TP-Lit roughly flat
-    ($-5$ to $0\%$).  These methods exploit higher demand density
-    to amortise tour distance per rider.
-  \item \emph{Anti-Mohring (increasing user time):} Joint-Nom and
-    Joint-DRO rise $19$--$34\%$ across all four cities.  This is
-    the Newton-$T^*$ partition design responding to higher
-    $\Lambda$ by \emph{lengthening} the dispatch interval to keep
-    tour cost competitive --- a real prediction of the
-    continuous-approximation literature.  OD also shows
-    anti-Mohring on Pittsburgh ($+39\%$) and on Manhattan
-    ($+144\%$ as $\Lambda$ goes 50$\to$300), where the fixed fleet
-    becomes queueing-saturated.
-  \item \emph{$\Lambda$-insensitive:} Multi-FR ($\pm 1\%$
-    everywhere).  Once the long-$T$ design locks in, additional
-    demand simply fills the same scheduled trips; user time per
-    rider is dominated by the wait $T_{\max}/2$, which does not
-    move with $\Lambda$.
-\end{itemize}
-
-\paragraph{Where the choice of method actually matters.}
-The cross-city cloud collapses two dimensions of comparison into
-one figure.  Operationally, the choice of which baseline ``wins''
-depends on where the policymaker sits on the user--provider
-tradeoff relative to the Pareto frontier:
-\begin{itemize}
-  \item \textbf{Cheap-provider regime:} Multi-FR (provider $\sim
-    20$--$30$, user time $\sim 1.6$\,h).  Acceptable only when
-    riders tolerate long headways --- a true rural- or
-    low-demand-microtransit operating point.
-  \item \textbf{Provider-balanced regime:} Joint-Nom/DRO and
-    SP-Lit (provider $40$--$135$, user time $0.4$--$0.9$\,h at
-    $w_r{=}1$).  The robustness premium of Joint-DRO over
-    Joint-Nom is small in population-weighted demand
-    ($\sim 0$--$15\%$ provider cost), consistent with the
-    synthetic-grid finding.
-  \item \textbf{User-time regime:} TP-Lit, VCC, OD (provider
-    $90$--$1{,}220$, user time $0.07$--$0.38$\,h).  Cost rises
-    super-linearly with topology irregularity (the OD/Joint-Nom
-    multiplier is $9{\times}$ on Manhattan but $21{\times}$ on
-    Pittsburgh), so the recommended choice depends sharply on the
-    deployment city.
-\end{itemize}
+\paragraph{Where each baseline wins.} The cross-city cloud localises the operational choice. Multi-FR is the cheap-provider option (provider $20$--$30$, user time $\sim 1.6$\,h), tolerable only when riders accept long headways (rural or low-demand microtransit). Joint-Nom/DRO and SP-Lit are the provider-balanced option (provider 40--135, user time 0.4--0.9\,h at $w_r{=}1$); the DRO premium over Nom is small ($\sim 0$ to $15\%$) on population-weighted demand. TP-Lit, VCC, and OD are the user-time-optimised option (provider 90--1{,}220, user time 0.07--0.38\,h); cost rises super-linearly with topology irregularity, so the deployment city sharply affects the recommended choice.
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\linewidth]{results/baseline_clouds/cities_road/four_city_designs_map}
-\caption{\textbf{Service designs across the four cities at
-$\Lambda{=}150$, $w_r{=}1$, with $K{=}3$ fixed for visualisation}
-(the cloud sweep picks $K$ per regime per method).  Rows are cities (Pittsburgh,
-Chicago, Manhattan, LA), columns are baselines (Joint-Nom,
-Joint-DRO, SP-Lit, Multi-FR, TP-Lit, VCC, OD).  Backdrops show the
-real OSMnx road network; route polylines follow road shortest
-paths (not Euclidean).  Partition methods (cols 1--3) show
-contiguous district fills with depot-anchored tours computed by
-exact TSP.  Multi-FR (col 4) shows selected reference loops.
-TP-Lit (col 5) shows three independent dispatch waves (blues =
-wave 1, reds = wave 2, greens = wave 3) with realised VRP routes
-per vehicle; red markers are sampled customers.  VCC (col 6) shows
-walk-radius halos at $\mathrm{max\_walk\_km} = 0.3$ around each
-block.  OD (col 7) shows depot + sample on-demand radial trips.
-The depot star is the same fixed geographic-centroid block for
-SP-Lit, Multi-FR, TP-Lit, VCC, OD across all panels (paper-faithful
-heuristic); only Joint-Nom and Joint-DRO optimise the depot, and
-Joint-Nom occasionally lands on a different block (visible on
-Pittsburgh's row).}
+\includegraphics[width=\linewidth]{figures/external baselines/designs_four_cities}
+\caption{Service designs across the four cities at $\Lambda{=}150$, $w_r{=}1$, with $K{=}3$ fixed for visualisation. Rows are cities (Pittsburgh, Chicago, Manhattan, LA); columns are baselines (Joint-Nom, Joint-DRO, SP-Lit, Multi-FR, TP-Lit, VCC, OD). Route polylines follow road shortest paths. Multi-FR shows selected reference loops; TP-Lit shows three dispatch waves; VCC shows walk halos; OD shows depot plus sample radial trips. Only Joint-Nom and Joint-DRO optimise the depot.}
 \label{fig:four-city-designs}
 \end{figure}
 
-\paragraph{Implication.}
-For a paper focused on service-design \emph{methodology}, these
-results validate that the synthetic-grid analysis
-(\S\ref{sec:cloud-analysis}) captures the right qualitative
-picture and ranks methods correctly --- with the explicit caveat
-that Multi-FR's first-stage objective and second-stage realised
-wait can diverge under tight fleet/$T$ budgets, and that
-cross-city absolute-cost comparisons hold the BG count constant
-rather than the service-region area.  The qualitative ranking is
-topology-robust, but the absolute position of the user-time regime
-(and therefore the cost premium of demanding low user time) can
-shift by a factor of 2--3 across topologies.  For deployment
-recommendations to a specific city, practitioners should fix a
-target service-region size (rather than BG count) and re-run the
-sweep on that city's real road network before committing to a
-service-mode choice; Multi-FR in particular needs its full
-hyperparameter grid (and possibly a smaller $T_{\max}$) to land on
-a competitive design point at the high-$w_r$ end.
+\paragraph{Implication.} The synthetic-grid conclusions (\S\ref{sec:cloud-analysis}) survive on real cities: the qualitative ranking is topology-robust, and the architectural distinctions remain visible in both the cloud and the design maps. The absolute position of the user-time regime varies with topology by a factor of 2 to 3 across cities, so deployment recommendations should be made on the actual target city, not extrapolated from a synthetic instance. Multi-FR remains the main outlier: its paper-faithful coverage reward yields a competitive provider cost but a long-headway design that pins user time near $T_{\max}/2$ regardless of regime. Reducing $T_{\max}$ or relaxing the load-factor floor would let Multi-FR enter a more user-favorable region of the Pareto plane, at the cost of departing from the paper's calibration.
