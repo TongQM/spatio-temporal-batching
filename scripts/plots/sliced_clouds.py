@@ -40,7 +40,11 @@ def lighten(c, a):
 
 
 def _panel_fixed_lambda(ax, df, Lambda_value, regime_wrs, title):
-    """Fixed Lambda, varying wr. Each baseline plotted across the wr sweep."""
+    """Fixed Lambda, varying wr. Each baseline plotted across the wr sweep.
+
+    Coincident markers (a baseline whose wr-sweep produces identical
+    rows) are jittered slightly in log-x so all three are visible.
+    """
     sub = df[df["Lambda"] == Lambda_value]
     shade_wr = {w: 0.55 * (1 - i / max(len(regime_wrs) - 1, 1))
                 for i, w in enumerate(regime_wrs)}
@@ -55,6 +59,10 @@ def _panel_fixed_lambda(ax, df, Lambda_value, regime_wrs, title):
         v = (x > 0) & np.isfinite(x) & np.isfinite(y)
         x, y = x[v], y[v]
         wrs_v = g["wr"].to_numpy(float)[v] if v.any() else np.array([])
+        # Detect coincidence (all rows identical) and apply a small log-x offset
+        if len(x) >= 2 and np.allclose(x, x[0]) and np.allclose(y, y[0]):
+            offsets = np.linspace(-0.04, 0.04, len(x))
+            x = x * (10.0 ** offsets)
         if len(x) >= 2:
             ax.plot(x, y, "-", color=bc, alpha=0.35, linewidth=1.0, zorder=2)
         for px, py, w in zip(x, y, wrs_v):
@@ -69,7 +77,10 @@ def _panel_fixed_lambda(ax, df, Lambda_value, regime_wrs, title):
 
 
 def _panel_fixed_wr(ax, df, wr_value, regime_lambdas, title):
-    """Fixed wr, varying Lambda. Each baseline plotted across the Lambda sweep."""
+    """Fixed wr, varying Lambda. Each baseline plotted across the Lambda sweep.
+
+    Coincident markers are jittered slightly in log-x so all are visible.
+    """
     sub = df[df["wr"] == wr_value]
     size_lambda = {l: 40 + (i / max(len(regime_lambdas) - 1, 1)) * 130
                    for i, l in enumerate(regime_lambdas)}
@@ -84,6 +95,9 @@ def _panel_fixed_wr(ax, df, wr_value, regime_lambdas, title):
         v = (x > 0) & np.isfinite(x) & np.isfinite(y)
         x, y = x[v], y[v]
         lams_v = g["Lambda"].to_numpy(float)[v] if v.any() else np.array([])
+        if len(x) >= 2 and np.allclose(x, x[0]) and np.allclose(y, y[0]):
+            offsets = np.linspace(-0.04, 0.04, len(x))
+            x = x * (10.0 ** offsets)
         if len(x) >= 2:
             ax.plot(x, y, "-", color=bc, alpha=0.35, linewidth=1.0, zorder=2)
         for px, py, lam in zip(x, y, lams_v):
