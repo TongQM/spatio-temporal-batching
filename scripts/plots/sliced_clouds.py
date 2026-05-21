@@ -204,14 +204,20 @@ if __name__ == "__main__":
     render_4city_grid("lambda", out_root / "four_city_clouds_by_lambda.png")
     render_4city_grid("wr",     out_root / "four_city_clouds_by_wr.png")
 
-    # Synthetic by-Lambda and by-wr (latest regime sweep)
+    # Synthetic by-Lambda and by-wr (most recent regime sweep with all 7 baselines)
     synth_csvs = sorted(
         Path("results/baseline_clouds").glob(
             "regime_synthetic_grid5x5_K3_L300_wr1.0_wv1.0_cloud_*/aggregate_summary.csv"))
-    if synth_csvs:
-        latest = synth_csvs[-1]
-        df = pd.read_csv(latest)
-        render_by_lambda(df, latest.parent / "scatter_by_lambda.png",
+    synth_pick = None
+    for csv in reversed(synth_csvs):
+        df = pd.read_csv(csv)
+        if df["baseline"].nunique() >= 7:
+            synth_pick = csv
+            break
+    if synth_pick is not None:
+        df = pd.read_csv(synth_pick)
+        render_by_lambda(df, synth_pick.parent / "scatter_by_lambda.png",
                          suptitle="Synthetic $5{\\times}5$ cloud, sliced by $\\Lambda$")
-        render_by_wr(df, latest.parent / "scatter_by_wr.png",
+        render_by_wr(df, synth_pick.parent / "scatter_by_wr.png",
                      suptitle="Synthetic $5{\\times}5$ cloud, sliced by $w_r$")
+        print(f"Synthetic source: {synth_pick.parent.name}")
