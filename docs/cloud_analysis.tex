@@ -7,7 +7,7 @@
 
 \section{External Baselines}\label{sec:external-baselines}
 
-We benchmark our service-design framework against seven external baselines drawn from three families: (i) partition with continuous approximation (\textbf{Joint-Nom}, \textbf{Joint-DRO}, \textbf{SP-Lit (Carlsson)}); (ii) routing-based (\textbf{Multi-FR (Jacquillat)}, \textbf{TP-Lit (Liu)}); (iii) operational extremes (\textbf{VCC}, \textbf{OD/fully-on-demand}). Each baseline sweeps its own structural hyperparameters internally per regime point and picks the combination minimising the aggregate cost $C_{\mathrm{prov}} + w_r \cdot \bar{u} \cdot \Lambda$. The comparison is stress-tested at three tiers: \S\ref{sec:cloud-analysis} synthetic $5{\times}5$ grid; \S\ref{sec:real-cloud} a 25-block-group Pittsburgh slice with real road distances and ACS population demand; \S\ref{sec:multi-city} four U.S.\ cities spanning topology archetypes (Pittsburgh, Chicago, Manhattan, LA). To keep clouds readable, each scatter figure is presented twice: once with all seven baselines overlaid (Pareto-overview view) and once sliced into a Pareto-core panel (Joint-Nom/DRO, SP-Lit, Multi-FR, TP-Lit) and an operational-extremes panel (VCC, OD) with separate $x$-axes.
+We benchmark our service-design framework against seven external baselines drawn from three families: (i) partition with continuous approximation (\textbf{Joint-Nom}, \textbf{Joint-DRO}, \textbf{SP-Lit (Carlsson)}); (ii) routing-based (\textbf{Multi-FR (Jacquillat)}, \textbf{TP-Lit (Liu)}); (iii) operational extremes (\textbf{VCC}, \textbf{OD/fully-on-demand}). Each baseline sweeps its own structural hyperparameters internally per regime point and picks the combination minimising the aggregate cost $C_{\mathrm{prov}} + w_r \cdot \bar{u} \cdot \Lambda$. The comparison is stress-tested at three tiers: \S\ref{sec:cloud-analysis} synthetic $5{\times}5$ grid; \S\ref{sec:real-cloud} a 25-block-group Pittsburgh slice with real road distances and ACS population demand; \S\ref{sec:multi-city} four U.S.\ cities spanning topology archetypes (Pittsburgh, Chicago, Manhattan, LA). To make the regime response readable, each cloud is presented in two faceted views: one figure with $\Lambda$ fixed per panel and $w_r$ varying within the panel (shows how each baseline responds to the user-time weight at a given demand level), and a companion figure with $w_r$ fixed per panel and $\Lambda$ varying within the panel (shows how each baseline responds to demand at a given user-time weight).
 
 \subsection{Analysis on the synthetic instance}\label{sec:cloud-analysis}
 
@@ -20,12 +20,19 @@ We benchmark our service-design framework against seven external baselines drawn
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\linewidth]{figures/external baselines/cloud_synthetic_split}
-\caption{Synthetic cloud sliced by baseline family: (a) Pareto-core methods (Joint, SP-Lit, Multi-FR, TP-Lit), (b) operational extremes (VCC, OD). Axes auto-scaled per panel so VCC/OD's wide provider-cost range does not compress the Pareto-core into a sliver.}
-\label{fig:cloud-split}
+\includegraphics[width=\linewidth]{figures/external baselines/cloud_synthetic_by_lambda}
+\caption{Synthetic cloud, fixed $\Lambda$ per panel, $w_r$ varying within panel (fill shade encodes $w_r$, lighter $=$ smaller $w_r$). Lines connect the $w_r$ sweep for each baseline.}
+\label{fig:cloud-by-lambda}
 \end{figure}
 
-Figure~\ref{fig:cloud} plots each baseline's provider cost rate (log scale) against average user time per rider across the shared regime grid. Each baseline sweeps its own structural hyperparameters internally: partition methods sweep $K \in \{2,\dots,6\}$, Multi-FR sweeps a (fleet, $\delta$) combo grid, OD and VCC sweep fleet. No fixed $K$ is imposed across the comparison. Some markers visually overlap when a baseline's chosen design does not respond to $w_r$ at a given $\Lambda$ (e.g.\ TP-Lit shows three points, one per $\Lambda$). Figure~\ref{fig:cloud-split} splits the same data into a Pareto-core panel and an operational-extremes panel; the split makes the Pareto-core's structure (which the merged plot crowds into the left band) directly readable.
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/external baselines/cloud_synthetic_by_wr}
+\caption{Synthetic cloud, fixed $w_r$ per panel, $\Lambda$ varying within panel (marker size $\propto \Lambda$). Lines connect the $\Lambda$ sweep for each baseline.}
+\label{fig:cloud-by-wr}
+\end{figure}
+
+Figure~\ref{fig:cloud} plots each baseline's provider cost rate (log scale) against average user time per rider across the full $3 \times 3$ regime grid. Figures~\ref{fig:cloud-by-lambda} and~\ref{fig:cloud-by-wr} decompose the same data by holding one regime parameter fixed per panel. The by-$\Lambda$ view exposes each method's $w_r$ trajectory (most clearly: partition methods sweep from cheap-provider/long-wait at $w_r{=}1$ to expensive-provider/short-wait at $w_r{=}10$, while Multi-FR barely moves); the by-$w_r$ view exposes each method's $\Lambda$ trajectory (most clearly: Multi-FR collapses to a single point per panel because of the Mohring effect, while OD's footprint widens with $\Lambda$ as fleet selection adapts).
 
 \subsubsection{Per-baseline sweep grids}
 
@@ -120,9 +127,16 @@ No single method dominates across the regime grid. The approximate Pareto fronti
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\linewidth]{figures/external baselines/cloud_pittsburgh_split}
-\caption{Pittsburgh cloud sliced by baseline family.}
-\label{fig:cloud-real-split}
+\includegraphics[width=\linewidth]{figures/external baselines/cloud_pittsburgh_by_lambda}
+\caption{Pittsburgh cloud, fixed $\Lambda$ per panel, $w_r$ varying.}
+\label{fig:cloud-real-by-lambda}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/external baselines/cloud_pittsburgh_by_wr}
+\caption{Pittsburgh cloud, fixed $w_r$ per panel, $\Lambda$ varying.}
+\label{fig:cloud-real-by-wr}
 \end{figure}
 
 We re-run the same regime grid on 25 census block groups around the centroid of HCT's Pittsburgh service area. Demand is ACS-population-weighted ($p_b \in [0.014, 0.062]$ versus the synthetic $p_b{=}1/25$); distances are OSMnx road-network shortest paths (2{,}931 nodes, 7{,}519 edges) everywhere a baseline supports them (Joint-Nom, Joint-DRO, SP-Lit in optimisation; all baselines in evaluation).
@@ -167,9 +181,16 @@ The map overlay confirms that the architectural distinctions are also visible in
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\linewidth]{figures/external baselines/cloud_four_cities_split}
-\caption{Cross-city clouds sliced by baseline family. Rows are cities; left columns show Pareto-core methods, right columns operational extremes.}
-\label{fig:four-city-cloud-split}
+\includegraphics[width=\linewidth]{figures/external baselines/cloud_four_cities_by_lambda}
+\caption{Cross-city clouds, fixed $\Lambda$ per column, $w_r$ varying within panel. Rows are cities.}
+\label{fig:four-city-cloud-by-lambda}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figures/external baselines/cloud_four_cities_by_wr}
+\caption{Cross-city clouds, fixed $w_r$ per column, $\Lambda$ varying within panel. Rows are cities.}
+\label{fig:four-city-cloud-by-wr}
 \end{figure}
 
 We re-run the regime sweep on four cities chosen for road-topology contrast: Pittsburgh (irregular hilly, river-cut), Chicago Loop (strict cardinal grid), Manhattan Midtown (avenue-and-street grid), and Los Angeles DTLA (freeway-fragmented grid). Each city uses real TIGER 2023 block groups, ACS-population demand, and full road-network shortest paths in both optimisation and evaluation.
