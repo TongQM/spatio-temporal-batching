@@ -47,8 +47,14 @@ across the shared regime grid
 $\Lambda \in \{50, 150, 300\}$~pax/hour,
 $w_r \in \{1, 3, 10\}$,
 with vehicle-km weight $w_v = 1$ and fleet amortisation
-$c_f = 4.0$~\$/veh-hour, on the $5 \times 5$ synthetic instance
-with base fleet budget $K=3$.
+$c_f = 4.0$~\$/veh-hour, on the $5 \times 5$ synthetic instance.
+Each baseline sweeps its own structural hyperparameters
+internally per regime point --- partition methods sweep
+$K \in \{2,\dots,6\}$, Multi-FR sweeps a (fleet, $\delta$)
+combo grid, OD/VCC sweep fleet --- and picks the combination
+minimising the aggregate cost
+$C_{\mathrm{prov}} + w_r \cdot \bar{u} \cdot \Lambda$; no fixed
+$K$ is imposed across the comparison.
 Marker size encodes~$\Lambda$ (small = 50, large = 300);
 fill shade encodes~$w_r$ (light = 1, dark = 10);
 lines connect the $w_r$ sweep at each fixed~$\Lambda$.
@@ -82,7 +88,7 @@ Joint-Nom  & $K \in \{2,3,4,5,6\}$ (random-search partition) & best $K$ by agg.\
 Joint-DRO  & $K \in \{2,3,4,5,6\}$, $\varepsilon = 0.5$ fixed & best $K$ by agg.\ cost \\
 Multi-FR   & (fleet, $\delta$) $\in \{(3, 0), (5, 0)\}$, $T$-grid & best combo by agg.\ cost \\
 SP-Lit     & $K \in \{2,\dots,6\}$ $\times$ $T_{\mathrm{fixed}} \in \{0.1, 0.2, 0.3, 0.5, 0.8, 1.0\}$ & best $(K, T)$ by agg.\ cost \\
-TP-Lit     & \texttt{max\_fleet} $\in \{20, 50, 100\}$; 25 candidates, $K{=}3$ & best fleet by agg.\ cost \\
+TP-Lit     & \texttt{max\_fleet} $\in \{20, 50, 100\}$; 25 candidate stops & best fleet by agg.\ cost \\
 VCC        & fleet $\in \{5, 10, 20, 30, 50\}$ $\times$ $\delta_w \in \{0.1, 0.3, 0.5\}$~km & best (fleet, $\delta_w$) by agg.\ cost \\
 OD         & fleet $\in \{5, 10, 15, 20, 30, 50, 80\}$ (queueing) & best fleet by agg.\ cost \\
 \bottomrule
@@ -398,12 +404,11 @@ increasing~$\Lambda$:
 \paragraph{Effect of $K$ optimisation on partition methods.}
 With $K$ swept over $\{2, 3, 4, 5, 6\}$, Joint-Nom picks
 $K \in \{4, 5, 6\}$ depending on regime --- more districts at high
-$w_r$ and $\Lambda$.
-This shifts Joint's cloud \textbf{down and right} compared to a
-fixed $K{=}3$ baseline: user time improves (shorter tours per
-district) at the cost of a larger fleet.
-SP-Lit shows the same pattern but at uniformly higher provider
-cost because its partition geometry is less efficient per
+$w_r$ and $\Lambda$.  This shifts Joint's cloud \textbf{down and
+right} compared to a hypothetical single fixed-$K$ baseline: user
+time improves (shorter tours per district) at the cost of a larger
+fleet.  SP-Lit shows the same pattern but at uniformly higher
+provider cost because its partition geometry is less efficient per
 district.
 
 \paragraph{When each method is preferred.}
@@ -458,7 +463,9 @@ The instance:
     use Euclidean distances on real block centroids.
   \item \textbf{All other parameters} match the synthetic sweep:
     $\Lambda \in \{50, 150, 300\}$~pax/h, $w_r \in \{1, 3, 10\}$,
-    $w_v = 1$, $c_f = 4.0$, $K = 3$, same per-baseline internal grids.
+    $w_v = 1$, $c_f = 4.0$, same per-baseline internal hyperparameter
+    grids (partition methods sweep $K \in \{2,\dots,6\}$, OD/VCC
+    sweep fleet, etc.); no fixed $K$ is imposed across baselines.
   \item \textbf{TP-Lit is omitted} from the real-data figure because
     its ADP+VRP solve takes ${\sim}5$~min per combo;
     9 combos $\times$ 9 settings $\approx$ 7~hours.
@@ -844,7 +851,8 @@ tradeoff relative to the Pareto frontier:
 \centering
 \includegraphics[width=\linewidth]{results/baseline_clouds/cities_road/four_city_designs_map}
 \caption{\textbf{Service designs across the four cities at
-$\Lambda{=}150$, $w_r{=}1$, $K{=}3$.} Rows are cities (Pittsburgh,
+$\Lambda{=}150$, $w_r{=}1$, with $K{=}3$ fixed for visualisation}
+(the cloud sweep picks $K$ per regime per method).  Rows are cities (Pittsburgh,
 Chicago, Manhattan, LA), columns are baselines (Joint-Nom,
 Joint-DRO, SP-Lit, Multi-FR, TP-Lit, VCC, OD).  Backdrops show the
 real OSMnx road network; route polylines follow road shortest
